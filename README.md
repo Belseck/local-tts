@@ -19,6 +19,7 @@ plus binaries you already have (or install once, on your terms).
 
 - [Requirements](#requirements)
 - [Install](#install)
+  - [Install with an AI agent](#install-with-an-ai-agent)
 - [Quick start](#quick-start)
 - [Usage](#usage)
 - [Providers](#providers)
@@ -110,7 +111,43 @@ pipx install .
 # or symlink the venv entry point somewhere on your PATH
 ln -s "$PWD/.venv/bin/tts" ~/.local/bin/tts
 ```
+
+The symlink works from any directory because the entry point's shebang is an absolute path
+to the venv's interpreter. The install is editable, so edits to `src/localtts/` take effect
+immediately — but do not move or delete the repo, since the link points into it. Undo with
+`rm ~/.local/bin/tts`.
 </details>
+
+### Install with an AI agent
+
+If you use an AI coding agent (Claude Code, Cursor, Copilot, …), the whole setup —
+including detecting what is already on the machine, installing the backends, and creating
+the global symlink — is scripted for it in **[`AGENT_INSTALL.md`](AGENT_INSTALL.md)**.
+
+Point your agent at this repository and say what you want:
+
+> **"Install this with the link."**
+
+or, more specifically:
+
+> "Read AGENT_INSTALL.md and install local-tts with piper in Spanish, and make it global."
+
+The agent will detect what you already have, ask once about anything missing, and validate
+the result with `tts check` plus a real synthesis. It is written to **ask before installing
+anything, downloading a model, creating a symlink, or running `sudo`** — so you approve
+each decision rather than discovering it afterwards.
+
+Phrases it understands without further questions:
+
+| Say | Meaning |
+| --- | --- |
+| "with the link" / "make it global" | create the `~/.local/bin/tts` symlink |
+| "with piper" / "for Spanish" (any language) | also install piper and a matching voice |
+| "just the CLI" | package only, no backends, no symlink |
+| "install everything" | all steps approved, plan still shown first |
+
+Prefer doing it yourself? Everything the agent does is the same set of commands documented
+in [Requirements](#requirements), [Install](#install) and [Providers](#providers) below.
 
 ### Verify the install
 
