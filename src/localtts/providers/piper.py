@@ -10,7 +10,8 @@ class PiperProvider(Provider):
     name = "piper"
     default_format = "wav"
 
-    def synthesize(self, text, out_path, voice=None):
+    def build_command(self, text, out_path, voice=None):
+        """The text is piped on stdin, so it does not appear in the argv."""
         exe = self.resolve_binary("binary", "piper")
         model = os.path.expanduser(voice or self.settings.get("model") or "")
         if not model:
@@ -25,8 +26,10 @@ class PiperProvider(Provider):
         speaker = self.settings.get("speaker")
         if speaker is not None:
             cmd += ["--speaker", str(speaker)]
-        cmd += list(self.settings.get("extra_args") or [])
+        return cmd + list(self.settings.get("extra_args") or [])
 
+    def synthesize(self, text, out_path, voice=None):
+        cmd = self.build_command(text, out_path, voice)
         self.run(cmd, stdin_text=text + "\n")
         if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
             raise TTSError("piper wrote no audio to %s" % out_path)

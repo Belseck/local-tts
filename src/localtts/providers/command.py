@@ -2,6 +2,7 @@
 
 import os
 import shlex
+import shutil
 
 from localtts.errors import TTSError
 from localtts.providers.base import Provider
@@ -38,4 +39,10 @@ class CommandProvider(Provider):
         template = self.settings.get("template") or ""
         if not template:
             return False, "no template configured"
+        try:
+            executable = self.build_command("probe", "/tmp/probe.wav")[0]
+        except TTSError as exc:
+            return False, str(exc)
+        if not shutil.which(executable):
+            return False, "%s (%r is not on PATH)" % (template, executable)
         return True, template

@@ -149,8 +149,11 @@ tts -f notes.md -o notes.wav
 # save and play
 tts -o greeting.wav --play "Good morning."
 
-# see the exact llama.cpp command without running it
-tts --dry-run "hello"
+# narrate a markdown document: syntax stripped, long text chunked and joined
+tts -f README.md -o readme.wav
+
+# see the exact backend command (and the chunk plan) without running it
+tts --dry-run -f README.md
 ```
 
 The first invocation is slow: it downloads the model. After that a short sentence
@@ -171,6 +174,7 @@ tts config [--show | --path | --init | --set KEY=VALUE]
 | --- | --- |
 | `TEXT ...` | Text to speak. Omit it to read stdin. |
 | `-f, --file FILE` | Read the text from a file (`-` for stdin). |
+| `--markdown` / `--no-markdown` | Force markdown stripping on or off (automatic for `.md` files). |
 | `-o, --output FILE` | Write the audio here instead of playing it. |
 | `-p, --provider NAME` | `llamacpp` (default), `openai`, `piper`, `command`. |
 | `-v, --voice VOICE` | Speaker file (llamacpp), `.onnx` voice (piper), or voice name (openai). |
@@ -186,6 +190,15 @@ tts config [--show | --path | --init | --set KEY=VALUE]
 
 Input precedence is `TEXT` → `--file` → stdin. Without `--output`, audio goes to a
 temporary file that is played and then deleted (`--keep` keeps it).
+
+**Markdown is handled for you.** Reading a `.md` file strips headings, emphasis, link
+URLs, bullet markers, tables and fenced code blocks before synthesis, so none of it gets
+read aloud. Override either way with `--markdown` / `--no-markdown`.
+
+**Long documents are handled for you too.** Backends that need short prompts (`llamacpp`)
+get the text split at sentence boundaries, synthesized piece by piece, and joined into a
+single file with a short pause between pieces. Backends that manage long input themselves
+(`piper`) receive it whole. See `max_words` below.
 
 Exit codes: `0` success, `1` error (with a one-line message on stderr), `130` interrupted.
 
@@ -210,12 +223,17 @@ Runs `llama-tts`. Zero configuration: with no model set it passes
 | `hf_repo` / `hf_file` | *(empty)* | Pull the TTS model from Hugging Face instead. |
 | `hf_repo_vocoder` / `hf_file_vocoder` | *(empty)* | Same, for the vocoder. |
 | `speaker_file` | *(empty)* | Voice profile JSON (`--tts-speaker-file`). |
+| `max_words` | `26` | Words per prompt; longer text is split and re-joined. `0` disables. |
 | `threads` | `0` | CPU threads; `0` lets llama.cpp decide. |
 | `gpu_layers` | `null` | Layers to offload (`-ngl`); `null` keeps llama.cpp's default. |
 | `guide_tokens` | `true` | `--tts-use-guide-tokens`, improves word recall. |
 | `extra_args` | `[]` | Extra flags appended verbatim. |
 
-Output is 24 kHz mono WAV.
+Output is 24 kHz mono WAV. The default OuteTTS weights speak **English, Chinese,
+Japanese and Korean**; other languages come out with English phonetics, so use the
+[`piper`](#piper--small-fast-offline-many-languages) provider for those. Quality also
+drops on long prompts, which is why `max_words` splits them — raise or lower it to trade
+continuity against reliability.
 
 #### Using your own models
 
@@ -267,14 +285,39 @@ tts -p openai -o out.mp3 "Local, but OpenAI-shaped."
 This is the only provider that writes formats other than WAV — the output
 extension picks the format (`wav`, `mp3`, `opus`, `aac`, `flac`, `pcm`).
 
-### `piper` — small, fast, offline
+### `piper` — small, fast, offline, many languages
 
-Uses [Piper](https://github.com/rhasspy/piper) ONNX voices. Download a voice from
-[rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices), then:
+[Piper](https://github.com/OHF-Voice/piper1-gpl) runs neural ONNX voices on the CPU at
+roughly 7x realtime, with good models for ~40 languages. Use it when `llamacpp` does not
+cover your language: the default OuteTTS weights handle English, Chinese, Japanese and
+Korean only, and will read anything else with English phonetics.
+
+Piper is distributed as a Python wheel (`piper-tts`, GPL-3.0). Install it in its **own**
+virtualenv so its ~200 MB of dependencies (onnxruntime, numpy) stay out of this project,
+then point `local-tts` at the binary:
 
 ```bash
-tts config --set piper.model=~/voices/en_US-lessac-medium.onnx
-tts -p piper "Piper is very fast on a CPU."
+python -m venv ~/.local/share/piper-venv
+~/.local/share/piper-venv/bin/pip install piper-tts
+
+# list every voice, then fetch the one you want (~60 MB for "medium", ~63 MB for "high")
+mkdir -p ~/.local/share/piper-voices && cd ~/.local/share/piper-voices
+~/.local/share/piper-venv/bin/python -m piper.download_voices            # list
+~/.local/share/piper-venv/bin/python -m piper.download_voices es_MX-claude-high
+
+tts config --set piper.binary=~/.local/share/piper-venv/bin/piper
+tts config --set piper.model=~/.local/share/piper-voices/es_MX-claude-high.onnx
+tts -p piper "Piper es muy rápido en una CPU."
+```
+
+Voice weights live at [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices)
+(MIT/CC, no account or API token needed). Naming is `<lang>_<REGION>-<speaker>-<quality>`,
+where quality is `x_low`, `low`, `medium`, or `high`.
+
+Piper splits long input into sentences by itself, so an entire document works in one call:
+
+```bash
+tts -p piper -f article.md -o article.wav
 ```
 
 | Setting | Default | Description |
@@ -427,7 +470,8 @@ Layout:
 src/localtts/
 ├── cli.py            argument parsing and the four subcommands
 ├── config.py         defaults, config file, env vars, precedence
-├── audio.py          playback autodetection
+├── text.py           markdown stripping and sentence-aware chunking
+├── audio.py          playback autodetection and wav joining
 ├── errors.py         TTSError -> a clean one-line message
 └── providers/
     ├── base.py       Provider contract + subprocess helpers

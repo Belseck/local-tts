@@ -13,6 +13,11 @@ class Provider:
     #: Container format this backend writes. Used to name temp files.
     default_format = "wav"
 
+    @property
+    def max_words(self):
+        """Words per synthesis call; 0 means the backend handles long text itself."""
+        return int(self.settings.get("max_words") or 0)
+
     def __init__(self, settings, verbose=False):
         self.settings = settings
         self.verbose = verbose
@@ -47,13 +52,18 @@ class Provider:
     def run(self, cmd, stdin_text=None):
         if self.verbose:
             print("+ %s" % " ".join(cmd), file=sys.stderr)
-        proc = subprocess.run(
-            cmd,
-            input=stdin_text,
-            text=True,
-            stdout=None if self.verbose else subprocess.PIPE,
-            stderr=None if self.verbose else subprocess.PIPE,
-        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=stdin_text,
+                text=True,
+                stdout=None if self.verbose else subprocess.PIPE,
+                stderr=None if self.verbose else subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            raise TTSError("%s: command not found: %s" % (self.name, cmd[0]))
+        except PermissionError:
+            raise TTSError("%s: not executable: %s" % (self.name, cmd[0]))
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()
             tail = "\n".join(detail.splitlines()[-15:])

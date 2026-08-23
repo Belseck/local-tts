@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import wave
 
 from localtts.errors import TTSError
 
@@ -85,3 +86,31 @@ def available_players():
     if not found and _is_wsl() and shutil.which("powershell.exe"):
         found.append("powershell.exe")
     return found
+
+
+def concat_wavs(paths, out_path, gap_seconds=0.35):
+    """Join same-format wav files into one, with a short silence between them."""
+    if not paths:
+        raise TTSError("nothing to join: every chunk failed")
+    if len(paths) == 1 and paths[0] == out_path:
+        return out_path
+
+    with wave.open(paths[0], "rb") as first:
+        params = first.getparams()
+    silence = b"\x00" * int(params.framerate * gap_seconds) * params.sampwidth * params.nchannels
+
+    with wave.open(out_path, "wb") as out:
+        out.setparams(params)
+        for index, path in enumerate(paths):
+            with wave.open(path, "rb") as part:
+                if part.getparams()[:3] != params[:3]:
+                    raise TTSError("cannot join %s: format differs from the first chunk" % path)
+                out.writeframes(part.readframes(part.getnframes()))
+            if index != len(paths) - 1:
+                out.writeframes(silence)
+    return out_path
+
+
+def duration(path):
+    with wave.open(path, "rb") as handle:
+        return handle.getnframes() / float(handle.getframerate())

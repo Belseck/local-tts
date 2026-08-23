@@ -6,7 +6,7 @@ import os
 import sys
 import tempfile
 
-from localtts import __version__, audio, config, providers
+from localtts import __version__, audio, config, providers, text as textutil
 from localtts.errors import TTSError
 
 PROG = "tts"
@@ -33,6 +33,10 @@ def _speak_parser():
     )
     parser.add_argument("text", nargs="*", help="text to speak (or pipe it on stdin)")
     parser.add_argument("-f", "--file", help="read the text from a file ('-' for stdin)")
+    parser.add_argument("--markdown", dest="markdown", action="store_true", default=None,
+                        help="strip markdown before speaking (automatic for .md files)")
+    parser.add_argument("--no-markdown", dest="markdown", action="store_false",
+                        help="speak the input verbatim, markdown included")
     parser.add_argument("-o", "--output", help="write audio here instead of playing it")
     parser.add_argument("-p", "--provider", choices=providers.names(), help="backend to use")
     parser.add_argument("-v", "--voice", help="voice: speaker file (llamacpp), .onnx (piper) or name (openai)")
@@ -50,18 +54,19 @@ def _speak_parser():
 
 
 def _read_text(args):
+    """Return the text to speak, and whether it came from a markdown source."""
     if args.file:
         if args.file == "-":
-            return sys.stdin.read()
+            return sys.stdin.read(), False
         path = os.path.expanduser(args.file)
         if not os.path.exists(path):
             raise TTSError("input file not found: %s" % path)
         with open(path, "r", encoding="utf-8") as fh:
-            return fh.read()
+            return fh.read(), textutil.looks_like_markdown(path)
     if args.text:
-        return " ".join(args.text)
+        return " ".join(args.text), False
     if not sys.stdin.isatty():
-        return sys.stdin.read()
+        return sys.stdin.read(), False
     raise TTSError("no text given; pass it as an argument, with --file, or on stdin")
 
 
@@ -91,7 +96,10 @@ def speak(argv):
     args = _speak_parser().parse_args(argv)
     cfg = config.load()
 
-    text = _read_text(args).strip()
+    text, is_markdown = _read_text(args)
+    if args.markdown or (args.markdown is None and is_markdown):
+        text = textutil.strip_markdown(text)
+    text = text.strip()
     if not text:
         raise TTSError("nothing to speak: the input was empty")
 
@@ -115,18 +123,30 @@ def speak(argv):
         temporary = True
 
     if args.dry_run:
-        if not hasattr(provider, "build_command"):
-            print("%s: no external command (this backend speaks HTTP)" % provider.name)
+        pieces = textutil.chunks(text, provider.max_words)
+        if len(pieces) > 1:
+            print("# %d words -> %d chunks of <=%d words, joined into one file"
+                  % (len(text.split()), len(pieces), provider.max_words))
+        builder = getattr(provider, "build_command", None)
+        if builder is None:
+            print("# %s runs no external command; it POSTs to %s"
+                  % (provider.name, provider.settings.get("base_url")))
         else:
-            builder = provider.build_command
-            cmd = builder(text, out_path, args.voice) if provider.name == "llamacpp" else builder(text, out_path)
+            try:
+                cmd = builder(pieces[0], out_path, args.voice)
+            except TypeError:
+                cmd = builder(pieces[0], out_path)
             print(" ".join(cmd))
+            if provider.name == "piper":
+                print("# (the text is piped to stdin, not passed as an argument)")
+            if len(pieces) > 1:
+                print("# ... and %d more like it" % (len(pieces) - 1))
         if temporary:
             os.unlink(out_path)
         return 0
 
     try:
-        provider.synthesize(text, out_path, voice=args.voice)
+        _synthesize(provider, text, out_path, args)
 
         should_play = not args.no_play and (args.play or (temporary and cfg["play"]))
         played = False
@@ -148,6 +168,31 @@ def speak(argv):
         if temporary and os.path.exists(out_path):
             os.unlink(out_path)
     return 0
+
+
+def _synthesize(provider, text, out_path, args):
+    """One call for short text; chunk-and-join when the backend needs small prompts."""
+    pieces = textutil.chunks(text, provider.max_words)
+    if len(pieces) == 1:
+        return provider.synthesize(text, out_path, voice=args.voice)
+
+    work = tempfile.mkdtemp(prefix="local-tts-chunks-")
+    made = []
+    try:
+        for index, piece in enumerate(pieces, 1):
+            part = os.path.join(work, "%04d.%s" % (index, provider.default_format))
+            print("  chunk %d/%d" % (index, len(pieces)), end="\r", file=sys.stderr, flush=True)
+            provider.synthesize(piece, part, voice=args.voice)
+            made.append(part)
+        print(" " * 24, end="\r", file=sys.stderr)
+        audio.concat_wavs(made, out_path)
+    finally:
+        for part in made:
+            if os.path.exists(part):
+                os.unlink(part)
+        if os.path.isdir(work):
+            os.rmdir(work)
+    return out_path
 
 
 def list_providers(argv):
@@ -216,6 +261,11 @@ def config_command(argv):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    # Bare `tts` at a prompt is someone asking what the tool can do, not an empty
+    # request. Piped input (`echo hi | tts`) still has no argv, so check the tty.
+    if not argv and sys.stdin.isatty():
+        _speak_parser().print_help()
+        return 0
     try:
         if argv and argv[0] in SUBCOMMANDS:
             handler = {"config": config_command, "providers": list_providers, "check": check}[argv[0]]

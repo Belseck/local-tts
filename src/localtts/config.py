@@ -32,6 +32,9 @@ DEFAULTS = {
             "hf_file_vocoder": "",
             # Speaker/voice profile JSON accepted by --tts-speaker-file.
             "speaker_file": "",
+            # OuteTTS degrades past a couple of sentences per prompt, so long text is
+            # synthesized in pieces and joined. 0 disables chunking.
+            "max_words": 26,
             "threads": 0,          # 0 => let llama.cpp decide
             "gpu_layers": None,    # None => leave llama.cpp default
             "guide_tokens": True,  # improves word recall on OuteTTS
