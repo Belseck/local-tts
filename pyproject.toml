@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-tts"
+version = "1.0.0"
+description = "Ultralight CLI for local text-to-speech, powered by llama.cpp by default"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["tts", "text-to-speech", "llama.cpp", "cli", "offline"]
+classifiers = [
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+# No runtime dependencies. Standard library only, on purpose.
+dependencies = []
+
+[project.scripts]
+tts = "localtts.cli:main"
+local-tts = "localtts.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
