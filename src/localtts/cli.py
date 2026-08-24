@@ -1,10 +1,12 @@
 """Command-line entry point."""
 
 import argparse
+import concurrent.futures
 import json
 import os
 import sys
 import tempfile
+import threading
 
 from localtts import __version__, audio, config, hooks, providers, skills, text as textutil
 from localtts.errors import TTSError
@@ -260,23 +262,42 @@ def speak(argv):
 
 
 def _synthesize(provider, text, out_path, args):
-    """One call for short text; chunk-and-join when the backend needs small prompts."""
+    """One call for short text; chunk-and-join when the backend needs small prompts.
+
+    Chunks are synthesized concurrently, bounded by provider.max_workers. Each
+    subprocess-based call pays its own fixed startup cost (process spawn, model
+    load) on top of the actual synthesis time, so running that overlapped instead
+    of serial is most of the win for a backend that has to chunk -- see
+    max_workers on the provider for the numbers behind the default.
+    """
     pieces = textutil.chunks(text, provider.max_words)
     if len(pieces) == 1:
         return provider.synthesize(text, out_path, voice=args.voice)
 
     work = tempfile.mkdtemp(prefix="local-tts-chunks-")
-    made = []
+    parts = [os.path.join(work, "%04d.%s" % (index, provider.default_format))
+             for index in range(1, len(pieces) + 1)]
+    done = 0
+    done_lock = threading.Lock()
+
+    def synth_one(index):
+        nonlocal done
+        provider.synthesize(pieces[index], parts[index], voice=args.voice)
+        with done_lock:
+            done += 1
+            print("  chunk %d/%d" % (done, len(pieces)), end="\r", file=sys.stderr, flush=True)
+
+    workers = max(1, min(provider.max_workers, len(pieces)))
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
     try:
-        for index, piece in enumerate(pieces, 1):
-            part = os.path.join(work, "%04d.%s" % (index, provider.default_format))
-            print("  chunk %d/%d" % (index, len(pieces)), end="\r", file=sys.stderr, flush=True)
-            provider.synthesize(piece, part, voice=args.voice)
-            made.append(part)
+        futures = [pool.submit(synth_one, index) for index in range(len(pieces))]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()  # re-raises the first chunk failure; others keep running
         print(" " * 24, end="\r", file=sys.stderr)
-        audio.concat_wavs(made, out_path)
+        audio.concat_wavs(parts, out_path)
     finally:
-        for part in made:
+        pool.shutdown(wait=True, cancel_futures=True)
+        for part in parts:
             if os.path.exists(part):
                 os.unlink(part)
         if os.path.isdir(work):

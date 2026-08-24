@@ -40,6 +40,15 @@ DEFAULTS = {
             # OuteTTS degrades past a couple of sentences per prompt, so long text is
             # synthesized in pieces and joined. 0 disables chunking.
             "max_words": 26,
+            # Chunks run concurrently, up to this many at once. Each llama-tts call pays
+            # several seconds of fixed process-startup/model-load cost regardless of how
+            # short the chunk is, so overlapping chunks matters more than raising
+            # max_words (which risks the degradation above). Measured on one RTX 4070
+            # laptop GPU: 2 concurrent calls ~1.4x faster wall-clock than sequential;
+            # 4 concurrent was not meaningfully faster than 2 (single-GPU compute is
+            # still serialized) but used more VRAM for no benefit. 2 is a safe default
+            # across GPU sizes; raise it if you have VRAM/cores to spare.
+            "max_workers": 2,
             "threads": 0,          # 0 => let llama.cpp decide
             "gpu_layers": None,    # None => leave llama.cpp default
             "guide_tokens": True,  # improves word recall on OuteTTS

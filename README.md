@@ -29,6 +29,7 @@ plus binaries you already have (or install once, on your terms).
 - [Requirements](#requirements)
 - [Install](#install)
   - [Install with an AI agent](#install-with-an-ai-agent)
+- [Updating](#updating)
 - [Quick start](#quick-start)
 - [Usage](#usage)
 - [Background playback](#background-playback)
@@ -185,6 +186,43 @@ Only the line matching your default provider has to say `[ok]`.
 
 ---
 
+## Updating
+
+There's no auto-update and no PyPI package — `local-tts` lives in the git clone from
+[Install](#install). Updating means pulling that repo, plus refreshing the couple of things
+that are copies of it rather than live links.
+
+```bash
+cd local-tts               # the repo you cloned in Install
+git status --short         # make sure there's nothing uncommitted first
+git pull
+
+# editable install (the default): src/ changes are live immediately. Rerunning this
+# is still worth it — it's a no-op most of the time, but it's what picks up a
+# pyproject.toml change (entry point, version, python floor), and it costs nothing
+# since the package has zero runtime dependencies
+pip install -e .
+
+# pipx install instead? pipx never re-reads the source directory on its own:
+pipx install . --force
+```
+
+Two more things are **snapshots taken at install time**, not symlinks into the repo, so
+pulling doesn't update them on its own:
+
+```bash
+tts skills --install    # refreshes the skill copies every detected agent is reading
+tts hooks --install      # only if `tts hooks --status` shows one is active
+```
+
+Then `tts --version` and `tts check` to confirm it landed.
+
+If you use a coding agent, the whole thing — including finding the repo behind whatever
+install method you used — is the **`local-tts-update`** skill from
+[Coding-agent skills](#coding-agent-skills); just say "update local-tts."
+
+---
+
 ## Quick start
 
 ```bash
@@ -285,7 +323,7 @@ native Windows they report that they are unsupported and `stop` is the control.
 
 ## Coding-agent skills
 
-`local-tts` ships two skills that teach a coding agent to use it, and installs them into
+`local-tts` ships three skills that teach a coding agent to use it, and installs them into
 whichever agents it finds on your machine:
 
 - **`local-tts-speak`** — speak to the user. Triggers on "talk to me", "read this aloud",
@@ -296,6 +334,10 @@ whichever agents it finds on your machine:
 - **`local-tts-configure`** — install, diagnose and configure: backends, voices for a new
   language, playback, and the per-language memory. Starts from `tts check` and asks before
   installing or downloading anything.
+- **`local-tts-update`** — update an already-installed CLI to the latest version. Locates
+  the repo behind the running `tts` command, pulls it, reinstalls only if that's actually
+  needed, and refreshes the skill/hook files that are copies rather than live links to the
+  repo. See [Updating](#updating).
 
 ```bash
 tts skills                       # what was detected, and what is installed

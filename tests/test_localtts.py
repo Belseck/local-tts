@@ -5,12 +5,17 @@ import os
 import signal
 import sys
 import tempfile
+import threading
+import time
+import types
 import unittest
+import wave
 from pathlib import Path
 
 from localtts import audio, config, hooks, providers, skills, text as textutil
-from localtts.cli import _resolve_session, main
+from localtts.cli import _resolve_session, _synthesize, main
 from localtts.errors import TTSError
+from localtts.providers.base import Provider
 from localtts.providers.command import CommandProvider
 from localtts.providers.llamacpp import LlamaCppProvider
 
@@ -61,6 +66,12 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(saved["provider"], "piper")
         self.assertEqual(saved["providers"]["llamacpp"]["threads"], 4)
 
+    def test_llamacpp_chunks_run_concurrently_by_default(self):
+        # See the comment above "max_workers" in DEFAULTS for the numbers behind 2:
+        # each llama-tts call pays several seconds of fixed startup cost regardless
+        # of chunk size, so this is where most of the real-world win comes from.
+        self.assertEqual(config.DEFAULTS["providers"]["llamacpp"]["max_workers"], 2)
+
 
 class LlamaCppTest(unittest.TestCase):
     def build(self, **settings):
@@ -91,6 +102,11 @@ class LlamaCppTest(unittest.TestCase):
     def test_missing_model_file_is_reported(self):
         with self.assertRaises(TTSError):
             self.build(model="/definitely/not/here.gguf", vocoder="/nope.gguf").build_command("hi", "/tmp/a.wav")
+
+    def test_max_workers_defaults_to_two_and_is_overridable(self):
+        self.assertEqual(self.build().max_workers, 2)
+        self.assertEqual(self.build(max_workers=5).max_workers, 5)
+        self.assertEqual(self.build(max_workers=0).max_workers, 1)  # clamped to at least 1
 
 
 class CommandProviderTest(unittest.TestCase):
@@ -193,6 +209,109 @@ class ConcatTest(unittest.TestCase):
     def test_joining_nothing_is_an_error(self):
         with self.assertRaises(TTSError):
             audio.concat_wavs([], "/tmp/never.wav")
+
+
+def _write_wav(path, marker_byte, frames=50):
+    with wave.open(path, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(24000)
+        handle.writeframes(bytes([marker_byte, 0]) * frames)
+
+
+class SynthesizeConcurrencyTest(unittest.TestCase):
+    """Exercises cli._synthesize's chunk-and-join path directly, without a real backend."""
+
+    def _run(self, provider, text):
+        args = types.SimpleNamespace(voice=None)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.wav")
+            _synthesize(provider, text, out, args)
+            with wave.open(out, "rb") as handle:
+                return handle.readframes(handle.getnframes())
+
+    def test_single_piece_text_skips_the_chunking_machinery(self):
+        calls = []
+
+        class RecordingProvider(Provider):
+            name = "recording"
+
+            def synthesize(self, text, out_path, voice=None):
+                calls.append((text, out_path))
+                _write_wav(out_path, 0)
+                return out_path
+
+        provider = RecordingProvider({"max_words": 100})
+        args = types.SimpleNamespace(voice=None)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.wav")
+            _synthesize(provider, "short text", out, args)
+        self.assertEqual(calls, [("short text", out)])
+
+    def test_chunks_run_concurrently_up_to_max_workers(self):
+        active, peak = [], [0]
+        lock = threading.Lock()
+
+        class SlowProvider(Provider):
+            name = "slow"
+
+            def synthesize(self, text, out_path, voice=None):
+                with lock:
+                    active.append(1)
+                    peak[0] = max(peak[0], len(active))
+                time.sleep(0.1)
+                _write_wav(out_path, 0)
+                with lock:
+                    active.pop()
+                return out_path
+
+        provider = SlowProvider({"max_words": 3, "max_workers": 2})
+        text = " ".join("w%d" % i for i in range(12))  # -> 4 chunks of 3 words
+        self._run(provider, text)
+        self.assertGreater(peak[0], 1, "chunks ran serially -- concurrency isn't happening")
+        self.assertLessEqual(peak[0], 2, "max_workers=2 was not respected as a concurrency cap")
+
+    def test_output_order_matches_chunk_order_even_when_finished_out_of_order(self):
+        # Chunk 0 is the slow one and finishes last; the join must still put its
+        # audio first, because output order is decided by chunk index, not by
+        # which worker happens to finish first.
+        delays = {0: 0.15, 1: 0.0}
+
+        class ReorderingProvider(Provider):
+            name = "reorder"
+
+            def synthesize(self, text, out_path, voice=None):
+                index = int(text.split()[0][1:])
+                time.sleep(delays.get(index, 0))
+                _write_wav(out_path, index)
+                return out_path
+
+        provider = ReorderingProvider({"max_words": 3, "max_workers": 2})
+        data = self._run(provider, "w0 a b w1 c d")
+        self.assertEqual(data[0], 0)
+
+    def test_a_chunk_failure_raises_and_pending_work_is_not_started(self):
+        started = []
+        lock = threading.Lock()
+
+        class FlakyProvider(Provider):
+            name = "flaky"
+
+            def synthesize(self, text, out_path, voice=None):
+                index = int(text.split()[0][1:])
+                with lock:
+                    started.append(index)
+                if index == 0:
+                    raise TTSError("boom")
+                _write_wav(out_path, index)
+                return out_path
+
+        # max_workers=1 makes this deterministic: chunks run strictly in order,
+        # so the failure on chunk 0 must stop chunk 1 from ever starting.
+        provider = FlakyProvider({"max_words": 1, "max_workers": 1})
+        with self.assertRaises(TTSError):
+            self._run(provider, "w0 w1")
+        self.assertEqual(started, [0])
 
 
 class PlaybackControlTest(unittest.TestCase):

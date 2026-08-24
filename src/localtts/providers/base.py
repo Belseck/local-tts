@@ -18,6 +18,17 @@ class Provider:
         """Words per synthesis call; 0 means the backend handles long text itself."""
         return int(self.settings.get("max_words") or 0)
 
+    @property
+    def max_workers(self):
+        """How many chunks to synthesize concurrently when text.chunks() splits the input.
+
+        Each chunk is a separate subprocess call paying its own fixed startup cost
+        (process spawn, model load), so overlapping them is most of the win for a
+        backend that has to chunk. Defaults to 1 (sequential, today's behavior)
+        unless a provider sets its own default or the user overrides it.
+        """
+        return max(1, int(self.settings.get("max_workers") or 1))
+
     def __init__(self, settings, verbose=False):
         self.settings = settings
         self.verbose = verbose
