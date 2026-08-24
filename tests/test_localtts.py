@@ -566,53 +566,132 @@ class HookInstallTest(unittest.TestCase):
         with open(hooks.settings_path("claude-code", self.base)) as fh:
             return json.load(fh)
 
+    def _existing_script(self, name="other-tool.sh", body="#!/usr/bin/env bash\necho hi\n"):
+        path = Path(self.base) / ".claude" / name
+        path.write_text(body)
+        path.chmod(0o755)
+        return path
+
     def test_unsupported_agent_reports_why(self):
         with self.assertRaises(TTSError) as caught:
             hooks.install("gemini", base=self.base)
         self.assertIn("footer", str(caught.exception))
 
-    def test_fresh_install_writes_settings_and_wrapper(self):
+    def test_fresh_install_with_nothing_configured_writes_a_standalone_wrapper(self):
         result = hooks.install("claude-code", base=self.base)
+        self.assertEqual(result["mode"], "standalone")
         settings = self._settings()
         self.assertEqual(settings["statusLine"]["command"], str(result["wrapper_path"]))
         self.assertEqual(settings["statusLine"]["refreshInterval"], 2)
         self.assertTrue(result["wrapper_path"].exists())
-        self.assertIsNone(result["chained_from"])
 
-    def test_existing_status_line_is_chained_not_clobbered(self):
+    # --- the regression this class exists for -------------------------------------
+    #
+    # A real Boost installation broke because install() used to REPLACE
+    # statusLine.command with our own wrapper and remember the old command as a string
+    # to chain via `eval`. When Boost's own reinstall regenerated its script at the same
+    # path, our saved reference still pointed at the right path in principle, but Boost's
+    # own installer no longer recognized statusLine as its own (something else -- us --
+    # now owned it) and declined to re-register itself, leaving the whole status line
+    # broken until the user manually reinstalled Boost. The fix: never touch
+    # statusLine.command when one is already configured; append into the file it already
+    # points to instead, so the original tool never stops owning its own slot.
+
+    def test_existing_status_line_command_is_never_rewritten(self):
+        script = self._existing_script()
         path = hooks.settings_path("claude-code", self.base)
         path.write_text(json.dumps({
             "otherSetting": "keep-me",
-            "statusLine": {"type": "command", "command": "~/.claude/other-tool.sh"},
+            "statusLine": {"type": "command", "command": str(script), "padding": 0},
         }))
-        result = hooks.install("claude-code", base=self.base)
-        self.assertEqual(result["chained_from"], "~/.claude/other-tool.sh")
-        script = result["wrapper_path"].read_text()
-        self.assertIn("PREV_CMD='~/.claude/other-tool.sh'", script)
-        self.assertEqual(self._settings()["otherSetting"], "keep-me")   # untouched
-
-    def test_reinstall_carries_the_chain_forward(self):
-        path = hooks.settings_path("claude-code", self.base)
-        path.write_text(json.dumps({"statusLine": {"type": "command", "command": "~/theirs.sh"}}))
+        before = self._settings()["statusLine"]
         hooks.install("claude-code", base=self.base)
-        # settings.json now points at OUR wrapper; a second install must not treat
-        # itself as "the previous command" and lose the real chain.
-        result = hooks.install("claude-code", base=self.base)
-        self.assertEqual(result["chained_from"], "~/theirs.sh")
+        after = self._settings()["statusLine"]
+        self.assertEqual(before, after)   # byte-for-byte: command, padding, everything
+        self.assertEqual(self._settings()["otherSetting"], "keep-me")
 
-    def test_dry_run_writes_nothing(self):
+    def test_existing_script_file_gets_our_block_appended(self):
+        script = self._existing_script(body="#!/usr/bin/env bash\nprintf 'BOOST'\n")
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({"statusLine": {"type": "command", "command": str(script)}}))
+        result = hooks.install("claude-code", base=self.base)
+        self.assertEqual(result["mode"], "appended")
+        content = script.read_text()
+        self.assertIn("printf 'BOOST'", content)          # original untouched
+        self.assertIn(hooks.HOOK_BEGIN, content)
+        self.assertIn("tts playback --compact", content)
+
+    def test_appended_output_concatenates_with_the_original_at_runtime(self):
+        import subprocess as sp
+        script = self._existing_script(body="#!/usr/bin/env bash\nprintf 'BOOST-OUTPUT'\n")
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({"statusLine": {"type": "command", "command": str(script)}}))
+        hooks.install("claude-code", base=self.base)
+        out = sp.run(["bash", str(script)], input="{}", capture_output=True, text=True)
+        self.assertEqual(out.stdout, "BOOST-OUTPUT")   # idle: appended block adds nothing
+
+    def test_reinstall_does_not_duplicate_the_appended_block(self):
+        script = self._existing_script()
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({"statusLine": {"type": "command", "command": str(script)}}))
+        hooks.install("claude-code", base=self.base)
+        hooks.install("claude-code", base=self.base)
+        self.assertEqual(script.read_text().count(hooks.HOOK_BEGIN), 1)
+
+    def test_uninstall_removes_only_our_block_from_the_appended_file(self):
+        script = self._existing_script(body="#!/usr/bin/env bash\necho original\n")
+        original = script.read_text()
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({"statusLine": {"type": "command", "command": str(script)}}))
+        hooks.install("claude-code", base=self.base)
+        result = hooks.uninstall("claude-code", base=self.base)
+        self.assertTrue(result["removed"])
+        self.assertEqual(script.read_text(), original)
+        # and the settings.json command was never touched in the first place
+        self.assertEqual(self._settings()["statusLine"]["command"], str(script))
+
+    def test_unappendable_command_requires_force(self):
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({
+            "statusLine": {"type": "command", "command": "node ~/status.js --flag"},
+        }))
+        with self.assertRaises(TTSError) as caught:
+            hooks.install("claude-code", base=self.base)
+        self.assertIn("--force", str(caught.exception))
+        # and it must not have touched anything on the refusal path
+        self.assertEqual(self._settings()["statusLine"]["command"], "node ~/status.js --flag")
+
+    def test_force_replaces_an_unappendable_command_and_chains_it(self):
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({
+            "statusLine": {"type": "command", "command": "node ~/status.js --flag"},
+        }))
+        result = hooks.install("claude-code", base=self.base, force=True)
+        self.assertEqual(result["mode"], "forced")
+        self.assertEqual(result["chained_from"], "node ~/status.js --flag")
+        self.assertEqual(self._settings()["statusLine"]["command"], str(result["wrapper_path"]))
+        self.assertIn("PREV_CMD='node ~/status.js --flag'", result["wrapper_path"].read_text())
+
+    def test_missing_script_file_also_requires_force(self):
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({
+            "statusLine": {"type": "command", "command": str(Path(self.base) / ".claude" / "gone.sh")},
+        }))
+        with self.assertRaises(TTSError):
+            hooks.install("claude-code", base=self.base)
+
+    def test_dry_run_writes_nothing_standalone(self):
         result = hooks.install("claude-code", base=self.base, dry_run=True)
         self.assertFalse(result["wrapper_path"].exists())
         self.assertFalse(hooks.settings_path("claude-code", self.base).exists())
 
-    def test_uninstall_restores_the_previous_command(self):
+    def test_dry_run_writes_nothing_appended(self):
+        script = self._existing_script()
+        original = script.read_text()
         path = hooks.settings_path("claude-code", self.base)
-        path.write_text(json.dumps({"statusLine": {"type": "command", "command": "~/theirs.sh"}}))
-        hooks.install("claude-code", base=self.base)
-        result = hooks.uninstall("claude-code", base=self.base)
-        self.assertTrue(result["removed"])
-        self.assertEqual(self._settings()["statusLine"]["command"], "~/theirs.sh")
-        self.assertFalse(hooks.wrapper_path("claude-code", self.base).exists())
+        path.write_text(json.dumps({"statusLine": {"type": "command", "command": str(script)}}))
+        hooks.install("claude-code", base=self.base, dry_run=True)
+        self.assertEqual(script.read_text(), original)
 
     def test_uninstall_drops_the_key_when_there_was_nothing_before(self):
         hooks.install("claude-code", base=self.base)
@@ -620,17 +699,22 @@ class HookInstallTest(unittest.TestCase):
         self.assertNotIn("statusLine", self._settings())
 
     def test_uninstall_refuses_to_touch_a_hook_it_did_not_install(self):
+        script = self._existing_script()
         path = hooks.settings_path("claude-code", self.base)
-        path.write_text(json.dumps({"statusLine": {"type": "command", "command": "~/theirs.sh"}}))
+        path.write_text(json.dumps({"statusLine": {"type": "command", "command": str(script)}}))
         result = hooks.uninstall("claude-code", base=self.base)
         self.assertFalse(result["removed"])
-        self.assertEqual(self._settings()["statusLine"]["command"], "~/theirs.sh")
+        self.assertEqual(self._settings()["statusLine"]["command"], str(script))
 
-    def test_wrapper_calls_tts_playback_compact(self):
-        result = hooks.install("claude-code", base=self.base)
-        self.assertIn("tts playback --compact", result["wrapper_path"].read_text())
+    def test_is_installed_true_only_for_our_own_wrapper_or_block(self):
+        self.assertFalse(hooks.is_installed("claude-code", base=self.base))
+        hooks.install("claude-code", base=self.base)
+        self.assertTrue(hooks.is_installed("claude-code", base=self.base))
 
-    def test_is_installed_true_only_for_our_own_wrapper(self):
+    def test_is_installed_true_for_appended_mode_too(self):
+        script = self._existing_script()
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({"statusLine": {"type": "command", "command": str(script)}}))
         self.assertFalse(hooks.is_installed("claude-code", base=self.base))
         hooks.install("claude-code", base=self.base)
         self.assertTrue(hooks.is_installed("claude-code", base=self.base))

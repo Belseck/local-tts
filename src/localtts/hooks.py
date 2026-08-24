@@ -1,6 +1,6 @@
-"""Status-bar hooks: install a script into a coding agent's own "run my command and show
-its stdout in the status bar" mechanism, so playback progress lives in the IDE/terminal
-chrome instead of chat messages.
+"""Status-bar hooks: get playback progress into a coding agent's own "run my command and
+show its stdout in the status bar" mechanism, so it lives in the IDE/terminal chrome
+instead of chat messages.
 
 Only agents with a REAL, documented mechanism of that shape are supported. Verified by
 reading each agent's own settings schema / shipped source, not by assumption:
@@ -10,26 +10,28 @@ reading each agent's own settings schema / shipped source, not by assumption:
   qwen          ~/.qwen/settings.json   -> ui.statusLine.command (+ refreshInterval) --
                 confirmed against the official Qwen Code docs.
 
-Everything else in skills.AGENTS is a documented non-match, not an unresearched gap:
+Everything else in skills.AGENTS is a documented non-match, not an unresearched gap --
+see UNSUPPORTED below for the specific reason each one can't do this today.
 
-  gemini        footer settings are hide/show toggles only (checked the shipped
-                settingsSchema.js) -- no arbitrary command.
-  codex         open feature request (openai/codex#17827, #20140, #20244); not shipped.
-  opencode      open feature request (#30295); community plugins exist but hook into
-                OpenCode's own plugin API, not a simple external command.
-  cursor,
-  windsurf      VS Code forks -- a status-bar item there means writing and installing a
-                real extension, not a lightweight config hook.
-  copilot       does have a real statusLine.command (per public write-ups), but the
-                settings path/schema is not documented officially and one source notes
-                "field names vary by CLI version" -- not solid enough to write into a
-                real config file unverified. Left unsupported until confirmed firsthand.
+A settings file's statusLine slot holds exactly one command. That command commonly belongs
+to another tool already (a user's own script, or something like Boost) -- and that tool
+may have its own installer that re-verifies or repairs its slot on update. Earlier this
+module *replaced* the slot with its own wrapper and saved the previous command as a string
+to restore later. That broke a real Boost installation: when Boost's own reinstall changed
+what its script's path or contents were, our saved reference went stale, and because we now
+owned the slot, Boost's installer no longer recognized it as its own -- so Boost quietly
+stopped rendering, and the fix required reinstalling Boost by hand.
 
-A settings file's statusLine slot is exclusive -- only one command can occupy it. If the
-agent already has one (the user's own, or another tool's), install() WRAPS it rather than
-replacing it: our script runs the previous command first and only adds our text when
-something is actually playing, so an idle system looks exactly like it did before we
-touched it. uninstall() restores exactly that prior command.
+The fix is structural, not a patch: **install() never rewrites statusLine.command when one
+is already configured.** Instead, if that command is a plain path to a writable script
+file, we APPEND a delimited block to the END of that same file -- the same tool keeps
+owning the settings.json slot and keeps running exactly as it did, and our text is simply
+concatenated onto its output when something is playing. Nothing we do is visible to that
+tool's own installer, because we never touched what it manages. Only when nothing was
+configured at all do we write a standalone wrapper and take the (previously-empty) slot.
+--force is available for a command we can't safely append to (not a bare file path, or not
+writable) -- it works like before, but it is now something the caller opts into explicitly,
+never the default.
 """
 
 import json
@@ -41,13 +43,13 @@ from pathlib import Path
 
 from localtts.errors import TTSError
 
-MARKER_START = "# >>> local-tts statusline hook (managed by `tts hooks`) — do not edit by hand"
-MARKER_END = "# <<< local-tts statusline hook"
+HOOK_BEGIN = "# >>> local-tts statusline hook (managed by `tts hooks`) — do not edit by hand"
+HOOK_END = "# <<< local-tts statusline hook"
 
 HEARTBEAT_MAX_AGE = 20  # seconds; must exceed every supported agent's max refreshInterval
 
 #: name -> (settings file relative to home, key path into that JSON, extra literal keys
-#: to set alongside "type"/"command", default refreshInterval)
+#: to set alongside "type"/"command" when we own the slot outright, default refreshInterval)
 HOOK_AGENTS = {
     "claude-code": (".claude/settings.json", ("statusLine",), {"padding": 0}, 2),
     "qwen": (".qwen/settings.json", ("ui", "statusLine"), {"hideContextIndicator": False}, 2),
@@ -126,36 +128,102 @@ def _shell_single_quote(text):
     return "'" + text.replace("'", "'\"'\"'") + "'"
 
 
-def _existing_previous_command(wrapper_file):
-    """The PREV_CMD this wrapper already carries, if we wrote it before. Reading it back
-    (instead of only checking settings.json) is what makes reinstall idempotent: once
-    we own the slot, settings.json's command IS our wrapper path, so the only place the
-    real previous command still lives is inside the file we wrote last time."""
-    if not wrapper_file.exists():
+def _resolve_appendable_file(command, base=None):
+    """If `command` is JUST a path to an existing, writable, plain-text file -- no
+    arguments, no pipeline, no interpreter prefix -- return that Path. Anything more
+    complex (a one-liner, a `node script.js`, a missing/read-only file) returns None:
+    appending to those either can't work or can't be done safely, so the caller should
+    fall back to asking for --force rather than guessing."""
+    if not command or not isinstance(command, str):
         return None
-    for line in wrapper_file.read_text(encoding="utf-8").splitlines():
-        if line.startswith("PREV_CMD="):
-            raw = line[len("PREV_CMD="):]
-            if raw in ("''", '""'):
-                return None
-            return raw[1:-1].replace("'\"'\"'", "'") if raw.startswith("'") else raw
-    return None
+    text = command.strip()
+    if not text or any(ch.isspace() for ch in text):
+        return None
+    expanded_text = os.path.expanduser(text) if text.startswith("~") else text
+    path = Path(expanded_text)
+    if not path.is_absolute():
+        return None
+    try:
+        if not path.is_file() or not os.access(path, os.W_OK):
+            return None
+    except OSError:
+        return None
+    return path
 
 
-def _render_wrapper(agent, previous_command, base=None):
+def _heartbeat_block(agent, base=None):
+    """The text appended to an existing script, or the body of our own standalone one.
+    Prints nothing extra when idle, so an idle status bar is byte-identical to before."""
+    heartbeat = heartbeat_path(agent, base)
+    return "\n".join([
+        HOOK_BEGIN,
+        "mkdir -p %s 2>/dev/null" % _shell_single_quote(str(heartbeat.parent)),
+        "date +%%s > %s 2>/dev/null" % _shell_single_quote(str(heartbeat)),
+        "if command -v tts >/dev/null 2>&1; then",
+        # No stdin is threaded through here on purpose: appended mode runs after the
+        # host's own script may have already consumed stdin, so we rely on session
+        # auto-detection from the environment instead (see cli._resolve_session) --
+        # the env var is set for the whole subprocess, not just what's piped to it.
+        "  __localtts_bar=\"$(tts playback --compact 2>/dev/null)\"",
+        "  if [ -n \"$__localtts_bar\" ]; then printf ' · %s' \"$__localtts_bar\"; fi",
+        "fi",
+        HOOK_END,
+        "",
+    ])
+
+
+def _append_block(target_file, block):
+    """Idempotent: replaces our own prior block in place if present, else appends once."""
+    existing = target_file.read_text(encoding="utf-8") if target_file.exists() else ""
+    if HOOK_BEGIN in existing and HOOK_END in existing:
+        head, _, rest = existing.partition(HOOK_BEGIN)
+        _, _, tail = rest.partition(HOOK_END)
+        updated = head.rstrip("\n") + "\n" + block + tail.lstrip("\n")
+    else:
+        sep = "" if not existing or existing.endswith("\n") else "\n"
+        updated = existing + sep + block
+    target_file.write_text(updated, encoding="utf-8")
+
+
+def _remove_block(target_file):
+    if not target_file.exists():
+        return False
+    existing = target_file.read_text(encoding="utf-8")
+    if HOOK_BEGIN not in existing or HOOK_END not in existing:
+        return False
+    head, _, rest = existing.partition(HOOK_BEGIN)
+    _, _, tail = rest.partition(HOOK_END)
+    remainder = head.rstrip("\n") + ("\n" if head.strip() else "") + tail.lstrip("\n")
+    if remainder.strip():
+        target_file.write_text(remainder, encoding="utf-8")
+    else:
+        target_file.unlink()
+    return True
+
+
+def _render_standalone_wrapper(agent, base=None):
+    """Used only when nothing was configured before, or under --force: a self-contained
+    script we fully own. previous_command (--force only) is chained via a saved literal,
+    same as appending would do if we could -- the one path where that tradeoff is
+    unavoidable, because the caller told us there's nothing safer to do."""
+    return "\n".join(["#!/usr/bin/env bash", _heartbeat_block(agent, base).rstrip("\n"), ""])
+
+
+def _render_forced_wrapper(agent, previous_command, base=None):
+    """--force only: replace the slot outright, chaining the previous command by a saved
+    reference. This is exactly the design that broke Boost when its own script moved --
+    kept only as an explicit opt-in for a command too complex to append into."""
     prev_literal = _shell_single_quote(previous_command) if previous_command else "''"
     heartbeat = heartbeat_path(agent, base)
     return "\n".join([
         "#!/usr/bin/env bash",
-        MARKER_START,
+        HOOK_BEGIN,
         "PREV_CMD=%s" % prev_literal,
         "input=\"$(cat)\"",
         "mkdir -p %s 2>/dev/null" % _shell_single_quote(str(heartbeat.parent)),
         "date +%%s > %s 2>/dev/null" % _shell_single_quote(str(heartbeat)),
         "bar=\"\"",
         "if command -v tts >/dev/null 2>&1; then",
-        # $input carries the host's own JSON (it has a session_id field on every agent we
-        # support), so this hook shows only THIS session's playback, not any session's.
         "  bar=\"$(printf '%s' \"$input\" | tts playback --compact 2>/dev/null)\"",
         "fi",
         "prev=\"\"",
@@ -168,7 +236,7 @@ def _render_wrapper(agent, previous_command, base=None):
         "else",
         "  printf '%s' \"$prev\"",
         "fi",
-        MARKER_END,
+        HOOK_END,
         "",
     ])
 
@@ -181,7 +249,7 @@ def detect(names=None, base=None):
     return {name: installed[name] for name in names if name in installed}
 
 
-def install(agent, base=None, refresh_interval=None, dry_run=False):
+def install(agent, base=None, refresh_interval=None, dry_run=False, force=False):
     if agent not in HOOK_AGENTS:
         if agent in UNSUPPORTED:
             raise TTSError("%s has no status-line hook to install: %s" % (agent, UNSUPPORTED[agent]))
@@ -191,31 +259,66 @@ def install(agent, base=None, refresh_interval=None, dry_run=False):
     path = settings_path(agent, base)
     data = _read_json(path)
     current = _get_nested(data, key_path) or {}
-    wrapper_file = wrapper_path(agent, base)
+    existing_command = current.get("command") if isinstance(current, dict) else None
+    our_wrapper = wrapper_path(agent, base)
 
-    if isinstance(current, dict) and current.get("command") == str(wrapper_file):
-        previous = _existing_previous_command(wrapper_file)   # reinstall: carry the chain forward
-    else:
-        previous = current.get("command") if isinstance(current, dict) else None
+    # Nothing configured yet, or we already own the slot (a prior local-tts install) --
+    # safe to write our own standalone wrapper and take the (empty-or-already-ours) slot.
+    if not existing_command or existing_command == str(our_wrapper):
+        script = _render_standalone_wrapper(agent, base)
+        block = {"type": "command", "command": str(our_wrapper),
+                 "refreshInterval": refresh_interval or default_interval}
+        block.update(extra)
+        result = {"mode": "standalone", "settings_path": path, "target_file": our_wrapper,
+                  "wrapper_path": our_wrapper, "block": block}
+        if dry_run:
+            return result
+        our_wrapper.parent.mkdir(parents=True, exist_ok=True)
+        our_wrapper.write_text(script, encoding="utf-8")
+        our_wrapper.chmod(our_wrapper.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        _set_nested(data, key_path, block)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        return result
 
-    script = _render_wrapper(agent, previous, base)
-    block = {"type": "command", "command": str(wrapper_file),
+    # Something else already owns the slot. Never touch settings.json's command --
+    # append into the file it already points to, so that tool keeps managing itself.
+    target = _resolve_appendable_file(existing_command, base)
+    if target is not None and not force:
+        block = _heartbeat_block(agent, base)
+        result = {"mode": "appended", "settings_path": path, "target_file": target,
+                  "wrapper_path": None, "block": None}
+        if dry_run:
+            return result
+        _append_block(target, block)
+        return result
+
+    if not force:
+        raise TTSError(
+            "statusLine.command is already %r, and it isn't a plain script file local-tts "
+            "can safely extend (it has arguments, isn't absolute, or isn't writable). "
+            "Add this to the end of it yourself:\n\n%s\n\nor re-run with --force to replace "
+            "it outright -- that stops the existing command from running."
+            % (existing_command, _heartbeat_block(agent, base))
+        )
+
+    # --force: explicit opt-in to the old behavior -- replace the slot, chaining the
+    # previous command by saved reference. Fragile in the way that broke Boost, which is
+    # exactly why it now requires the caller to ask for it.
+    script = _render_forced_wrapper(agent, existing_command, base)
+    block = {"type": "command", "command": str(our_wrapper),
              "refreshInterval": refresh_interval or default_interval}
     block.update(extra)
-
+    result = {"mode": "forced", "settings_path": path, "target_file": our_wrapper,
+              "wrapper_path": our_wrapper, "block": block, "chained_from": existing_command}
     if dry_run:
-        return {"settings_path": path, "wrapper_path": wrapper_file,
-                "chained_from": previous, "block": block}
-
-    wrapper_file.parent.mkdir(parents=True, exist_ok=True)
-    wrapper_file.write_text(script, encoding="utf-8")
-    wrapper_file.chmod(wrapper_file.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-
+        return result
+    our_wrapper.parent.mkdir(parents=True, exist_ok=True)
+    our_wrapper.write_text(script, encoding="utf-8")
+    our_wrapper.chmod(our_wrapper.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     _set_nested(data, key_path, block)
-    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-
-    return {"settings_path": path, "wrapper_path": wrapper_file, "chained_from": previous, "block": block}
+    return result
 
 
 def uninstall(agent, base=None):
@@ -223,26 +326,27 @@ def uninstall(agent, base=None):
         raise TTSError("unknown agent %r" % agent)
     _, key_path, _, _ = HOOK_AGENTS[agent]
     path = settings_path(agent, base)
-    wrapper_file = wrapper_path(agent, base)
+    our_wrapper = wrapper_path(agent, base)
     data = _read_json(path)
     current = _get_nested(data, key_path) or {}
+    command = current.get("command") if isinstance(current, dict) else None
 
-    if not (isinstance(current, dict) and current.get("command") == str(wrapper_file)):
-        return {"removed": False, "settings_path": path}   # not ours to touch
-
-    previous = _existing_previous_command(wrapper_file)
-    if previous:
-        _set_nested(data, key_path, {"type": "command", "command": previous})
-    else:
+    removed, detail = False, "nothing to remove (not installed by local-tts)"
+    if command == str(our_wrapper):
         _pop_nested(data, key_path)
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        if our_wrapper.exists():
+            our_wrapper.unlink()
+        removed, detail = True, "removed the statusLine entry (nothing was configured before)"
+    elif command:
+        target = _resolve_appendable_file(command, base)
+        if target is not None and _remove_block(target):
+            removed, detail = True, "removed our block from %s; the rest is untouched" % target
 
-    if wrapper_file.exists():
-        wrapper_file.unlink()
     hb = heartbeat_path(agent, base)
     if hb.exists():
         hb.unlink()
-    return {"removed": True, "settings_path": path, "restored": previous}
+    return {"removed": removed, "detail": detail, "settings_path": path}
 
 
 def is_installed(agent, base=None):
@@ -251,14 +355,25 @@ def is_installed(agent, base=None):
     _, key_path, _, _ = HOOK_AGENTS[agent]
     data = _read_json(settings_path(agent, base))
     current = _get_nested(data, key_path) or {}
-    return isinstance(current, dict) and current.get("command") == str(wrapper_path(agent, base))
+    command = current.get("command") if isinstance(current, dict) else None
+    if not command:
+        return False
+    if command == str(wrapper_path(agent, base)):
+        return True
+    target = _resolve_appendable_file(command, base)
+    if target is None:
+        return False
+    try:
+        return HOOK_BEGIN in target.read_text(encoding="utf-8")
+    except OSError:
+        return False
 
 
 def is_active(agent, base=None, max_age=HEARTBEAT_MAX_AGE):
     """Installed AND actually being invoked right now by a live host session -- distinct
     from is_installed(), since a hook can be configured in an agent that isn't the one
-    currently running. Freshness of the heartbeat file the wrapper touches on every call
-    is what tells us a host is live, not just configured."""
+    currently running. Freshness of the heartbeat file the hook touches on every call is
+    what tells us a host is live, not just configured."""
     hb = heartbeat_path(agent, base)
     if not hb.exists():
         return False

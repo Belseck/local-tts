@@ -167,23 +167,40 @@ exists yet for most of them (open upstream feature requests, not a gap in this t
 Cursor/Windsurf would need a full IDE extension rather than a lightweight hook. Don't
 promise this to a user on one of those hosts; tell them why it isn't available there yet.
 
-**Install is non-destructive.** If the host already has a status line (the user's own
-script, another tool's), install *wraps* it rather than replacing it — the existing command
-still runs, and local-tts's text is only added when something is actually playing. An idle
-system looks exactly as it did before. Reinstalling (e.g. after an update) preserves that
-same chain. `--uninstall` restores the prior command exactly, or removes the key entirely
-if there wasn't one.
+**Install never rewrites `statusLine.command` — it appends into the file it already points
+to.** This is load-bearing, not a nicety: an earlier version replaced the pointer with its
+own wrapper and saved the old command as a string to restore later, and that broke a real
+Boost installation — when Boost's own reinstall regenerated its script, our saved reference
+went stale, and because we now owned the slot, Boost's own installer no longer recognized
+it as its own and silently stopped rendering. The fix is structural: if a status line is
+already configured, we add a small marked block to the *end of that script file* instead,
+so whatever tool owns the slot keeps owning it and keeps running exactly as it did. Idle,
+output is byte-for-byte what it was before installing. Reinstalling replaces our block in
+place, never duplicating it; `--uninstall` removes only our block, leaving everything else
+untouched.
 
-After installing, tell the user to **restart their agent** — the setting is read at
-startup. Then verify with `tts hooks --status`, which prints `active`/`inactive` — that
-only flips to `active` once the host has actually called the hook at least once (right
-after restart, on its first status-bar render), so give it a moment.
+This only works when the existing command is a **plain path to a writable script file** —
+not a one-liner, not something with arguments, not something unwritable. If it doesn't
+qualify, install refuses and prints the exact block to add by hand, or the user can choose
+`--force` to fall back to the old replace-and-chain behavior — tell them plainly that this
+means the tool that used to own the slot stops running, which is a real cost, not a free
+upgrade; don't reach for `--force` as a default when append fails, ask first.
 
-**Multiple sessions on the same machine are correctly isolated.** The wrapper reads the
-`session_id` (or `sessionId`) field the host's own JSON payload carries and only shows that
-session's playback — one session starting audio never stops or shows up in another's status
-bar. This works automatically as long as the agent starting playback passes `--session`
-(the `local-tts-speak` skill does, using `$CLAUDE_CODE_SESSION_ID` where available). If a
+After an append-mode install, no restart is needed — it takes effect on the very next
+status-bar refresh, since only the script's own content changed. A fresh install with
+nothing configured before (or `--force`) does change `statusLine.command`/`refreshInterval`
+directly, and *does* need a restart. Verify with `tts hooks --status`, which prints
+`active`/`inactive` — that only flips to `active` once the host has actually called the
+hook at least once, so give it a moment right after.
+
+**Multiple sessions on the same machine are correctly isolated for Claude Code**, verified
+against a live capture. Playback started with `--session` is looked up by that same id when
+rendering — for a fresh/`--force` install, from the `session_id` field in the host's JSON
+payload; for the (default) appended mode, from `$CLAUDE_CODE_SESSION_ID` in the
+environment, since stdin may already be consumed by the script we appended into. Only
+`CLAUDE_CODE_SESSION_ID` is verified so far — Qwen Code's shell tool sets no session-id env
+var (checked its docs), so session isolation there is unconfirmed; a single Qwen session
+still works correctly, it's only concurrent Qwen sessions that aren't proven yet. If a
 user reports their status bar showing playback they didn't start, or not showing playback
 they did, check `tts hooks --status` and confirm they're on a build where `-b` actually
 uses `--session` — that correlation is what makes this work, not anything host-specific.

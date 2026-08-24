@@ -360,16 +360,33 @@ this, not yet shipped; Cursor and Windsurf are VS Code forks where a status-bar 
 writing a real extension, not a lightweight hook; GitHub Copilot CLI has one, but its
 config schema isn't documented solidly enough to target without an install to test against.
 
-**Install never clobbers an existing status line.** If one is already configured — your own
-script, another tool's — the hook *wraps* it: the previous command still runs, and
-local-tts's text is only prepended while something is actually playing. Idle, the status
-bar looks exactly as it did before. Reinstalling preserves that same chain rather than
-re-wrapping itself; `--uninstall` restores the original command, or removes the key
-entirely if there wasn't one.
+**Install never rewrites an existing status line — it appends into it.** If your settings
+already point at a script (yours, or another tool's), that pointer is never touched;
+instead a small block is added to the *end of that script file*, so the original tool keeps
+owning its slot and keeps running exactly as it always did. Idle, output is byte-for-byte
+what it was before — our block only adds text while something is actually playing:
 
-Restart the agent after installing — status-line config is read at startup. When a hook is
-live, the `local-tts-speak` skill stops printing its own status line, since a real,
-continuously-updating one already exists — `tts hooks --status` is what it checks.
+```
+$ tts hooks --install claude-code
+  claude-code  did append into /home/user/.claude/statusline-command.sh -- your existing
+               status line is untouched, and picks this up on its very next refresh
+```
+
+This only appends into a **plain path to a writable script file** — not a one-liner, not a
+command with arguments, not something unwritable. If the existing command doesn't qualify,
+install refuses and shows you the exact block to add by hand, or you can pass `--force` to
+replace the pointer outright (the old chain-by-reference behavior — the existing command
+still runs, but the tool that owned it no longer does, which is a real tradeoff, not a free
+upgrade; only reach for it when appending genuinely isn't possible). Reinstalling replaces
+our block in place rather than duplicating it. `--uninstall` removes only our block and
+leaves the rest of the file untouched, or drops the settings key entirely if nothing was
+configured before we installed.
+
+Appended mode takes effect on the *very next status-bar refresh* — no restart needed, since
+only the script's content changed, not anything Claude Code reads once at startup. A fresh
+install with nothing configured before (or `--force`) does need a restart, since those set
+`statusLine.command`/`refreshInterval` directly. When a hook is live, the `local-tts-speak`
+skill stops printing its own status line — `tts hooks --status` is what it checks.
 
 ### Multiple sessions
 

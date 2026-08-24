@@ -406,6 +406,10 @@ def hooks_command(argv):
         epilog=("Only agents with a real 'run my command, show its stdout in the status "
                 "bar' mechanism support this. With no options, prints what was found — "
                 "supported agents detected, and why the rest can't do it.\n\n"
+                "If a status line is already configured (yours, or another tool's),\n"
+                "install NEVER rewrites it -- it appends into the same script file so\n"
+                "that tool keeps managing itself exactly as before. Only when nothing was\n"
+                "configured does it take the (empty) slot for its own standalone script.\n\n"
                 "examples:\n"
                 "  %(prog)s                    show detected agents and status\n"
                 "  %(prog)s --install          install into every detected supported agent\n"
@@ -418,11 +422,16 @@ def hooks_command(argv):
                         help="limit to these agents (default: every detected one); one of: "
                              + ", ".join(sorted(hooks.HOOK_AGENTS)))
     parser.add_argument("--install", action="store_true", help="write the hook")
-    parser.add_argument("--uninstall", action="store_true", help="remove it and restore "
-                        "whatever status-line command was there before")
+    parser.add_argument("--uninstall", action="store_true", help="remove it (appended mode: "
+                        "just our block, leaving everything else untouched)")
     parser.add_argument("--status", action="store_true",
                         help="print 'active' if any installed hook is being called right "
                              "now by a live session, else 'inactive'; exit 0/1 to match")
+    parser.add_argument("--force", action="store_true",
+                        help="with --install, replace an existing status-line command that "
+                             "can't be safely appended to (not a plain script file). This "
+                             "is the fragile chain-by-reference mode -- only use it if the "
+                             "existing command has no simpler script file to extend.")
     parser.add_argument("--dry-run", action="store_true", help="show what would change")
     args = parser.parse_args(argv)
 
@@ -467,26 +476,31 @@ def hooks_command(argv):
     if not chosen:
         raise TTSError("no supported agents detected; pass a name explicitly")
 
-    action = hooks.install if args.install else hooks.uninstall
+    needs_restart = False
     for name in chosen:
         try:
             if args.install:
-                result = hooks.install(name, refresh_interval=None, dry_run=args.dry_run)
-                verb = "would write" if args.dry_run else "installed"
-                print("  %-12s %s -> %s (refresh every %ss%s)" % (
-                    name, verb, result["settings_path"], result["block"]["refreshInterval"],
-                    ", chaining your existing status line" if result["chained_from"] else ""))
+                result = hooks.install(name, dry_run=args.dry_run, force=args.force)
+                verb = "would" if args.dry_run else "did"
+                if result["mode"] == "appended":
+                    print("  %-12s %s append into %s -- your existing status line is "
+                          "untouched, and picks this up on its very next refresh"
+                          % (name, verb, result["target_file"]))
+                elif result["mode"] == "standalone":
+                    print("  %-12s %s write -> %s (refresh every %ss)" % (
+                        name, verb, result["settings_path"], result["block"]["refreshInterval"]))
+                    needs_restart = True
+                else:   # forced
+                    print("  %-12s %s replace statusLine.command, chaining %r (--force)" % (
+                        name, verb, result["chained_from"]))
+                    needs_restart = True
             else:
                 result = hooks.uninstall(name)
-                if result["removed"]:
-                    print("  %-12s removed%s" % (
-                        name, " (restored your previous status line)" if result.get("restored") else ""))
-                else:
-                    print("  %-12s nothing to remove (not installed by local-tts)" % name)
+                print("  %-12s %s" % (name, result["detail"]))
         except TTSError as exc:
             print("  %-12s failed: %s" % (name, exc), file=sys.stderr)
-    if args.install and not args.dry_run:
-        print("\nRestart your agent so it picks up the new status line.")
+    if needs_restart and not args.dry_run:
+        print("\nRestart your agent so it picks up the new statusLine setting.")
     return 0
 
 
