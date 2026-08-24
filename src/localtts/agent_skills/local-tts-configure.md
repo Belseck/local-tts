@@ -193,6 +193,24 @@ directly, and *does* need a restart. Verify with `tts hooks --status`, which pri
 `active`/`inactive` — that only flips to `active` once the host has actually called the
 hook at least once, so give it a moment right after.
 
+**If the user says the bar "looks frozen"**, that's the default: appending into an existing
+status line leaves the refresh cadence exactly as it was, and without a timer configured
+that means only redrawing on host events (a new message, a permission-mode change), not a
+per-second tick. Offer `--refresh-interval N` — ask what cadence they want rather than
+picking one:
+
+```bash
+tts hooks --install claude-code --refresh-interval 2   # real timer, ticks live
+tts hooks --install claude-code --refresh-interval 0   # explicitly event-based (removes any existing timer)
+```
+
+Tell them plainly that this also changes how often the *other* tool's script re-runs, not
+just ours — that's real overhead if the existing tool does anything non-trivial per call,
+which you have no visibility into. `0` is a deliberate choice (explicitly no timer), not
+the same as omitting the flag (leave whatever cadence was already configured). This does
+write to settings.json — only the `refreshInterval` key, `command` is still never touched —
+so it needs a restart.
+
 **Multiple sessions on the same machine are correctly isolated for Claude Code**, verified
 against a live capture. Playback started with `--session` is looked up by that same id when
 rendering — for a fresh/`--force` install, from the `session_id` field in the host's JSON

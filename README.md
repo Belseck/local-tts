@@ -388,6 +388,25 @@ install with nothing configured before (or `--force`) does need a restart, since
 `statusLine.command`/`refreshInterval` directly. When a hook is live, the `local-tts-speak`
 skill stops printing its own status line — `tts hooks --status` is what it checks.
 
+### Refresh cadence
+
+With nothing else configured, a fresh install defaults to a real 2-second timer. When
+appending into an *existing* status line, the existing refresh cadence — timer or
+event-only — is left exactly as it was by default, since changing it also changes how often
+the other tool's own script re-runs, not just ours:
+
+```bash
+tts hooks --install claude-code --refresh-interval 2   # a real timer, ticks live
+tts hooks --install claude-code --refresh-interval 0   # explicitly event-based, no timer
+tts hooks --install claude-code                        # leave whatever cadence was already there
+```
+
+`0` is a deliberate choice, not the same as omitting the flag — it removes `refreshInterval`
+outright (so the status bar only redraws on host events like a new message), whereas
+omitting the flag means "don't decide, leave it as configured." Changing the cadence
+(anything other than "leave it as configured") does write to settings.json — just the
+`refreshInterval` key, never `command` — so that one does need a restart.
+
 ### Multiple sessions
 
 Running more than one session at once (two terminals, two agent instances) works without

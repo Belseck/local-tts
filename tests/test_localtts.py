@@ -693,6 +693,68 @@ class HookInstallTest(unittest.TestCase):
         hooks.install("claude-code", base=self.base, dry_run=True)
         self.assertEqual(script.read_text(), original)
 
+    def test_appended_mode_leaves_refresh_interval_alone_by_default(self):
+        script = self._existing_script()
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({"statusLine": {"type": "command", "command": str(script)}}))
+        result = hooks.install("claude-code", base=self.base)
+        self.assertIsNone(result.get("refresh_interval"))
+        self.assertNotIn("refreshInterval", self._settings()["statusLine"])
+
+    def test_appended_mode_sets_refresh_interval_only_when_explicitly_asked(self):
+        script = self._existing_script()
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({
+            "otherSetting": "keep-me",
+            "statusLine": {"type": "command", "command": str(script)},
+        }))
+        result = hooks.install("claude-code", base=self.base, refresh_interval=5)
+        self.assertEqual(result["refresh_interval"], 5)
+        settings = self._settings()
+        self.assertEqual(settings["statusLine"]["refreshInterval"], 5)
+        self.assertEqual(settings["statusLine"]["command"], str(script))   # command still untouched
+        self.assertEqual(settings["otherSetting"], "keep-me")
+
+    def test_explicit_refresh_interval_dry_run_writes_nothing(self):
+        script = self._existing_script()
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({"statusLine": {"type": "command", "command": str(script)}}))
+        hooks.install("claude-code", base=self.base, refresh_interval=5, dry_run=True)
+        self.assertNotIn("refreshInterval", self._settings()["statusLine"])
+
+    def test_zero_means_explicitly_event_based_in_appended_mode(self):
+        script = self._existing_script()
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({
+            "statusLine": {"type": "command", "command": str(script), "refreshInterval": 5},
+        }))
+        result = hooks.install("claude-code", base=self.base, refresh_interval=0)
+        self.assertEqual(result["refresh_interval"], 0)
+        self.assertTrue(result["settings_changed"])
+        settings = self._settings()
+        self.assertNotIn("refreshInterval", settings["statusLine"])
+        self.assertEqual(settings["statusLine"]["command"], str(script))   # command untouched
+
+    def test_zero_on_an_already_event_based_config_makes_no_write(self):
+        script = self._existing_script()
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({"statusLine": {"type": "command", "command": str(script)}}))
+        mtime_before = path.stat().st_mtime_ns
+        result = hooks.install("claude-code", base=self.base, refresh_interval=0)
+        self.assertEqual(result["refresh_interval"], 0)
+        self.assertFalse(result["settings_changed"])
+        self.assertEqual(path.stat().st_mtime_ns, mtime_before)   # never even opened for write
+
+    def test_zero_means_explicitly_event_based_in_standalone_mode(self):
+        result = hooks.install("claude-code", base=self.base, refresh_interval=0)
+        self.assertEqual(result["refresh_interval"], 0)
+        self.assertNotIn("refreshInterval", self._settings()["statusLine"])
+
+    def test_no_flag_still_defaults_standalone_to_two_seconds(self):
+        result = hooks.install("claude-code", base=self.base)
+        self.assertEqual(result["refresh_interval"], 2)
+        self.assertEqual(self._settings()["statusLine"]["refreshInterval"], 2)
+
     def test_uninstall_drops_the_key_when_there_was_nothing_before(self):
         hooks.install("claude-code", base=self.base)
         hooks.uninstall("claude-code", base=self.base)
@@ -728,6 +790,23 @@ class HookInstallTest(unittest.TestCase):
 
     def test_detect_only_returns_agents_actually_present(self):
         self.assertEqual(hooks.detect(base=self.base), {"claude-code": Path(self.base) / ".claude"})
+
+
+class HooksCliFlagTest(unittest.TestCase):
+    def test_refresh_interval_out_of_range_is_rejected(self):
+        self.assertEqual(main(["hooks", "--install", "--refresh-interval", "61"]), 1)
+        self.assertEqual(main(["hooks", "--install", "--refresh-interval", "-1"]), 1)
+
+    def test_zero_is_a_valid_refresh_interval(self):
+        with tempfile.TemporaryDirectory() as base:
+            os.makedirs(os.path.join(base, ".claude"))
+            from unittest import mock
+            with mock.patch.object(hooks, "home", lambda b=None: Path(base)):
+                self.assertEqual(
+                    main(["hooks", "--install", "claude-code", "--refresh-interval", "0"]), 0)
+                with open(hooks.settings_path("claude-code")) as fh:
+                    settings = json.load(fh)
+                self.assertNotIn("refreshInterval", settings["statusLine"])
 
 
 class HookLivenessTest(unittest.TestCase):

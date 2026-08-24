@@ -262,15 +262,25 @@ def install(agent, base=None, refresh_interval=None, dry_run=False, force=False)
     existing_command = current.get("command") if isinstance(current, dict) else None
     our_wrapper = wrapper_path(agent, base)
 
+    # refresh_interval semantics, deliberately three-valued so "event-based" is something
+    # the caller can ask for, not just what happens when they don't ask for anything:
+    #   None -> don't decide: standalone mode still needs *some* cadence since we alone
+    #           own the file, so it gets `default_interval`; appended mode leaves whatever
+    #           was already configured exactly alone (the safe default from before).
+    #   0    -> explicitly event-based: no refreshInterval key at all, in either mode.
+    #   1-60 -> that many seconds, in either mode.
+
     # Nothing configured yet, or we already own the slot (a prior local-tts install) --
     # safe to write our own standalone wrapper and take the (empty-or-already-ours) slot.
     if not existing_command or existing_command == str(our_wrapper):
         script = _render_standalone_wrapper(agent, base)
-        block = {"type": "command", "command": str(our_wrapper),
-                 "refreshInterval": refresh_interval or default_interval}
+        block = {"type": "command", "command": str(our_wrapper)}
+        if refresh_interval != 0:
+            block["refreshInterval"] = refresh_interval if refresh_interval is not None else default_interval
         block.update(extra)
         result = {"mode": "standalone", "settings_path": path, "target_file": our_wrapper,
-                  "wrapper_path": our_wrapper, "block": block}
+                  "wrapper_path": our_wrapper, "block": block,
+                  "refresh_interval": block.get("refreshInterval", 0)}
         if dry_run:
             return result
         our_wrapper.parent.mkdir(parents=True, exist_ok=True)
@@ -286,11 +296,33 @@ def install(agent, base=None, refresh_interval=None, dry_run=False, force=False)
     target = _resolve_appendable_file(existing_command, base)
     if target is not None and not force:
         block = _heartbeat_block(agent, base)
+        # refreshInterval is the one exception to "never touch the existing block": it's
+        # an independent timing knob, not part of what identifies who owns the slot (that
+        # was always `command`, which we still never touch here). Still opt-in only --
+        # bumping it also changes how often the OTHER tool's own script gets invoked, and
+        # we have no visibility into whether that costs it anything.
+        interval_note, settings_changed = None, False
+        if refresh_interval == 0:
+            interval_note = 0
+            if "refreshInterval" in current:
+                current = dict(current)
+                current.pop("refreshInterval")
+                settings_changed = True
+        elif refresh_interval is not None:
+            interval_note = refresh_interval
+            if current.get("refreshInterval") != refresh_interval:
+                current = dict(current)
+                current["refreshInterval"] = refresh_interval
+                settings_changed = True
         result = {"mode": "appended", "settings_path": path, "target_file": target,
-                  "wrapper_path": None, "block": None}
+                  "wrapper_path": None, "block": None, "refresh_interval": interval_note,
+                  "settings_changed": settings_changed}
         if dry_run:
             return result
         _append_block(target, block)
+        if settings_changed:
+            _set_nested(data, key_path, current)
+            path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         return result
 
     if not force:

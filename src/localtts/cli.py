@@ -432,11 +432,22 @@ def hooks_command(argv):
                              "can't be safely appended to (not a plain script file). This "
                              "is the fragile chain-by-reference mode -- only use it if the "
                              "existing command has no simpler script file to extend.")
+    parser.add_argument("--refresh-interval", type=int, metavar="SECONDS",
+                        help="with --install: how often the status bar re-renders on a "
+                             "timer. 1-60 for a real timer; 0 for explicitly event-based "
+                             "(no timer at all, only redraws on host events). When nothing "
+                             "else is configured this already defaults to 2s. When "
+                             "appending into an existing status line (e.g. another tool's), "
+                             "refreshInterval is left exactly as it was unless you pass "
+                             "this -- it also changes how often THAT tool's own script "
+                             "re-runs, so it's opt-in there either way.")
     parser.add_argument("--dry-run", action="store_true", help="show what would change")
     args = parser.parse_args(argv)
 
     if sum([args.install, args.uninstall, args.status]) > 1:
         raise TTSError("choose one of --install, --uninstall, --status")
+    if args.refresh_interval is not None and not (0 <= args.refresh_interval <= 60):
+        raise TTSError("--refresh-interval must be 0 (event-based) or between 1 and 60 seconds")
 
     if args.status:
         active = hooks.any_active()
@@ -480,15 +491,30 @@ def hooks_command(argv):
     for name in chosen:
         try:
             if args.install:
-                result = hooks.install(name, dry_run=args.dry_run, force=args.force)
+                result = hooks.install(name, dry_run=args.dry_run, force=args.force,
+                                       refresh_interval=args.refresh_interval)
                 verb = "would" if args.dry_run else "did"
                 if result["mode"] == "appended":
-                    print("  %-12s %s append into %s -- your existing status line is "
-                          "untouched, and picks this up on its very next refresh"
-                          % (name, verb, result["target_file"]))
+                    if not result.get("settings_changed"):
+                        print("  %-12s %s append into %s -- your existing status line is "
+                              "untouched (including its refresh rate), and picks this up "
+                              "on its very next refresh"
+                              % (name, verb, result["target_file"]))
+                    elif result["refresh_interval"] == 0:
+                        print("  %-12s %s append into %s and set it to event-based (no "
+                              "timer -- also affects the existing command's refresh rate)"
+                              % (name, verb, result["target_file"]))
+                        needs_restart = True   # refreshInterval IS read at startup
+                    else:
+                        print("  %-12s %s append into %s and set refreshInterval to %ss "
+                              "(also affects the existing command's own refresh rate)"
+                              % (name, verb, result["target_file"], result["refresh_interval"]))
+                        needs_restart = True
                 elif result["mode"] == "standalone":
-                    print("  %-12s %s write -> %s (refresh every %ss)" % (
-                        name, verb, result["settings_path"], result["block"]["refreshInterval"]))
+                    cadence = ("event-based (no timer)" if result["refresh_interval"] == 0
+                              else "every %ss" % result["refresh_interval"])
+                    print("  %-12s %s write -> %s (%s)" % (
+                        name, verb, result["settings_path"], cadence))
                     needs_restart = True
                 else:   # forced
                     print("  %-12s %s replace statusLine.command, chaining %r (--force)" % (
