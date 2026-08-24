@@ -302,6 +302,12 @@ class ProgressBarTest(unittest.TestCase):
         bar = audio.progress_bar(3, 0, width=10)
         self.assertIn("0:03", bar)
 
+    def test_elapsed_label_is_clamped_to_the_total_not_just_the_bar_fill(self):
+        # Real elapsed time can briefly exceed the file's duration between refreshes --
+        # the displayed "X / Y" must never show X > Y, e.g. "0:11 / 0:09".
+        bar = audio.progress_bar(11, 9, width=10)
+        self.assertEqual(bar, "[##########] 0:09 / 0:09")
+
 
 class RegistryTest(unittest.TestCase):
     def test_every_registered_provider_has_defaults(self):
@@ -388,6 +394,13 @@ class CompactStatusTest(unittest.TestCase):
         audio._write_state(os.getpid(), "/tmp/x.wav", duration_seconds=12.0, paused=True,
                            elapsed=3.0, segment_start=None)
         self.assertIn("⏸", audio.compact_status())
+
+    def test_elapsed_label_is_clamped_to_the_total(self):
+        audio._write_state(os.getpid(), "/tmp/x.wav", duration_seconds=9.0,
+                           elapsed=11.0, segment_start=None)
+        status = audio.compact_status()
+        self.assertIn("0:09/0:09", status)
+        self.assertNotIn("0:11", status)
 
 
 class SessionScopingTest(unittest.TestCase):

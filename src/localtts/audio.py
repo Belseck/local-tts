@@ -337,7 +337,11 @@ def progress_bar(elapsed, total, width=20):
     safe to print once and leave in a transcript, unlike a carriage-return spinner."""
     if total <= 0:
         return "[%s] %s" % ("?" * width, format_time(elapsed))
-    filled = min(width, int(width * min(1.0, elapsed / total)))
+    # Real elapsed time can briefly exceed the file's duration -- the player takes a
+    # moment to exit after the audio ends, and we only notice on the next refresh -- so
+    # clamp for display, or the label reads like "0:11 / 0:09" for a second or two.
+    elapsed = min(elapsed, total)
+    filled = min(width, int(width * (elapsed / total)))
     bar = "#" * filled + "-" * (width - filled)
     return "[%s] %s / %s" % (bar, format_time(elapsed), format_time(total))
 
@@ -358,7 +362,8 @@ def compact_status(width=10, session=None):
     total = float(state.get("duration") or 0.0)
     if total <= 0:
         return "%s %s" % (icon, format_time(elapsed))
-    filled = min(width, int(width * min(1.0, elapsed / total)))
+    elapsed = min(elapsed, total)   # see progress_bar()'s comment on the same clamp
+    filled = min(width, int(width * (elapsed / total)))
     bar = "#" * filled + "-" * (width - filled)
     return "%s %s/%s [%s]" % (icon, format_time(elapsed), format_time(total), bar)
 
