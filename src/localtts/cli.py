@@ -6,11 +6,12 @@ import os
 import sys
 import tempfile
 
-from localtts import __version__, audio, config, providers, text as textutil
+from localtts import __version__, audio, config, providers, skills, text as textutil
 from localtts.errors import TTSError
 
 PROG = "tts"
-SUBCOMMANDS = ("config", "providers", "check")
+SUBCOMMANDS = ("config", "providers", "check", "languages", "skills",
+               "playback", "stop", "pause", "resume")
 
 
 def _speak_parser():
@@ -20,6 +21,9 @@ def _speak_parser():
         epilog=(
             "subcommands:\n"
             "  %(prog)s providers            list available backends\n"
+            "  %(prog)s languages            show which backend speaks which language\n"
+            "  %(prog)s skills               install agent skills for this CLI\n"
+            "  %(prog)s stop | pause | resume control background playback\n"
             "  %(prog)s check                verify backends and audio players\n"
             "  %(prog)s config --show        print the effective configuration\n"
             "  %(prog)s config --set k=v     persist a setting\n"
@@ -27,6 +31,7 @@ def _speak_parser():
             "  %(prog)s \"hello world\"\n"
             "  %(prog)s -o out.wav -f script.txt\n"
             "  echo \"from a pipe\" | %(prog)s\n"
+            "  %(prog)s -b --lang es \"en segundo plano\"\n"
             "  %(prog)s --provider openai --voice nova \"hi there\"\n"
         ) % {"prog": PROG},
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -39,10 +44,15 @@ def _speak_parser():
                         help="speak the input verbatim, markdown included")
     parser.add_argument("-o", "--output", help="write audio here instead of playing it")
     parser.add_argument("-p", "--provider", choices=providers.names(), help="backend to use")
+    parser.add_argument("-l", "--lang", metavar="CODE",
+                        help="use the backend and voice remembered for this language (see `tts languages`)")
     parser.add_argument("-v", "--voice", help="voice: speaker file (llamacpp), .onnx (piper) or name (openai)")
     parser.add_argument("-m", "--model", help="override the provider's model for this run")
     parser.add_argument("-s", "--set", dest="overrides", action="append", default=[],
                         metavar="KEY=VALUE", help="override a provider setting for this run (repeatable)")
+    parser.add_argument("-b", "--background", action="store_true",
+                        help="play in the background and return immediately; keeps the file "
+                             "and prints its path (control it with `tts stop|pause|resume`)")
     parser.add_argument("--play", action="store_true", help="play the audio even when --output is given")
     parser.add_argument("--no-play", action="store_true", help="never play, just report the file path")
     parser.add_argument("--player", help="playback command to use (default: autodetect)")
@@ -92,6 +102,31 @@ def _apply_overrides(provider, args):
         provider.settings["model"] = args.model
 
 
+def _resolve_language(cfg, args):
+    """Pick the backend (and voice) for --lang, without overriding explicit flags."""
+    name = args.provider or cfg["provider"]
+    voice = args.voice
+    if not args.lang:
+        return name, voice
+
+    entry = config.language_entry(cfg, args.lang)
+    if entry is None:
+        known = ", ".join(sorted(cfg.get("languages") or {})) or "none recorded yet"
+        raise TTSError(
+            "no backend remembered for language %r (known: %s). Record one with "
+            "`%s languages --set %s=<provider>[:<voice>]`."
+            % (args.lang, known, PROG, args.lang)
+        )
+    recorded = entry.get("provider")
+    if not args.provider and recorded:
+        name = recorded
+    # A voice is provider-specific: a piper .onnx means nothing to llama.cpp. Only apply
+    # the recorded voice when the backend actually in use is the one it was recorded for.
+    if not args.voice and entry.get("voice") and (not recorded or recorded == name):
+        voice = os.path.expanduser(entry["voice"])
+    return name, voice
+
+
 def speak(argv):
     args = _speak_parser().parse_args(argv)
     cfg = config.load()
@@ -103,7 +138,8 @@ def speak(argv):
     if not text:
         raise TTSError("nothing to speak: the input was empty")
 
-    provider = providers.build(args.provider or cfg["provider"], cfg, verbose=args.verbose)
+    name, voice = _resolve_language(cfg, args)
+    provider = providers.build(name, cfg, verbose=args.verbose)
     _apply_overrides(provider, args)
 
     if args.output:
@@ -122,6 +158,7 @@ def speak(argv):
         os.close(handle)
         temporary = True
 
+    args.voice = voice
     if args.dry_run:
         pieces = textutil.chunks(text, provider.max_words)
         if len(pieces) > 1:
@@ -148,16 +185,23 @@ def speak(argv):
     try:
         _synthesize(provider, text, out_path, args)
 
-        should_play = not args.no_play and (args.play or (temporary and cfg["play"]))
+        should_play = not args.no_play and (
+            args.play or args.background or (temporary and cfg["play"]))
         played = False
-        if should_play:
+        if should_play and args.background:
+            pid = audio.play_detached(out_path, args.player or cfg["player"], verbose=args.verbose)
+            played = pid is not None
+            if played:
+                print("playing in the background (pid %d) — `%s stop` to end it"
+                      % (pid, PROG), file=sys.stderr)
+            # The file outlives this process, so it must not be deleted on the way out.
+            temporary = False
+        elif should_play:
             played = audio.play(out_path, args.player or cfg["player"], verbose=args.verbose)
-            if not played:
-                print(
-                    "no audio player found (tried: %s). Install ffmpeg, or use --output."
-                    % ", ".join(name for name, _ in audio.PLAYERS),
-                    file=sys.stderr,
-                )
+
+        if should_play and not played:
+            print("no audio player found (tried: %s). Install ffmpeg, or use --output."
+                  % ", ".join(name for name, _ in audio.PLAYERS), file=sys.stderr)
 
         if not temporary:
             print(out_path)
@@ -206,6 +250,45 @@ def list_providers(argv):
     return 0
 
 
+def languages(argv):
+    parser = argparse.ArgumentParser(
+        prog="%s languages" % PROG,
+        description="Remember which backend and voice to use per language.",
+        epilog=("examples:\n"
+                "  %(prog)s --set es=piper:~/voices/es_MX-claude-high.onnx\n"
+                "  %(prog)s --set en=llamacpp\n"
+                "  %(prog)s --forget es\n") % {"prog": "%s languages" % PROG},
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--set", dest="assignments", action="append", default=[],
+                        metavar="CODE=PROVIDER[:VOICE]",
+                        help="record a language preference (repeatable)")
+    parser.add_argument("--forget", action="append", default=[], metavar="CODE",
+                        help="drop a recorded language (repeatable)")
+    args = parser.parse_args(argv)
+
+    if args.assignments or args.forget:
+        config.set_values(
+            ["languages.%s" % item for item in args.assignments]
+            + ["languages.%s=" % code for code in args.forget]
+        )
+        print("updated %s" % config.config_path())
+
+    recorded = config.load().get("languages") or {}
+    if not recorded:
+        print("no language preferences recorded yet.\n"
+              "Record one with `%s languages --set es=piper:/path/to/voice.onnx`." % PROG)
+        return 0
+    width = max(len(code) for code in recorded)
+    for code in sorted(recorded):
+        entry = recorded[code] or {}
+        voice = entry.get("voice")
+        print("  %-*s  %-9s %s" % (width, code, entry.get("provider") or "-",
+                                   os.path.basename(voice) if voice else ""))
+    print("\nUse with: %s --lang <code> \"...\"" % PROG)
+    return 0
+
+
 def check(argv):
     parser = argparse.ArgumentParser(prog="%s check" % PROG, description="Verify backends and audio players.")
     parser.parse_args(argv)
@@ -225,6 +308,107 @@ def check(argv):
     found = audio.available_players()
     print("players     : %s" % (", ".join(found) if found else "none found (install ffmpeg for ffplay)"))
     return 0 if ok_default else 1
+
+
+def playback_command(argv, action=None):
+    parser = argparse.ArgumentParser(
+        prog="%s playback" % PROG,
+        description="Control audio started with `%s --background`." % PROG,
+        epilog=("shortcuts:\n"
+                "  %s stop      %s pause      %s resume\n" % (PROG, PROG, PROG)),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--status", action="store_true", help="is anything playing? (default)")
+    group.add_argument("--stop", action="store_true", help="end playback")
+    group.add_argument("--pause", action="store_true", help="suspend playback")
+    group.add_argument("--resume", action="store_true", help="continue a paused playback")
+    args = parser.parse_args(argv)
+
+    chosen = action or ("stop" if args.stop else "pause" if args.pause
+                        else "resume" if args.resume else "status")
+    handler = {
+        "stop": audio.stop_playback,
+        "pause": audio.pause_playback,
+        "resume": audio.resume_playback,
+        "status": audio.playback_status,
+    }[chosen]
+    ok, message = handler()
+    print(message, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok or chosen == "status" else 1
+
+
+def skills_command(argv):
+    parser = argparse.ArgumentParser(
+        prog="%s skills" % PROG,
+        description="Install the local-tts skills into your coding agents.",
+        epilog=("Skills teach an agent to speak to you with this CLI and to configure it.\n"
+                "With no options, prints what was detected and what is installed.\n\n"
+                "examples:\n"
+                "  %(prog)s                      show detected agents and status\n"
+                "  %(prog)s --install            install into every detected agent\n"
+                "  %(prog)s --install claude-code gemini\n"
+                "  %(prog)s --install --all      install even where no agent was detected\n"
+                "  %(prog)s --uninstall\n") % {"prog": "%s skills" % PROG},
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("agents", nargs="*", metavar="AGENT",
+                        help="limit to these agents (default: every detected one); one of: "
+                             + ", ".join(sorted(skills.AGENTS)))
+    parser.add_argument("--install", action="store_true", help="write the skills")
+    parser.add_argument("--uninstall", action="store_true", help="remove them again")
+    parser.add_argument("--all", action="store_true",
+                        help="with --install, also target agents that were not detected")
+    parser.add_argument("--dry-run", action="store_true", help="show what would be written")
+    args = parser.parse_args(argv)
+
+    if args.install and args.uninstall:
+        raise TTSError("choose either --install or --uninstall, not both")
+
+    detected = skills.detect()
+    chosen = args.agents or sorted(detected if not args.all else skills.AGENTS)
+    unknown = [a for a in chosen if a not in skills.AGENTS]
+    if unknown:
+        raise TTSError("unknown agent(s): %s" % ", ".join(unknown))
+
+    if not args.install and not args.uninstall:
+        print("bundled skills : %s" % ", ".join(skills.SKILLS))
+        print("")
+        for name in sorted(skills.AGENTS):
+            kind, _, label = skills.AGENTS[name]
+            installed, detail = skills.status(name)
+            mark = "ok" if installed else ("--" if name in detected else "  ")
+            print("[%s] %-12s %-16s %-9s %s"
+                  % (mark, name, label, "(%s)" % kind,
+                     detail if name in detected else "agent not detected"))
+        print("")
+        if detected:
+            print("Install with: %s skills --install" % PROG)
+        else:
+            print("No coding agents detected. Use --install --all to write them anyway.")
+        return 0
+
+    if not chosen:
+        raise TTSError("no coding agents detected; pass names explicitly or use --all")
+
+    action = skills.install if args.install else skills.uninstall
+    verb = "would write" if args.dry_run else ("wrote" if args.install else "removed")
+    total = 0
+    for name in chosen:
+        try:
+            paths = action(name, dry_run=args.dry_run) if args.install else action(name)
+        except TTSError as exc:
+            print("  %-12s failed: %s" % (name, exc), file=sys.stderr)
+            continue
+        if not paths:
+            print("  %-12s nothing to remove" % name)
+            continue
+        for path in paths:
+            print("  %-12s %s %s" % (name, verb, path))
+            total += 1
+    if args.install and not args.dry_run and total:
+        print("\nRestart your agent (or start a new session) so it picks the skills up.")
+    return 0
 
 
 def config_command(argv):
@@ -268,7 +452,16 @@ def main(argv=None):
         return 0
     try:
         if argv and argv[0] in SUBCOMMANDS:
-            handler = {"config": config_command, "providers": list_providers, "check": check}[argv[0]]
+            handler = {
+                "config": config_command,
+                "providers": list_providers,
+                "check": check,
+                "languages": languages,
+                "skills": skills_command,
+                "playback": playback_command,
+            }.get(argv[0])
+            if handler is None:      # stop / pause / resume are shortcuts
+                return playback_command(argv[1:], action=argv[0])
             return handler(argv[1:])
         return speak(argv)
     except TTSError as exc:

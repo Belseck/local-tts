@@ -267,6 +267,29 @@ being played.
 
 ---
 
+## Step 6b — Agent skills and the language memory — **ASK**
+
+Install the skills that teach coding agents (this one included) to use the CLI:
+
+```bash
+tts skills                 # what is detected and what is installed
+tts skills --install       # every detected agent
+```
+
+Then record which backend speaks the human's language, so the preference is shared by every
+agent instead of living in one session:
+
+```bash
+tts languages --set es=piper:~/.local/share/piper-voices/es_MX-claude-high.onnx
+tts languages --set en=llamacpp
+tts languages
+```
+
+If you installed piper in Step 4, **record its language here** — otherwise the next agent
+will not know it exists and will fall back to llama.cpp with the wrong phonetics.
+
+Tell the human that skills only take effect after restarting their agent.
+
 ## Step 7 — Validate
 
 Run all of these and show the real output:
@@ -275,6 +298,8 @@ Run all of these and show the real output:
 tts --version                 # or .venv/bin/tts if no symlink was created
 tts                           # with no args, prints the full parameter list
 tts check                     # per-provider readiness + detected players
+tts languages                 # recorded language preferences
+tts skills                    # agent skill status
 ```
 
 `tts check` must show `[ok]` on the row for the **default provider**. Other rows may be
@@ -305,8 +330,10 @@ Close with a short summary containing:
 - What you skipped and why
 - Whether the symlink was created, and the exact path
 - The `tts check` result
+- Which agents received the skills, and that a restart is needed
+- What was recorded in `tts languages`
 - The one command they will use day to day, e.g.
-  `tts -p piper -f documento.md -o documento.wav`
+  `tts --lang es -f documento.md -o documento.wav`
 - How to undo it: `rm ~/.local/bin/tts`, `rm -rf .venv ~/.local/share/piper-venv ~/.local/share/piper-voices`
 
 ---

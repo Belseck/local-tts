@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 from copy import deepcopy
 from pathlib import Path
 
@@ -17,6 +18,10 @@ DEFAULTS = {
     "play": True,
     # Force a specific playback command (e.g. "ffplay"). Empty => autodetect.
     "player": "",
+    # Which backend speaks which language, e.g.
+    #   {"es": {"provider": "piper", "voice": "~/voices/es_MX-claude-high.onnx"}}
+    # Shared by every coding agent so the preference is remembered in one place.
+    "languages": {},
     "providers": {
         "llamacpp": {
             "binary": "llama-tts",
@@ -66,11 +71,27 @@ DEFAULTS = {
 
 
 TOP_LEVEL_KEYS = ("provider", "play", "player")
+LANGUAGE_KEYS = ("provider", "voice")
+
+
+def config_root():
+    """Per-platform config directory: %APPDATA% on Windows, ~/.config elsewhere.
+
+    $XDG_CONFIG_HOME wins everywhere when it is set, so a user can keep one location
+    across machines.
+    """
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg)
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return Path(appdata)
+    return Path.home() / ".config"
 
 
 def config_dir():
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(Path.home(), ".config")
-    return Path(base) / APP_NAME
+    return config_root() / APP_NAME
 
 
 def config_path():
@@ -114,6 +135,11 @@ def _apply_env(cfg):
         if suffix in TOP_LEVEL_KEYS:
             cfg[suffix] = _coerce(raw, DEFAULTS[suffix])
             continue
+        if suffix.startswith("lang_"):
+            code = suffix[len("lang_"):].replace("_", "-")
+            if code:
+                cfg.setdefault("languages", {})[code] = parse_language_value(raw)
+            continue
         for provider, settings in cfg["providers"].items():
             prefix = provider + "_"
             if suffix.startswith(prefix):
@@ -138,6 +164,37 @@ def load():
     return _apply_env(cfg)
 
 
+def normalize_language(code):
+    """'es-MX', 'es_MX', 'ES' -> ('es-mx', 'es'): the exact tag and its base."""
+    tag = str(code or "").strip().lower().replace("_", "-")
+    return tag, tag.split("-")[0]
+
+
+def language_entry(cfg, code):
+    """The {provider, voice} recorded for a language, matching 'es-MX' before 'es'."""
+    languages = cfg.get("languages") or {}
+    exact, base = normalize_language(code)
+    for key in (exact, base):
+        for stored, entry in languages.items():
+            if normalize_language(stored)[0] == key:
+                return entry
+    return None
+
+
+def parse_language_value(raw):
+    """Accept 'piper' or 'piper:/path/to/voice.onnx'."""
+    provider, _, voice = str(raw).partition(":")
+    provider = provider.strip()
+    if provider and provider not in DEFAULTS["providers"]:
+        raise TTSError(
+            "unknown provider %r (available: %s)" % (provider, ", ".join(sorted(DEFAULTS["providers"])))
+        )
+    entry = {"provider": provider} if provider else {}
+    if voice.strip():
+        entry["voice"] = voice.strip()
+    return entry
+
+
 def read_user_config():
     """The on-disk config only, without defaults or environment applied."""
     path = config_path()
@@ -157,6 +214,26 @@ def set_values(assignments):
             raise TTSError("expected key=value, got %r" % item)
         key, raw = item.split("=", 1)
         key = key.strip()
+        if key.startswith("languages."):
+            rest = key[len("languages."):]
+            code, _, field = rest.partition(".")
+            if not code:
+                raise TTSError("expected languages.<code>=<provider>[:<voice>]")
+            bucket = user.setdefault("languages", {}).setdefault(code, {})
+            if field:
+                if field not in LANGUAGE_KEYS:
+                    raise TTSError(
+                        "unknown language key %r (valid: %s)" % (field, ", ".join(LANGUAGE_KEYS))
+                    )
+                if field == "provider" and raw and raw not in DEFAULTS["providers"]:
+                    raise TTSError("unknown provider %r" % raw)
+                bucket[field] = raw
+            else:
+                bucket.clear()
+                bucket.update(parse_language_value(raw))
+            if not bucket:
+                user["languages"].pop(code, None)
+            continue
         if "." in key:
             provider, sub = key.split(".", 1)
             if provider not in DEFAULTS["providers"]:

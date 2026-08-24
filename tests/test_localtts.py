@@ -2,12 +2,13 @@
 
 import json
 import os
+import signal
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from localtts import audio, config, providers, text as textutil
+from localtts import audio, config, providers, skills, text as textutil
 from localtts.cli import main
 from localtts.errors import TTSError
 from localtts.providers.command import CommandProvider
@@ -194,6 +195,63 @@ class ConcatTest(unittest.TestCase):
             audio.concat_wavs([], "/tmp/never.wav")
 
 
+class PlaybackControlTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = os.path.join(self.tmp.name, "playback.json")
+        self.original = audio.STATE_FILE
+        audio.STATE_FILE = self.state
+        self.addCleanup(setattr, audio, "STATE_FILE", self.original)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_idle_reports_nothing_playing(self):
+        for call in (audio.playback_status, audio.stop_playback,
+                     audio.pause_playback, audio.resume_playback):
+            ok, message = call()
+            self.assertFalse(ok, call.__name__)
+            self.assertIn("nothing is playing", message)
+
+    def test_stale_pid_is_reported_as_idle_and_cleared(self):
+        with open(self.state, "w") as fh:
+            json.dump({"pid": 2 ** 30, "path": "/tmp/gone.wav"}, fh)
+        ok, message = audio.playback_status()
+        self.assertFalse(ok)
+        self.assertFalse(os.path.exists(self.state))
+
+    def test_control_a_real_background_process(self):
+        import subprocess as sp
+        proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                        stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        self.addCleanup(proc.kill)
+        audio._write_state(proc.pid, "/tmp/x.wav")
+
+        ok, message = audio.playback_status()
+        self.assertTrue(ok)
+        self.assertIn("playing", message)
+
+        if hasattr(signal, "SIGSTOP"):
+            self.assertTrue(audio.pause_playback()[0])
+            self.assertIn("paused", audio.playback_status()[1])
+            self.assertTrue(audio.resume_playback()[0])
+            self.assertIn("playing", audio.playback_status()[1])
+
+        ok, message = audio.stop_playback()
+        self.assertTrue(ok)
+        self.assertIn("stopped", message)
+        self.assertFalse(os.path.exists(self.state))
+        proc.wait(timeout=5)
+
+    def test_starting_playback_stops_the_previous_one(self):
+        import subprocess as sp
+        proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                        stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        self.addCleanup(proc.kill)
+        audio._write_state(proc.pid, "/tmp/old.wav")
+        audio.stop_previous()
+        proc.wait(timeout=5)
+        self.assertFalse(os.path.exists(self.state))
+
+
 class RegistryTest(unittest.TestCase):
     def test_every_registered_provider_has_defaults(self):
         for name in providers.names():
@@ -203,6 +261,158 @@ class RegistryTest(unittest.TestCase):
     def test_unknown_provider_raises(self):
         with self.assertRaises(TTSError):
             providers.build("nope", config.DEFAULTS)
+
+
+class LanguageMemoryTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["LOCALTTS_CONFIG"] = os.path.join(self.tmp.name, "config.json")
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(os.environ.pop, "LOCALTTS_CONFIG", None)
+
+    def test_record_provider_and_voice(self):
+        config.set_values(["languages.es=piper:/voices/es_MX.onnx"])
+        entry = config.language_entry(config.load(), "es")
+        self.assertEqual(entry, {"provider": "piper", "voice": "/voices/es_MX.onnx"})
+
+    def test_specific_region_wins_over_base(self):
+        config.set_values(["languages.es=piper:/generic.onnx",
+                           "languages.es-MX=piper:/mexican.onnx"])
+        cfg = config.load()
+        self.assertEqual(config.language_entry(cfg, "es-MX")["voice"], "/mexican.onnx")
+        self.assertEqual(config.language_entry(cfg, "es_mx")["voice"], "/mexican.onnx")
+        self.assertEqual(config.language_entry(cfg, "es")["voice"], "/generic.onnx")
+
+    def test_unknown_language_is_absent_not_guessed(self):
+        config.set_values(["languages.es=piper"])
+        self.assertIsNone(config.language_entry(config.load(), "fr"))
+
+    def test_forget_removes_the_entry(self):
+        config.set_values(["languages.es=piper"])
+        config.set_values(["languages.es="])
+        self.assertEqual(config.load()["languages"], {})
+
+    def test_unknown_provider_is_rejected(self):
+        with self.assertRaises(TTSError):
+            config.set_values(["languages.es=notaprovider"])
+
+    def test_env_can_record_a_language(self):
+        os.environ["LOCALTTS_LANG_DE"] = "piper:/voices/de.onnx"
+        self.addCleanup(os.environ.pop, "LOCALTTS_LANG_DE", None)
+        self.assertEqual(config.language_entry(config.load(), "de")["provider"], "piper")
+
+    def test_lang_flag_selects_the_recorded_backend(self):
+        config.set_values(["languages.es=piper:/voices/es.onnx"])
+        self.assertEqual(main(["--lang", "es", "--dry-run", "hola"]), 1)   # piper voice missing -> clean error
+
+    def test_lang_flag_without_a_record_is_a_clean_error(self):
+        self.assertEqual(main(["--lang", "xx", "hola"]), 1)
+
+    def test_explicit_provider_beats_the_recorded_one(self):
+        config.set_values(["languages.es=piper:/voices/es.onnx"])
+        self.assertEqual(main(["--lang", "es", "-p", "llamacpp", "--dry-run", "hola"]), 0)
+
+
+SAMPLE_RULES = "# Mine\n\nAlways use tabs.\n"
+
+
+class SkillInstallTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = self.tmp.name
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_bundled_skills_have_name_and_description(self):
+        for name in skills.SKILLS:
+            meta, prose = skills.split_frontmatter(skills.read_skill(name))
+            self.assertEqual(meta.get("name"), name)
+            self.assertTrue(meta.get("description"), name)
+            self.assertTrue(prose.strip(), name)
+
+    def test_detection_only_reports_directories_that_exist(self):
+        self.assertEqual(skills.detect(self.base), {})
+        os.makedirs(os.path.join(self.base, ".claude"))
+        self.assertEqual(sorted(skills.detect(self.base)), ["claude-code"])
+
+    def test_skill_shaped_agent_gets_one_file_per_skill(self):
+        os.makedirs(os.path.join(self.base, ".claude"))
+        written = skills.install("claude-code", base=self.base)
+        self.assertEqual(len(written), len(skills.SKILLS))
+        for path in written:
+            self.assertTrue(path.exists())
+            self.assertEqual(path.name, "SKILL.md")
+        self.assertEqual(skills.status("claude-code", base=self.base)[0], True)
+
+    def test_doc_shaped_agent_preserves_existing_content(self):
+        os.makedirs(os.path.join(self.base, ".codex"))
+        target = os.path.join(self.base, ".codex", "AGENTS.md")
+        with open(target, "w") as fh:
+            fh.write(SAMPLE_RULES)
+        skills.install("codex", base=self.base)
+        body = open(target).read()
+        self.assertIn("Always use tabs.", body)
+        self.assertIn(skills.BEGIN, body)
+
+    def test_reinstall_does_not_duplicate_the_section(self):
+        os.makedirs(os.path.join(self.base, ".codex"))
+        skills.install("codex", base=self.base)
+        first = open(os.path.join(self.base, ".codex", "AGENTS.md")).read()
+        skills.install("codex", base=self.base)
+        second = open(os.path.join(self.base, ".codex", "AGENTS.md")).read()
+        self.assertEqual(first, second)
+        self.assertEqual(second.count(skills.BEGIN), 1)
+
+    def test_uninstall_restores_the_original_file(self):
+        os.makedirs(os.path.join(self.base, ".codex"))
+        target = os.path.join(self.base, ".codex", "AGENTS.md")
+        with open(target, "w") as fh:
+            fh.write(SAMPLE_RULES)
+        skills.install("codex", base=self.base)
+        skills.uninstall("codex", base=self.base)
+        self.assertEqual(open(target).read().strip(), SAMPLE_RULES.strip())
+
+    def test_uninstall_removes_a_file_it_created_alone(self):
+        os.makedirs(os.path.join(self.base, ".codex"))
+        skills.install("codex", base=self.base)
+        skills.uninstall("codex", base=self.base)
+        self.assertFalse(os.path.exists(os.path.join(self.base, ".codex", "AGENTS.md")))
+
+    def test_dry_run_writes_nothing(self):
+        os.makedirs(os.path.join(self.base, ".claude"))
+        written = skills.install("claude-code", base=self.base, dry_run=True)
+        self.assertTrue(written)
+        for path in written:
+            self.assertFalse(path.exists())
+
+    def test_unknown_agent_raises(self):
+        with self.assertRaises(TTSError):
+            skills.install("notanagent", base=self.base)
+
+    def test_config_root_follows_the_platform(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/xdg"}, clear=False):
+            self.assertEqual(str(config.config_root()), "/xdg")
+        env = {k: v for k, v in os.environ.items() if k != "XDG_CONFIG_HOME"}
+        env["APPDATA"] = os.path.join("C:", "Users", "x", "AppData", "Roaming")
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(sys, "platform", "win32"):
+            self.assertEqual(str(config.config_root()), env["APPDATA"])
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(sys, "platform", "linux"):
+            self.assertTrue(str(config.config_root()).endswith(".config"))
+
+    def test_skills_and_cli_agree_on_the_config_root(self):
+        self.assertEqual(skills.config_root(), config.config_root())
+
+    def test_config_placeholder_is_expanded(self):
+        path = skills.resolve("${CONFIG}/opencode", self.base)
+        self.assertEqual(path, Path(self.base) / ".config" / "opencode")
+
+    def test_every_agent_has_a_marker_and_a_label(self):
+        self.assertEqual(sorted(skills.AGENTS), sorted(skills.MARKERS))
+        for name, (kind, relative, label) in skills.AGENTS.items():
+            self.assertIn(kind, ("skill", "doc"))
+            self.assertTrue(relative and label, name)
 
 
 class CliTest(unittest.TestCase):
@@ -229,6 +439,12 @@ class CliTest(unittest.TestCase):
 
     def test_providers_subcommand(self):
         self.assertEqual(main(["providers"]), 0)
+
+    def test_skills_subcommand_reports_status(self):
+        self.assertEqual(main(["skills"]), 0)
+
+    def test_languages_subcommand(self):
+        self.assertEqual(main(["languages"]), 0)
 
 
 if __name__ == "__main__":

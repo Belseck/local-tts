@@ -1,5 +1,7 @@
 # local-tts
 
+Make your coding agent talk to you!
+
 A tiny command-line text-to-speech tool. It shells out to **llama.cpp's `llama-tts`**
 by default, so speech is generated locally and offline.
 
@@ -22,6 +24,9 @@ plus binaries you already have (or install once, on your terms).
   - [Install with an AI agent](#install-with-an-ai-agent)
 - [Quick start](#quick-start)
 - [Usage](#usage)
+- [Background playback](#background-playback)
+- [Coding-agent skills](#coding-agent-skills)
+- [Language memory](#language-memory)
 - [Providers](#providers)
 - [Configuration](#configuration)
 - [Audio playback](#audio-playback)
@@ -35,6 +40,7 @@ plus binaries you already have (or install once, on your terms).
 | What | Why | Required? |
 | --- | --- | --- |
 | Python ≥ 3.9 | runs the CLI | yes |
+| Linux, macOS or Windows | all three supported | — |
 | `llama-tts` from llama.cpp | the default speech backend | yes, for the default provider |
 | An audio player (`ffplay`, `paplay`, `aplay`, …) | playing the result | only if you want playback |
 
@@ -214,9 +220,11 @@ tts config [--show | --path | --init | --set KEY=VALUE]
 | `--markdown` / `--no-markdown` | Force markdown stripping on or off (automatic for `.md` files). |
 | `-o, --output FILE` | Write the audio here instead of playing it. |
 | `-p, --provider NAME` | `llamacpp` (default), `openai`, `piper`, `command`. |
+| `-l, --lang CODE` | Use the backend and voice remembered for this language. |
 | `-v, --voice VOICE` | Speaker file (llamacpp), `.onnx` voice (piper), or voice name (openai). |
 | `-m, --model MODEL` | Override the provider's model for this run. |
 | `-s, --set KEY=VALUE` | Override any provider setting for this run. Repeatable. |
+| `-b, --background` | Play in the background, return immediately, keep the file and print its path. |
 | `--play` | Play the audio *and* keep `--output`. |
 | `--no-play` | Never play; just report the file path. |
 | `--player CMD` | Force a playback command instead of autodetecting. |
@@ -240,6 +248,102 @@ single file with a short pause between pieces. Backends that manage long input t
 Exit codes: `0` success, `1` error (with a one-line message on stderr), `130` interrupted.
 
 ---
+
+## Background playback
+
+`--background` (`-b`) starts playback detached and returns straight away, so a long file
+does not block the shell — or an agent driving it. The file is kept and its path printed.
+
+```bash
+$ tts -b --lang es -f documento.md
+playing in the background (pid 4123) — `tts stop` to end it
+/tmp/local-tts-a1b2c3d4.wav
+```
+
+Control it afterwards:
+
+```bash
+tts playback     # playing / paused / nothing, and which file
+tts pause
+tts resume
+tts stop
+```
+
+Starting a new background playback stops the previous one, so voices never stack.
+`pause`/`resume` use `SIGSTOP`/`SIGCONT` and therefore work on Linux, macOS and WSL; on
+native Windows they report that they are unsupported and `stop` is the control.
+
+## Coding-agent skills
+
+`local-tts` ships two skills that teach a coding agent to use it, and installs them into
+whichever agents it finds on your machine:
+
+- **`local-tts-speak`** — speak to the user. Triggers on "talk to me", "read this aloud",
+  "narrate this file", "háblame", and so on. Instructs the agent to check the language
+  memory first, to always use `-b` (and to run the command itself non-blocking), to play the
+  whole thing regardless of length unless told otherwise, to offer `stop`/`pause`/`resume`,
+  to always report the file path, and never to read secrets out loud.
+- **`local-tts-configure`** — install, diagnose and configure: backends, voices for a new
+  language, playback, and the per-language memory. Starts from `tts check` and asks before
+  installing or downloading anything.
+
+```bash
+tts skills                       # what was detected, and what is installed
+tts skills --install             # install into every detected agent
+tts skills --install gemini      # or just one
+tts skills --install --dry-run   # show the paths without writing
+tts skills --uninstall           # remove them again
+```
+
+Restart the agent (or open a new session) afterwards so it picks them up.
+
+| Agent | Installed as |
+| --- | --- |
+| Claude Code | `~/.claude/skills/<name>/SKILL.md` |
+| Gemini CLI | `~/.gemini/skills/<name>/SKILL.md` |
+| OpenCode | `<config>/opencode/skills/<name>/SKILL.md` |
+| Qwen Code | `~/.qwen/skills/<name>/SKILL.md` |
+| Codex CLI | section in `~/.codex/AGENTS.md` |
+| Cursor | `~/.cursor/rules/local-tts.mdc` |
+| Windsurf | `~/.codeium/windsurf/memories/local-tts.md` |
+| GitHub Copilot | `<config>/github-copilot/local-tts-instructions.md` |
+
+`<config>` is `%APPDATA%` on Windows and `~/.config` on Linux and macOS
+(`$XDG_CONFIG_HOME` wins on any platform when set). Detection only writes where the agent's
+directory already exists, so nothing is created for agents you do not use.
+
+Agents with a real skill mechanism get one file per skill. Agents that read a single flat
+instructions file get a block delimited by `<!-- BEGIN local-tts skills -->` markers —
+**anything already in that file is preserved**, reinstalling replaces only the block, and
+`--uninstall` removes it and leaves the rest untouched.
+
+## Language memory
+
+Which backend speaks which language is remembered in the config file, so the preference
+survives sessions and is shared by *every* agent rather than living in one agent's memory.
+
+```bash
+tts languages                                     # show what is recorded
+tts languages --set es=piper:~/voices/es_MX.onnx  # provider + voice
+tts languages --set en=llamacpp                   # provider only
+tts languages --forget de
+```
+
+Then just name the language:
+
+```bash
+tts --lang es "Hola, ya terminé."
+tts --lang es -f documento.md -o documento.wav
+```
+
+The lookup prefers the specific tag over the base one, so with both recorded, `--lang es-MX`
+picks the Mexican entry while `--lang es` picks the generic one. Explicit flags always win
+over the memory, and a recorded voice is only applied to the provider it was recorded for —
+a piper `.onnx` is never handed to llama.cpp.
+
+This is what the agent skills write to when you give feedback like *"use piper for
+Spanish"* or *"that accent is wrong, use the Mexican voice"*. You can also set it per shell
+with `LOCALTTS_LANG_ES=piper:/path/voice.onnx`.
 
 ## Providers
 
@@ -395,9 +499,16 @@ tts config --show      # the effective configuration, defaults included
 tts config --init      # write a file containing every default, ready to edit
 ```
 
-Default location `~/.config/local-tts/config.json`
-(`$XDG_CONFIG_HOME/local-tts/config.json` if set, or `$LOCALTTS_CONFIG` to override
-the path entirely). It only needs to contain what you change:
+Default location:
+
+| Platform | Path |
+| --- | --- |
+| Linux / macOS | `~/.config/local-tts/config.json` |
+| Windows | `%APPDATA%\local-tts\config.json` |
+| any, if `XDG_CONFIG_HOME` is set | `$XDG_CONFIG_HOME/local-tts/config.json` |
+
+`$LOCALTTS_CONFIG` overrides the path entirely. The file only needs to contain what you
+change:
 
 ```json
 {
@@ -447,12 +558,14 @@ tts -p openai -s model=tts-1-hd -s speed=1.15 "faster, nicer"
 
 ## Audio playback
 
-There is no audio library to install. The first available player wins:
+There is no audio library to install.
 
-`ffplay` (ffmpeg) → `paplay` → `aplay` → `afplay` (macOS) → `play` (sox) → `mpv` → `cvlc`.
-
-On WSL with no Linux player installed, it falls back to Windows' own
-`powershell.exe` sound player.
+| Platform | Player |
+| --- | --- |
+| **Windows** | PowerShell's built-in sound player — nothing to install |
+| **macOS** | `afplay`, built in |
+| **Linux** | the first of `ffplay` → `paplay` → `aplay` → `play` → `mpv` → `cvlc` |
+| **WSL** | a Linux player if present, otherwise it reaches out to Windows automatically |
 
 ```bash
 sudo apt install ffmpeg     # Debian/Ubuntu
@@ -509,6 +622,8 @@ src/localtts/
 ├── config.py         defaults, config file, env vars, precedence
 ├── text.py           markdown stripping and sentence-aware chunking
 ├── audio.py          playback autodetection and wav joining
+├── skills.py         agent detection and skill installation
+├── agent_skills/     the skill markdown shipped to agents
 ├── errors.py         TTSError -> a clean one-line message
 └── providers/
     ├── base.py       Provider contract + subprocess helpers
