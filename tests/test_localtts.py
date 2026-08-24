@@ -251,6 +251,57 @@ class PlaybackControlTest(unittest.TestCase):
         proc.wait(timeout=5)
         self.assertFalse(os.path.exists(self.state))
 
+    def test_status_reports_elapsed_and_total_duration(self):
+        audio._write_state(os.getpid(), "/tmp/x.wav", duration_seconds=12.0, elapsed=4.0,
+                           segment_start=None)
+        ok, message = audio.playback_status()
+        self.assertTrue(ok)
+        self.assertIn("0:04 / 0:12", message)
+
+    def test_elapsed_advances_while_running(self):
+        import time as _time
+        audio._write_state(os.getpid(), "/tmp/x.wav", duration_seconds=12.0,
+                           segment_start=_time.time() - 3.0)
+        state = audio.read_state()
+        self.assertAlmostEqual(audio._elapsed(state), 3.0, delta=0.5)
+
+    def test_pause_freezes_elapsed_time(self):
+        import time as _time
+        proc_pid = os.getpid()   # a real, currently-running pid; no signal is actually sent to it here
+        audio._write_state(proc_pid, "/tmp/x.wav", duration_seconds=12.0,
+                           segment_start=_time.time() - 2.0)
+        state = audio.read_state()
+        before = audio._elapsed(state)
+        # Simulate what pause_playback() records, without sending a real SIGSTOP to this test process.
+        audio._write_state(proc_pid, "/tmp/x.wav", duration_seconds=12.0, paused=True,
+                           elapsed=before, segment_start=None)
+        _time.sleep(0.2)
+        after = audio._elapsed(audio.read_state())
+        self.assertAlmostEqual(before, after, delta=0.05)
+
+
+class ProgressBarTest(unittest.TestCase):
+    def test_format_time(self):
+        self.assertEqual(audio.format_time(0), "0:00")
+        self.assertEqual(audio.format_time(65), "1:05")
+        self.assertEqual(audio.format_time(-3), "0:00")
+
+    def test_bar_fills_proportionally(self):
+        empty = audio.progress_bar(0, 10, width=10)
+        half = audio.progress_bar(5, 10, width=10)
+        full = audio.progress_bar(10, 10, width=10)
+        self.assertEqual(empty.count("#"), 0)
+        self.assertEqual(half.count("#"), 5)
+        self.assertEqual(full.count("#"), 10)
+
+    def test_bar_never_exceeds_full_past_the_end(self):
+        over = audio.progress_bar(999, 10, width=10)
+        self.assertEqual(over.count("#"), 10)
+
+    def test_zero_duration_is_handled_without_dividing_by_zero(self):
+        bar = audio.progress_bar(3, 0, width=10)
+        self.assertIn("0:03", bar)
+
 
 class RegistryTest(unittest.TestCase):
     def test_every_registered_provider_has_defaults(self):

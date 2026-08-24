@@ -256,14 +256,16 @@ does not block the shell — or an agent driving it. The file is kept and its pa
 
 ```bash
 $ tts -b --lang es -f documento.md
-playing in the background (pid 4123) — `tts stop` to end it
+playing in the background (pid 4123, 0:12) — `tts stop` to end it, `tts playback` for progress
 /tmp/local-tts-a1b2c3d4.wav
 ```
 
-Control it afterwards:
+Control it afterwards, with elapsed time tracked against the file's real duration:
 
 ```bash
-tts playback     # playing / paused / nothing, and which file
+$ tts playback
+playing [###########---------] 0:03 / 0:05 (pid 4123): /tmp/local-tts-a1b2c3d4.wav
+
 tts pause
 tts resume
 tts stop

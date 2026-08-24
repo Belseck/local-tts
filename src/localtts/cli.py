@@ -189,11 +189,12 @@ def speak(argv):
             args.play or args.background or (temporary and cfg["play"]))
         played = False
         if should_play and args.background:
-            pid = audio.play_detached(out_path, args.player or cfg["player"], verbose=args.verbose)
+            pid, length = audio.play_detached(out_path, args.player or cfg["player"], verbose=args.verbose)
             played = pid is not None
             if played:
-                print("playing in the background (pid %d) — `%s stop` to end it"
-                      % (pid, PROG), file=sys.stderr)
+                print("playing in the background (pid %d, %s) — `%s stop` to end it, "
+                      "`%s playback` for progress"
+                      % (pid, audio.format_time(length), PROG, PROG), file=sys.stderr)
             # The file outlives this process, so it must not be deleted on the way out.
             temporary = False
         elif should_play:

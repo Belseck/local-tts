@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import wave
 
 from localtts.errors import TTSError
@@ -151,10 +152,21 @@ def duration(path):
 STATE_FILE = os.path.join(tempfile.gettempdir(), "local-tts-playback.json")
 
 
-def _write_state(pid, path, paused=False):
+def _write_state(pid, path, duration_seconds=0.0, paused=False, elapsed=0.0, segment_start=None):
+    """`elapsed` is time already spent playing before the current running segment (0 if
+    never paused); `segment_start` is when the current running segment began, or None
+    while paused. Together they let playback_status() compute progress without polling
+    the player process for position, which most players do not expose anyway."""
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as handle:
-            json.dump({"pid": pid, "path": os.path.abspath(path), "paused": paused}, handle)
+            json.dump({
+                "pid": pid,
+                "path": os.path.abspath(path),
+                "duration": duration_seconds,
+                "paused": paused,
+                "elapsed": elapsed,
+                "segment_start": segment_start,
+            }, handle)
     except OSError:
         pass          # a lost state file only costs us the stop/pause convenience
 
@@ -188,10 +200,10 @@ def is_running(pid):
 
 
 def play_detached(path, preferred="", verbose=False):
-    """Start playback in the background. Returns the player's pid, or None if no player."""
+    """Start playback in the background. Returns (pid, duration_seconds), or (None, 0)."""
     cmd = find_player(path, preferred)
     if not cmd:
-        return None
+        return None, 0.0
     if verbose:
         print("+ %s &" % " ".join(cmd), file=sys.stderr)
 
@@ -206,8 +218,20 @@ def play_detached(path, preferred="", verbose=False):
         process = subprocess.Popen(cmd, **kwargs)
     except OSError as exc:
         raise TTSError("could not start %s: %s" % (cmd[0], exc))
-    _write_state(process.pid, path)
-    return process.pid
+    try:
+        length = duration(path)
+    except (wave.Error, EOFError, OSError):
+        length = 0.0
+    _write_state(process.pid, path, duration_seconds=length, segment_start=time.time())
+    return process.pid, length
+
+
+def _elapsed(state):
+    base = float(state.get("elapsed") or 0.0)
+    segment_start = state.get("segment_start")
+    if segment_start is None:
+        return base
+    return base + max(0.0, time.time() - float(segment_start))
 
 
 def _signal_playback(sig, name, paused):
@@ -225,7 +249,10 @@ def _signal_playback(sig, name, paused):
         os.kill(pid, sig)
     except OSError as exc:
         return False, "could not %s pid %d: %s" % (name, pid, exc)
-    _write_state(pid, state.get("path") or "", paused=paused)
+
+    elapsed = _elapsed(state)
+    _write_state(pid, state.get("path") or "", duration_seconds=float(state.get("duration") or 0.0),
+                paused=paused, elapsed=elapsed, segment_start=None if paused else time.time())
     return True, "%s: %s" % (name, state.get("path") or pid)
 
 
@@ -274,6 +301,21 @@ def resume_playback():
     return _signal_playback(getattr(signal, "SIGCONT", None), "resumed", paused=False)
 
 
+def format_time(seconds):
+    seconds = max(0, int(seconds))
+    return "%d:%02d" % (seconds // 60, seconds % 60)
+
+
+def progress_bar(elapsed, total, width=20):
+    """A static text bar: '[####------] 0:04 / 0:12'. No terminal control codes —
+    safe to print once and leave in a transcript, unlike a carriage-return spinner."""
+    if total <= 0:
+        return "[%s] %s" % ("?" * width, format_time(elapsed))
+    filled = min(width, int(width * min(1.0, elapsed / total)))
+    bar = "#" * filled + "-" * (width - filled)
+    return "[%s] %s / %s" % (bar, format_time(elapsed), format_time(total))
+
+
 def playback_status():
     state = read_state()
     if not state:
@@ -283,4 +325,7 @@ def playback_status():
         clear_state()
         return False, "nothing is playing"
     label = "paused" if state.get("paused") else "playing"
-    return True, "%s (pid %d): %s" % (label, pid, state.get("path") or "?")
+    elapsed = _elapsed(state)
+    total = float(state.get("duration") or 0.0)
+    bar = progress_bar(elapsed, total)
+    return True, "%s %s (pid %d): %s" % (label, bar, pid, state.get("path") or "?")

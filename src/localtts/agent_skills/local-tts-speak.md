@@ -103,12 +103,45 @@ stops the previous one automatically, so you never stack two voices.
 that they are unsupported — there, `stop` is the control, and you should say so rather than
 suggesting pause.
 
+### Present a status, not the raw command
+
+Whether the human running you sees the `tts` invocation itself (the command, its raw
+stdout/stderr) depends on your host, not on this skill — some show every tool call, some
+keep them collapsed. Either way, **your own reply text is yours to compose**, and it should
+never just be the pasted command or its raw output. Write a short status line instead.
+
+A chat reply cannot repaint itself, and there is no live position to show anyway — most
+players expose no progress interface, so anything that looked like it was "filling up"
+would be fabricated, not measured. Don't build a progress bar and don't chase one with
+follow-up messages. **Say it once, with the icon and the duration `tts -b` already printed,
+and stop:**
+
+```
+🔊 0:12 · /tmp/local-tts-a1b2c3d4.wav
+```
+
+That is the whole status — one line, sent once, when playback starts. No bar, no midpoint
+check, no "still playing" follow-up, no completion notice. If the user wants to know how
+far along it is, *then* run `tts playback` and relay what it says — on request only, never
+proactively:
+
+```bash
+tts playback
+# playing [###########---------] 0:03 / 0:05 (pid 4123): /tmp/local-tts-a1b2c3d4.wav
+```
+
+That bar is real (computed from elapsed time against the file's duration), which is exactly
+why it belongs behind an explicit ask rather than in the default status — showing it
+unprompted implies an ongoing display this is not.
+
 ### Always tell the user where the file is
 
 Every `-b` run prints the path. **Say it in your reply**, every time — the user may want to
-replay it, keep it, or send it on:
+replay it, keep it, or send it on. Combined with the status line above, a full first reply
+looks like:
 
-> Playing now — saved at `/tmp/local-tts-a1b2c3d4.wav`. Say "stop" or "pause" any time.
+> 🔊 0:12 · `/tmp/local-tts-a1b2c3d4.wav`
+> Say "stop" or "pause" any time.
 
 Default to a temp folder, which is what `-b` does on its own (`/tmp` on Linux/macOS,
 `%TEMP%` on Windows). Only write elsewhere when the user asks for a specific location:
