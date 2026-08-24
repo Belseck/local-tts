@@ -8,8 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from localtts import audio, config, providers, skills, text as textutil
-from localtts.cli import main
+from localtts import audio, config, hooks, providers, skills, text as textutil
+from localtts.cli import _resolve_session, main
 from localtts.errors import TTSError
 from localtts.providers.command import CommandProvider
 from localtts.providers.llamacpp import LlamaCppProvider
@@ -365,6 +365,317 @@ class LanguageMemoryTest(unittest.TestCase):
 
 
 SAMPLE_RULES = "# Mine\n\nAlways use tabs.\n"
+
+
+class CompactStatusTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.original = audio.STATE_FILE
+        audio.STATE_FILE = os.path.join(self.tmp.name, "playback.json")
+        self.addCleanup(setattr, audio, "STATE_FILE", self.original)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_empty_when_idle(self):
+        self.assertEqual(audio.compact_status(), "")
+
+    def test_non_empty_while_playing(self):
+        audio._write_state(os.getpid(), "/tmp/x.wav", duration_seconds=12.0, segment_start=0.0)
+        status = audio.compact_status()
+        self.assertIn("🔊", status)
+        self.assertNotIn("\n", status)
+
+    def test_paused_uses_a_different_icon(self):
+        audio._write_state(os.getpid(), "/tmp/x.wav", duration_seconds=12.0, paused=True,
+                           elapsed=3.0, segment_start=None)
+        self.assertIn("⏸", audio.compact_status())
+
+
+class SessionScopingTest(unittest.TestCase):
+    """State files, and therefore playback control, are isolated per session so two
+    concurrent sessions (two terminals, two agents) don't stop or read each other's audio."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.original = audio.STATE_FILE
+        audio.STATE_FILE = os.path.join(self.tmp.name, "playback.json")
+        self.addCleanup(setattr, audio, "STATE_FILE", self.original)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_no_session_uses_the_original_global_file(self):
+        self.assertEqual(audio.state_path(), audio.STATE_FILE)
+        self.assertEqual(audio.state_path(None), audio.STATE_FILE)
+
+    def test_different_sessions_get_different_files(self):
+        a = audio.state_path("session-a")
+        b = audio.state_path("session-b")
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(a, audio.STATE_FILE)
+
+    def test_same_session_string_is_deterministic(self):
+        self.assertEqual(audio.state_path("same"), audio.state_path("same"))
+
+    def test_session_path_is_sanitized_and_bounded(self):
+        path = audio.state_path("weird/../id with spaces\x00" + "x" * 500)
+        self.assertNotIn("/", os.path.basename(path))
+        self.assertLess(len(os.path.basename(path)), 120)
+
+    def test_a_second_sessions_playback_does_not_stop_the_firsts(self):
+        import subprocess as sp
+        proc_a = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                          stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        self.addCleanup(proc_a.kill)
+        audio._write_state(proc_a.pid, "/tmp/a.wav", session="session-a")
+
+        # Starting session B's playback must not touch session A's state or process.
+        audio.stop_previous(session="session-b")
+
+        self.assertTrue(audio.is_running(proc_a.pid))
+        ok, _ = audio.playback_status(session="session-a")
+        self.assertTrue(ok)
+
+    def test_stop_only_affects_its_own_session(self):
+        import subprocess as sp
+        proc_a = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                          stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        self.addCleanup(proc_a.kill)
+        audio._write_state(proc_a.pid, "/tmp/a.wav", session="session-a")
+
+        ok, message = audio.stop_playback(session="session-b")
+        self.assertFalse(ok)
+        self.assertIn("nothing is playing", message)
+        self.assertTrue(audio.is_running(proc_a.pid))
+
+        ok, _ = audio.stop_playback(session="session-a")
+        self.assertTrue(ok)
+        proc_a.wait(timeout=5)
+
+    def test_compact_status_is_isolated_per_session(self):
+        audio._write_state(os.getpid(), "/tmp/a.wav", duration_seconds=10.0,
+                           segment_start=0.0, session="session-a")
+        self.assertNotEqual(audio.compact_status(session="session-a"), "")
+        self.assertEqual(audio.compact_status(session="session-b"), "")
+        self.assertEqual(audio.compact_status(), "")   # the global slot is untouched
+
+
+class SessionResolutionTest(unittest.TestCase):
+    """_resolve_session() is where env-var auto-detection lives -- audio.py itself never
+    reads the environment, so these tests must not let a real ambient session id (this
+    suite runs inside an actual Claude Code session) leak into assertions about the
+    no-session fallback."""
+
+    def setUp(self):
+        self.saved = {name: os.environ.pop(name, None) for name in
+                      ("CLAUDE_CODE_SESSION_ID",)}
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for name, value in self.saved.items():
+            if value is not None:
+                os.environ[name] = value
+            else:
+                os.environ.pop(name, None)
+
+    def test_no_signal_at_all_resolves_to_none(self):
+        self.assertIsNone(_resolve_session(None))
+
+    def test_explicit_flag_wins(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "from-env"
+        self.assertEqual(_resolve_session("from-flag"), "from-flag")
+
+    def test_env_var_is_used_when_no_flag(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "from-env"
+        self.assertEqual(_resolve_session(None), "from-env")
+
+    def test_stdin_json_session_id_beats_env(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "from-env"
+        stdin = json.dumps({"session_id": "from-json"})
+        self.assertEqual(_resolve_session(None, stdin_json=stdin), "from-json")
+
+    def test_stdin_json_sessionId_camelcase_is_also_recognized(self):
+        stdin = json.dumps({"sessionId": "from-json-camel"})
+        self.assertEqual(_resolve_session(None, stdin_json=stdin), "from-json-camel")
+
+    def test_malformed_stdin_json_falls_back_to_env(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "from-env"
+        self.assertEqual(_resolve_session(None, stdin_json="not json"), "from-env")
+
+    def test_explicit_flag_beats_stdin_json_too(self):
+        stdin = json.dumps({"session_id": "from-json"})
+        self.assertEqual(_resolve_session("from-flag", stdin_json=stdin), "from-flag")
+
+
+class BackgroundSessionCliTest(unittest.TestCase):
+    """End-to-end through main(): starting and controlling playback for two sessions
+    without either one's global env leaking into the other's isolation."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.original = audio.STATE_FILE
+        audio.STATE_FILE = os.path.join(self.tmp.name, "playback.json")
+        self.addCleanup(setattr, audio, "STATE_FILE", self.original)
+        self.addCleanup(self.tmp.cleanup)
+        self.saved_env = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        if self.saved_env is not None:
+            os.environ["CLAUDE_CODE_SESSION_ID"] = self.saved_env
+
+    def test_compact_reads_session_from_piped_json(self):
+        import io
+        from unittest import mock
+        audio._write_state(os.getpid(), "/tmp/x.wav", duration_seconds=10.0,
+                           segment_start=0.0, session="from-hook-json")
+        stdin = io.StringIO(json.dumps({"session_id": "from-hook-json"}))
+        stdin.isatty = lambda: False
+        captured = io.StringIO()
+        with mock.patch.object(sys, "stdin", stdin), mock.patch.object(sys, "stdout", captured):
+            self.assertEqual(main(["playback", "--compact"]), 0)
+        self.assertIn("🔊", captured.getvalue())
+
+    def test_compact_is_empty_for_a_session_with_no_state(self):
+        import io
+        from unittest import mock
+        audio._write_state(os.getpid(), "/tmp/x.wav", duration_seconds=10.0,
+                           segment_start=0.0, session="playing-session")
+        stdin = io.StringIO(json.dumps({"session_id": "some-other-session"}))
+        stdin.isatty = lambda: False
+        captured = io.StringIO()
+        with mock.patch.object(sys, "stdin", stdin), mock.patch.object(sys, "stdout", captured):
+            self.assertEqual(main(["playback", "--compact"]), 0)
+        self.assertEqual(captured.getvalue(), "")
+
+    def test_explicit_session_flag_on_stop(self):
+        import subprocess as sp
+        proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                        stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        self.addCleanup(proc.kill)
+        audio._write_state(proc.pid, "/tmp/x.wav", session="explicit-session")
+        self.assertEqual(main(["stop", "--session", "explicit-session"]), 0)
+        proc.wait(timeout=5)
+
+
+class HookInstallTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = self.tmp.name
+        os.makedirs(os.path.join(self.base, ".claude"))
+        self.addCleanup(self.tmp.cleanup)
+
+    def _settings(self):
+        with open(hooks.settings_path("claude-code", self.base)) as fh:
+            return json.load(fh)
+
+    def test_unsupported_agent_reports_why(self):
+        with self.assertRaises(TTSError) as caught:
+            hooks.install("gemini", base=self.base)
+        self.assertIn("footer", str(caught.exception))
+
+    def test_fresh_install_writes_settings_and_wrapper(self):
+        result = hooks.install("claude-code", base=self.base)
+        settings = self._settings()
+        self.assertEqual(settings["statusLine"]["command"], str(result["wrapper_path"]))
+        self.assertEqual(settings["statusLine"]["refreshInterval"], 2)
+        self.assertTrue(result["wrapper_path"].exists())
+        self.assertIsNone(result["chained_from"])
+
+    def test_existing_status_line_is_chained_not_clobbered(self):
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({
+            "otherSetting": "keep-me",
+            "statusLine": {"type": "command", "command": "~/.claude/other-tool.sh"},
+        }))
+        result = hooks.install("claude-code", base=self.base)
+        self.assertEqual(result["chained_from"], "~/.claude/other-tool.sh")
+        script = result["wrapper_path"].read_text()
+        self.assertIn("PREV_CMD='~/.claude/other-tool.sh'", script)
+        self.assertEqual(self._settings()["otherSetting"], "keep-me")   # untouched
+
+    def test_reinstall_carries_the_chain_forward(self):
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({"statusLine": {"type": "command", "command": "~/theirs.sh"}}))
+        hooks.install("claude-code", base=self.base)
+        # settings.json now points at OUR wrapper; a second install must not treat
+        # itself as "the previous command" and lose the real chain.
+        result = hooks.install("claude-code", base=self.base)
+        self.assertEqual(result["chained_from"], "~/theirs.sh")
+
+    def test_dry_run_writes_nothing(self):
+        result = hooks.install("claude-code", base=self.base, dry_run=True)
+        self.assertFalse(result["wrapper_path"].exists())
+        self.assertFalse(hooks.settings_path("claude-code", self.base).exists())
+
+    def test_uninstall_restores_the_previous_command(self):
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({"statusLine": {"type": "command", "command": "~/theirs.sh"}}))
+        hooks.install("claude-code", base=self.base)
+        result = hooks.uninstall("claude-code", base=self.base)
+        self.assertTrue(result["removed"])
+        self.assertEqual(self._settings()["statusLine"]["command"], "~/theirs.sh")
+        self.assertFalse(hooks.wrapper_path("claude-code", self.base).exists())
+
+    def test_uninstall_drops_the_key_when_there_was_nothing_before(self):
+        hooks.install("claude-code", base=self.base)
+        hooks.uninstall("claude-code", base=self.base)
+        self.assertNotIn("statusLine", self._settings())
+
+    def test_uninstall_refuses_to_touch_a_hook_it_did_not_install(self):
+        path = hooks.settings_path("claude-code", self.base)
+        path.write_text(json.dumps({"statusLine": {"type": "command", "command": "~/theirs.sh"}}))
+        result = hooks.uninstall("claude-code", base=self.base)
+        self.assertFalse(result["removed"])
+        self.assertEqual(self._settings()["statusLine"]["command"], "~/theirs.sh")
+
+    def test_wrapper_calls_tts_playback_compact(self):
+        result = hooks.install("claude-code", base=self.base)
+        self.assertIn("tts playback --compact", result["wrapper_path"].read_text())
+
+    def test_is_installed_true_only_for_our_own_wrapper(self):
+        self.assertFalse(hooks.is_installed("claude-code", base=self.base))
+        hooks.install("claude-code", base=self.base)
+        self.assertTrue(hooks.is_installed("claude-code", base=self.base))
+
+    def test_qwen_uses_its_own_nested_key_and_settings_file(self):
+        os.makedirs(os.path.join(self.base, ".qwen"))
+        hooks.install("qwen", base=self.base)
+        with open(hooks.settings_path("qwen", self.base)) as fh:
+            settings = json.load(fh)
+        self.assertIn("command", settings["ui"]["statusLine"])
+
+    def test_detect_only_returns_agents_actually_present(self):
+        self.assertEqual(hooks.detect(base=self.base), {"claude-code": Path(self.base) / ".claude"})
+
+
+class HookLivenessTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = self.tmp.name
+        os.makedirs(os.path.join(self.base, ".claude"))
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_inactive_with_no_heartbeat(self):
+        self.assertFalse(hooks.is_active("claude-code", base=self.base))
+        self.assertFalse(hooks.any_active(base=self.base))
+
+    def test_active_with_a_fresh_heartbeat(self):
+        hooks.install("claude-code", base=self.base)
+        hb = hooks.heartbeat_path("claude-code", base=self.base)
+        hb.parent.mkdir(parents=True, exist_ok=True)
+        hb.write_text(str(int(__import__("time").time())))
+        self.assertTrue(hooks.is_active("claude-code", base=self.base))
+        self.assertTrue(hooks.any_active(base=self.base))
+
+    def test_inactive_with_a_stale_heartbeat(self):
+        hooks.install("claude-code", base=self.base)
+        hb = hooks.heartbeat_path("claude-code", base=self.base)
+        hb.parent.mkdir(parents=True, exist_ok=True)
+        hb.write_text(str(int(__import__("time").time()) - 999))
+        self.assertFalse(hooks.is_active("claude-code", base=self.base))
+
+    def test_installed_but_never_run_is_not_active(self):
+        hooks.install("claude-code", base=self.base)   # config written, wrapper never executed
+        self.assertTrue(hooks.is_installed("claude-code", base=self.base))
+        self.assertFalse(hooks.is_active("claude-code", base=self.base))
 
 
 class SkillInstallTest(unittest.TestCase):

@@ -1,8 +1,10 @@
 """Audio playback using whatever command-line player the system already has."""
 
 import errno
+import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -152,13 +154,36 @@ def duration(path):
 STATE_FILE = os.path.join(tempfile.gettempdir(), "local-tts-playback.json")
 
 
-def _write_state(pid, path, duration_seconds=0.0, paused=False, elapsed=0.0, segment_start=None):
+def _safe_session(session):
+    if not session:
+        return None
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(session).strip())[:40]
+    digest = hashlib.sha1(str(session).encode("utf-8", "surrogateescape")).hexdigest()[:8]
+    return "%s-%s" % (safe, digest) if safe else digest
+
+
+def state_path(session=None):
+    """The state file for one playback stream. With no session, this is STATE_FILE --
+    the original single global slot, so a caller that never passes a session sees exactly
+    the pre-multi-session behavior. Each session gets its own file so two concurrent
+    sessions (two terminals, two agent instances) neither stop nor see each other's audio.
+    Derived from STATE_FILE's own directory (not tempfile.gettempdir() directly) so tests
+    that redirect STATE_FILE into a temp dir redirect session-scoped files too."""
+    tag = _safe_session(session)
+    if not tag:
+        return STATE_FILE
+    base, ext = os.path.splitext(STATE_FILE)
+    return "%s-%s%s" % (base, tag, ext)
+
+
+def _write_state(pid, path, duration_seconds=0.0, paused=False, elapsed=0.0, segment_start=None,
+                 session=None):
     """`elapsed` is time already spent playing before the current running segment (0 if
     never paused); `segment_start` is when the current running segment began, or None
     while paused. Together they let playback_status() compute progress without polling
     the player process for position, which most players do not expose anyway."""
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as handle:
+        with open(state_path(session), "w", encoding="utf-8") as handle:
             json.dump({
                 "pid": pid,
                 "path": os.path.abspath(path),
@@ -171,18 +196,18 @@ def _write_state(pid, path, duration_seconds=0.0, paused=False, elapsed=0.0, seg
         pass          # a lost state file only costs us the stop/pause convenience
 
 
-def read_state():
+def read_state(session=None):
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as handle:
+        with open(state_path(session), "r", encoding="utf-8") as handle:
             state = json.load(handle)
     except (OSError, ValueError):
         return None
     return state if isinstance(state, dict) and state.get("pid") else None
 
 
-def clear_state():
+def clear_state(session=None):
     try:
-        os.unlink(STATE_FILE)
+        os.unlink(state_path(session))
     except OSError:
         pass
 
@@ -199,7 +224,7 @@ def is_running(pid):
     return True
 
 
-def play_detached(path, preferred="", verbose=False):
+def play_detached(path, preferred="", verbose=False, session=None):
     """Start playback in the background. Returns (pid, duration_seconds), or (None, 0)."""
     cmd = find_player(path, preferred)
     if not cmd:
@@ -207,7 +232,7 @@ def play_detached(path, preferred="", verbose=False):
     if verbose:
         print("+ %s &" % " ".join(cmd), file=sys.stderr)
 
-    stop_previous()          # one playback at a time, so stop/pause stay unambiguous
+    stop_previous(session=session)   # one playback at a time PER SESSION, not machine-wide
     stream = None if verbose else subprocess.DEVNULL
     kwargs = {"stdout": stream, "stderr": stream, "stdin": subprocess.DEVNULL}
     if sys.platform == "win32":
@@ -222,7 +247,7 @@ def play_detached(path, preferred="", verbose=False):
         length = duration(path)
     except (wave.Error, EOFError, OSError):
         length = 0.0
-    _write_state(process.pid, path, duration_seconds=length, segment_start=time.time())
+    _write_state(process.pid, path, duration_seconds=length, segment_start=time.time(), session=session)
     return process.pid, length
 
 
@@ -234,14 +259,14 @@ def _elapsed(state):
     return base + max(0.0, time.time() - float(segment_start))
 
 
-def _signal_playback(sig, name, paused):
+def _signal_playback(sig, name, paused, session=None):
     """Send a signal to the recorded player. Returns (ok, message)."""
-    state = read_state()
+    state = read_state(session)
     if not state:
         return False, "nothing is playing"
     pid = int(state["pid"])
     if not is_running(pid):
-        clear_state()
+        clear_state(session)
         return False, "nothing is playing (the last playback already finished)"
     if sig is None:
         return False, ("%s is not supported on this platform; use `stop` instead" % name)
@@ -252,26 +277,27 @@ def _signal_playback(sig, name, paused):
 
     elapsed = _elapsed(state)
     _write_state(pid, state.get("path") or "", duration_seconds=float(state.get("duration") or 0.0),
-                paused=paused, elapsed=elapsed, segment_start=None if paused else time.time())
+                paused=paused, elapsed=elapsed, segment_start=None if paused else time.time(),
+                session=session)
     return True, "%s: %s" % (name, state.get("path") or pid)
 
 
-def stop_previous():
-    """Stop any playback we started earlier, quietly."""
-    state = read_state()
+def stop_previous(session=None):
+    """Stop any playback this session started earlier, quietly."""
+    state = read_state(session)
     if state and is_running(int(state["pid"])):
-        stop_playback()
+        stop_playback(session)
     else:
-        clear_state()
+        clear_state(session)
 
 
-def stop_playback():
-    state = read_state()
+def stop_playback(session=None):
+    state = read_state(session)
     if not state:
         return False, "nothing is playing"
     pid = int(state["pid"])
     if not is_running(pid):
-        clear_state()
+        clear_state(session)
         return False, "nothing is playing (the last playback already finished)"
     if sys.platform == "win32":
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
@@ -289,16 +315,16 @@ def stop_playback():
         except OSError as exc:
             return False, "could not stop pid %d: %s" % (pid, exc)
     path = state.get("path")
-    clear_state()
+    clear_state(session)
     return True, "stopped: %s" % (path or pid)
 
 
-def pause_playback():
-    return _signal_playback(getattr(signal, "SIGSTOP", None), "paused", paused=True)
+def pause_playback(session=None):
+    return _signal_playback(getattr(signal, "SIGSTOP", None), "paused", paused=True, session=session)
 
 
-def resume_playback():
-    return _signal_playback(getattr(signal, "SIGCONT", None), "resumed", paused=False)
+def resume_playback(session=None):
+    return _signal_playback(getattr(signal, "SIGCONT", None), "resumed", paused=False, session=session)
 
 
 def format_time(seconds):
@@ -316,13 +342,34 @@ def progress_bar(elapsed, total, width=20):
     return "[%s] %s / %s" % (bar, format_time(elapsed), format_time(total))
 
 
-def playback_status():
-    state = read_state()
+def compact_status(width=10, session=None):
+    """A short one-line status for embedding in a host status bar: '🔊 0:03/0:12' while
+    playing, '⏸ 0:03/0:12' while paused, '' (empty string) when nothing is — so a caller
+    that only shows our text while it's non-empty needs no separate on/off check."""
+    state = read_state(session)
+    if not state:
+        return ""
+    pid = int(state["pid"])
+    if not is_running(pid):
+        clear_state(session)
+        return ""
+    icon = "⏸" if state.get("paused") else "🔊"
+    elapsed = _elapsed(state)
+    total = float(state.get("duration") or 0.0)
+    if total <= 0:
+        return "%s %s" % (icon, format_time(elapsed))
+    filled = min(width, int(width * min(1.0, elapsed / total)))
+    bar = "#" * filled + "-" * (width - filled)
+    return "%s %s/%s [%s]" % (icon, format_time(elapsed), format_time(total), bar)
+
+
+def playback_status(session=None):
+    state = read_state(session)
     if not state:
         return False, "nothing is playing"
     pid = int(state["pid"])
     if not is_running(pid):
-        clear_state()
+        clear_state(session)
         return False, "nothing is playing"
     label = "paused" if state.get("paused") else "playing"
     elapsed = _elapsed(state)

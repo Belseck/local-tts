@@ -143,6 +143,51 @@ If the user reports that audio "will not stop", run `tts playback` first — if 
 nothing, the sound is coming from something else, not this CLI. A stale state file is
 harmless: the next `stop` clears it.
 
+## Status-bar hook (progress in the host's own UI, not chat)
+
+`local-tts-speak` prints a status line for each thing it plays. If the user finds that
+noisy and asks for progress somewhere else — "can this show in my status bar instead",
+"don't spam the chat" — a real hook exists for two hosts, verified against their own
+settings schemas, not assumed:
+
+| Host | Mechanism |
+| --- | --- |
+| Claude Code | `~/.claude/settings.json` → `statusLine.command`, with a real `refreshInterval` timer |
+| Qwen Code | `~/.qwen/settings.json` → `ui.statusLine.command`, same idea |
+
+```bash
+tts hooks                    # what's detected, installed, and why the rest can't do this
+tts hooks --install          # install into every detected supported host
+tts hooks --uninstall        # remove it, restoring whatever status line was there before
+```
+
+Everything else — Gemini CLI, Codex CLI, OpenCode, Cursor, Windsurf, GitHub Copilot CLI —
+reports a specific reason it isn't supported (`tts hooks` prints it): no such mechanism
+exists yet for most of them (open upstream feature requests, not a gap in this tool), and
+Cursor/Windsurf would need a full IDE extension rather than a lightweight hook. Don't
+promise this to a user on one of those hosts; tell them why it isn't available there yet.
+
+**Install is non-destructive.** If the host already has a status line (the user's own
+script, another tool's), install *wraps* it rather than replacing it — the existing command
+still runs, and local-tts's text is only added when something is actually playing. An idle
+system looks exactly as it did before. Reinstalling (e.g. after an update) preserves that
+same chain. `--uninstall` restores the prior command exactly, or removes the key entirely
+if there wasn't one.
+
+After installing, tell the user to **restart their agent** — the setting is read at
+startup. Then verify with `tts hooks --status`, which prints `active`/`inactive` — that
+only flips to `active` once the host has actually called the hook at least once (right
+after restart, on its first status-bar render), so give it a moment.
+
+**Multiple sessions on the same machine are correctly isolated.** The wrapper reads the
+`session_id` (or `sessionId`) field the host's own JSON payload carries and only shows that
+session's playback — one session starting audio never stops or shows up in another's status
+bar. This works automatically as long as the agent starting playback passes `--session`
+(the `local-tts-speak` skill does, using `$CLAUDE_CODE_SESSION_ID` where available). If a
+user reports their status bar showing playback they didn't start, or not showing playback
+they did, check `tts hooks --status` and confirm they're on a build where `-b` actually
+uses `--session` — that correlation is what makes this work, not anything host-specific.
+
 ## Other settings
 
 ```bash

@@ -6,12 +6,45 @@ import os
 import sys
 import tempfile
 
-from localtts import __version__, audio, config, providers, skills, text as textutil
+from localtts import __version__, audio, config, hooks, providers, skills, text as textutil
 from localtts.errors import TTSError
 
 PROG = "tts"
-SUBCOMMANDS = ("config", "providers", "check", "languages", "skills",
+SUBCOMMANDS = ("config", "providers", "check", "languages", "skills", "hooks",
                "playback", "stop", "pause", "resume")
+
+#: Environment variables known to hold a stable per-run session id, checked in order.
+#: Verified against a live capture: Claude Code's own status-line JSON payload carries
+#: the exact same value as this env var (see AGENT_INSTALL.md). Add an entry here only
+#: once confirmed the same way for another host -- an unverified guess would silently
+#: mis-scope playback state instead of falling back to the safe global default.
+SESSION_ENV_VARS = ("CLAUDE_CODE_SESSION_ID",)
+
+
+def _session_from_env():
+    for name in SESSION_ENV_VARS:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
+def _resolve_session(explicit, stdin_json=None):
+    """Priority: an explicit --session flag, then a session_id embedded in JSON piped on
+    stdin (what a status-line hook's host feeds it), then a known host env var, then None
+    -- which means "the single global slot", exactly the pre-multi-session behavior."""
+    if explicit:
+        return explicit
+    if stdin_json:
+        try:
+            data = json.loads(stdin_json)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            for key in ("session_id", "sessionId"):
+                if data.get(key):
+                    return data[key]
+    return _session_from_env()
 
 
 def _speak_parser():
@@ -23,6 +56,7 @@ def _speak_parser():
             "  %(prog)s providers            list available backends\n"
             "  %(prog)s languages            show which backend speaks which language\n"
             "  %(prog)s skills               install agent skills for this CLI\n"
+            "  %(prog)s hooks                install a status-bar hook (fewer chat messages)\n"
             "  %(prog)s stop | pause | resume control background playback\n"
             "  %(prog)s check                verify backends and audio players\n"
             "  %(prog)s config --show        print the effective configuration\n"
@@ -53,6 +87,11 @@ def _speak_parser():
     parser.add_argument("-b", "--background", action="store_true",
                         help="play in the background and return immediately; keeps the file "
                              "and prints its path (control it with `tts stop|pause|resume`)")
+    parser.add_argument("--session", metavar="ID",
+                        help="scope background playback to this session, so concurrent "
+                             "sessions don't stop each other's audio or share one status-bar "
+                             "entry (default: autodetected from the environment, see "
+                             "`tts hooks`; falls back to one shared slot)")
     parser.add_argument("--play", action="store_true", help="play the audio even when --output is given")
     parser.add_argument("--no-play", action="store_true", help="never play, just report the file path")
     parser.add_argument("--player", help="playback command to use (default: autodetect)")
@@ -189,9 +228,14 @@ def speak(argv):
             args.play or args.background or (temporary and cfg["play"]))
         played = False
         if should_play and args.background:
-            pid, length = audio.play_detached(out_path, args.player or cfg["player"], verbose=args.verbose)
+            session = _resolve_session(args.session)
+            pid, length = audio.play_detached(out_path, args.player or cfg["player"],
+                                              verbose=args.verbose, session=session)
             played = pid is not None
             if played:
+                # `tts stop` (no flag) resolves the same session automatically as long as
+                # it runs in the same environment -- that's the common case, so the hint
+                # stays simple rather than repeating a session id back at the caller.
                 print("playing in the background (pid %d, %s) — `%s stop` to end it, "
                       "`%s playback` for progress"
                       % (pid, audio.format_time(length), PROG, PROG), file=sys.stderr)
@@ -324,8 +368,23 @@ def playback_command(argv, action=None):
     group.add_argument("--stop", action="store_true", help="end playback")
     group.add_argument("--pause", action="store_true", help="suspend playback")
     group.add_argument("--resume", action="store_true", help="continue a paused playback")
+    group.add_argument("--compact", action="store_true",
+                       help="one short line for a status bar: '' when idle, no trailing "
+                            "newline. If JSON with a session_id/sessionId field is piped "
+                            "on stdin (what a host feeds its status-line command), that "
+                            "session is used automatically -- see `tts hooks`.")
+    parser.add_argument("--session", metavar="ID",
+                        help="target this session instead of autodetecting one (see "
+                             "`tts --session` for what autodetection uses)")
     args = parser.parse_args(argv)
 
+    if action is None and args.compact:
+        stdin_json = sys.stdin.read() if not sys.stdin.isatty() else None
+        session = _resolve_session(args.session, stdin_json=stdin_json)
+        sys.stdout.write(audio.compact_status(session=session))
+        return 0
+
+    session = _resolve_session(args.session)
     chosen = action or ("stop" if args.stop else "pause" if args.pause
                         else "resume" if args.resume else "status")
     handler = {
@@ -334,9 +393,101 @@ def playback_command(argv, action=None):
         "resume": audio.resume_playback,
         "status": audio.playback_status,
     }[chosen]
-    ok, message = handler()
+    ok, message = handler(session=session)
     print(message, file=sys.stdout if ok else sys.stderr)
     return 0 if ok or chosen == "status" else 1
+
+
+def hooks_command(argv):
+    parser = argparse.ArgumentParser(
+        prog="%s hooks" % PROG,
+        description="Install a status-bar hook so playback progress lives in your coding "
+                    "agent's own status bar instead of chat messages.",
+        epilog=("Only agents with a real 'run my command, show its stdout in the status "
+                "bar' mechanism support this. With no options, prints what was found — "
+                "supported agents detected, and why the rest can't do it.\n\n"
+                "examples:\n"
+                "  %(prog)s                    show detected agents and status\n"
+                "  %(prog)s --install          install into every detected supported agent\n"
+                "  %(prog)s --install claude-code\n"
+                "  %(prog)s --status           is a hook live right now? (used by the skill)\n"
+                "  %(prog)s --uninstall\n") % {"prog": "%s hooks" % PROG},
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("agents", nargs="*", metavar="AGENT",
+                        help="limit to these agents (default: every detected one); one of: "
+                             + ", ".join(sorted(hooks.HOOK_AGENTS)))
+    parser.add_argument("--install", action="store_true", help="write the hook")
+    parser.add_argument("--uninstall", action="store_true", help="remove it and restore "
+                        "whatever status-line command was there before")
+    parser.add_argument("--status", action="store_true",
+                        help="print 'active' if any installed hook is being called right "
+                             "now by a live session, else 'inactive'; exit 0/1 to match")
+    parser.add_argument("--dry-run", action="store_true", help="show what would change")
+    args = parser.parse_args(argv)
+
+    if sum([args.install, args.uninstall, args.status]) > 1:
+        raise TTSError("choose one of --install, --uninstall, --status")
+
+    if args.status:
+        active = hooks.any_active()
+        print("active" if active else "inactive")
+        return 0 if active else 1
+
+    detected = hooks.detect()
+    chosen = args.agents or sorted(detected)
+    unknown = [a for a in chosen if a not in hooks.HOOK_AGENTS]
+    if unknown:
+        reasons = [hooks.UNSUPPORTED.get(a, "unknown agent") for a in unknown]
+        raise TTSError("not supported: %s" % "; ".join(
+            "%s (%s)" % pair for pair in zip(unknown, reasons)))
+
+    if not args.install and not args.uninstall:
+        print("supported : %s" % ", ".join(sorted(hooks.HOOK_AGENTS)))
+        print("")
+        for name in sorted(hooks.HOOK_AGENTS):
+            if name not in detected:
+                print("[  ] %-12s agent not detected" % name)
+                continue
+            installed = hooks.is_installed(name)
+            active = hooks.is_active(name)
+            state = "active" if active else "installed, not currently running" if installed else "not installed"
+            mark = "ok" if active else ("--" if installed else "  ")
+            print("[%s] %-12s %s" % (mark, name, state))
+        print("")
+        for name in sorted(hooks.UNSUPPORTED):
+            print("[xx] %-12s not supported: %s" % (name, hooks.UNSUPPORTED[name]))
+        print("")
+        if detected:
+            print("Install with: %s hooks --install" % PROG)
+        else:
+            print("No supported agent detected on this machine.")
+        return 0
+
+    if not chosen:
+        raise TTSError("no supported agents detected; pass a name explicitly")
+
+    action = hooks.install if args.install else hooks.uninstall
+    for name in chosen:
+        try:
+            if args.install:
+                result = hooks.install(name, refresh_interval=None, dry_run=args.dry_run)
+                verb = "would write" if args.dry_run else "installed"
+                print("  %-12s %s -> %s (refresh every %ss%s)" % (
+                    name, verb, result["settings_path"], result["block"]["refreshInterval"],
+                    ", chaining your existing status line" if result["chained_from"] else ""))
+            else:
+                result = hooks.uninstall(name)
+                if result["removed"]:
+                    print("  %-12s removed%s" % (
+                        name, " (restored your previous status line)" if result.get("restored") else ""))
+                else:
+                    print("  %-12s nothing to remove (not installed by local-tts)" % name)
+        except TTSError as exc:
+            print("  %-12s failed: %s" % (name, exc), file=sys.stderr)
+    if args.install and not args.dry_run:
+        print("\nRestart your agent so it picks up the new status line.")
+    return 0
 
 
 def skills_command(argv):
@@ -459,6 +610,7 @@ def main(argv=None):
                 "check": check,
                 "languages": languages,
                 "skills": skills_command,
+                "hooks": hooks_command,
                 "playback": playback_command,
             }.get(argv[0])
             if handler is None:      # stop / pause / resume are shortcuts

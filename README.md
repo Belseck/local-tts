@@ -26,6 +26,7 @@ plus binaries you already have (or install once, on your terms).
 - [Usage](#usage)
 - [Background playback](#background-playback)
 - [Coding-agent skills](#coding-agent-skills)
+- [Status-bar hook](#status-bar-hook)
 - [Language memory](#language-memory)
 - [Providers](#providers)
 - [Configuration](#configuration)
@@ -318,6 +319,75 @@ Agents with a real skill mechanism get one file per skill. Agents that read a si
 instructions file get a block delimited by `<!-- BEGIN local-tts skills -->` markers —
 **anything already in that file is preserved**, reinstalling replaces only the block, and
 `--uninstall` removes it and leaves the rest untouched.
+
+## Status-bar hook
+
+By default, speaking prints a status line in chat each time. Two coding agents can instead
+show live progress in their own status bar — verified against their actual settings
+schemas, not assumed:
+
+| Agent | Mechanism |
+| --- | --- |
+| Claude Code | `~/.claude/settings.json` → `statusLine.command`, with a real `refreshInterval` timer (1–60s) |
+| Qwen Code | `~/.qwen/settings.json` → `ui.statusLine.command`, same idea |
+
+```bash
+tts hooks                # what's detected, installed, and why the rest can't do this
+tts hooks --install      # install into every detected supported agent
+tts hooks --status       # is a hook live right now? (exit 0/1; used by the skill)
+tts hooks --uninstall    # remove it, restoring whatever status line was there before
+```
+
+```
+$ tts hooks
+supported : claude-code, qwen
+
+[ok] claude-code  active
+[  ] qwen         agent not detected
+
+[xx] codex        not supported: no status line mechanism yet (open feature request upstream)
+[xx] copilot      not supported: has one, but its config schema isn't documented solidly enough to target yet
+[xx] cursor       not supported: would need a full VS Code extension, not a lightweight hook
+[xx] gemini       not supported: footer settings are show/hide toggles only; no custom command
+[xx] opencode     not supported: no status line mechanism yet (open feature request upstream)
+[xx] windsurf     not supported: would need a full VS Code extension, not a lightweight hook
+```
+
+Only these two have a documented "run my command, show its stdout in the status bar"
+mechanism today. Gemini CLI's footer is hide/show toggles only (checked its shipped
+`settingsSchema.js`); Codex CLI and OpenCode both have open upstream feature requests for
+this, not yet shipped; Cursor and Windsurf are VS Code forks where a status-bar item means
+writing a real extension, not a lightweight hook; GitHub Copilot CLI has one, but its
+config schema isn't documented solidly enough to target without an install to test against.
+
+**Install never clobbers an existing status line.** If one is already configured — your own
+script, another tool's — the hook *wraps* it: the previous command still runs, and
+local-tts's text is only prepended while something is actually playing. Idle, the status
+bar looks exactly as it did before. Reinstalling preserves that same chain rather than
+re-wrapping itself; `--uninstall` restores the original command, or removes the key
+entirely if there wasn't one.
+
+Restart the agent after installing — status-line config is read at startup. When a hook is
+live, the `local-tts-speak` skill stops printing its own status line, since a real,
+continuously-updating one already exists — `tts hooks --status` is what it checks.
+
+### Multiple sessions
+
+Running more than one session at once (two terminals, two agent instances) works without
+one's audio stopping another's or its status bar showing the wrong progress. Pass
+`--session` with anything that identifies the run:
+
+```bash
+tts -b --session "$CLAUDE_CODE_SESSION_ID" "hello"
+tts stop --session "$CLAUDE_CODE_SESSION_ID"
+```
+
+Playback state is stored per session; starting playback only stops a *previous* playback
+from the *same* session. `--session` is auto-detected when omitted — currently from
+`$CLAUDE_CODE_SESSION_ID`, verified by capturing a live status-line payload from Claude Code
+and confirming it carries the exact same value in its `session_id` field, which is also how
+the status-bar hook knows which session's progress to show. Omit `--session` entirely and
+everything works exactly as before it existed — one shared slot.
 
 ## Language memory
 

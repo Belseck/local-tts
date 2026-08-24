@@ -68,6 +68,24 @@ playing in the background (pid 4123) — `tts stop` to end it
 /tmp/local-tts-a1b2c3d4.wav
 ```
 
+**If more than one of you could be running at once** (multiple terminals, multiple agent
+sessions on the same machine), pass `--session` with something that identifies *this* run,
+so your playback and status-bar entry stay yours — starting new audio in one session must
+never stop another session's, and one session's status bar must never show another's
+progress:
+
+```bash
+tts -b --lang es --session "$CLAUDE_CODE_SESSION_ID" "Terminé de revisar el código."
+```
+
+If you have a stable session id available to you (Claude Code sets
+`$CLAUDE_CODE_SESSION_ID` for every command it runs — check `echo $CLAUDE_CODE_SESSION_ID`
+once and use it every time), pass it explicitly like that. `tts` also auto-detects the same
+variable when `--session` is omitted, so this only matters on a host without a known
+variable yet, or when you want to be certain rather than rely on the fallback. Omitting it
+entirely is still safe for the common case (one session at a time) — it just shares the one
+original global slot, exactly like before this existed.
+
 **Run the command itself in the background too**, using whatever mechanism you have for
 non-blocking shell commands. `-b` returns as soon as playback starts, but *synthesis* still
 happens first, and that takes a moment (a second or two for a sentence, ~12s for a
@@ -102,6 +120,31 @@ stops the previous one automatically, so you never stack two voices.
 `pause` and `resume` are POSIX-only (Linux, macOS, WSL). On native **Windows** they report
 that they are unsupported — there, `stop` is the control, and you should say so rather than
 suggesting pause.
+
+### Check for a status-bar hook first
+
+Some hosts (currently Claude Code and Qwen Code — see `local-tts-configure` for why not
+others) can run a script that paints your own status bar, refreshed on a real timer. If one
+is installed and live, playback progress already has a genuine, continuously-updating home
+that isn't a chat message. Check once, right before you would otherwise print a status
+line:
+
+```bash
+tts hooks --status
+```
+
+Prints `active` and exits 0 if a hook is currently being called by a live session;
+`inactive` and exits 1 otherwise (nothing installed, or installed somewhere that isn't the
+session you're in right now — this is what "for that agent" actually means, since the
+check is host-agnostic and just tests whether *some* installed hook is being invoked).
+
+**If active:** do not print the chat status line at all — it is genuinely redundant, the
+bar the user is looking at is real and moving. The first time this happens in a session,
+say once that progress is in their status bar; after that, stay silent about it and just
+speak.
+
+**If inactive:** fall back to exactly the behavior below — this is the only way most hosts
+can show anything, so it stays the default.
 
 ### Present a status, not the raw command
 
