@@ -1,10 +1,16 @@
 # local-tts
 
 <p align="center">
+  <img src="assets/logo.jpg" alt="local-tts logo" width="160">
+</p>
+
+<p align="center">
   <a href="https://www.producthunt.com/products/localtts?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-local-tts" target="_blank" rel="noopener noreferrer"><img alt="local-tts - Make your coding agent talk to you! Offline! | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1230101&amp;theme=neutral&amp;t=1787592484631"></a>
   <br>
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg">
   <img alt="Python 3.9+" src="https://img.shields.io/badge/python-3.9%2B-blue.svg">
+  <br>
+  <a href="https://buymeacoffee.com/rperez93" target="_blank" rel="noopener noreferrer"><img alt="Buy Me A Coffee" src="https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-ffdd00?logo=buymeacoffee&logoColor=black"></a>
 </p>
 
 Make your coding agent talk to you!
