@@ -214,6 +214,24 @@ def apply_speed(path, factor):
         return False
 
 
+def append_silence(path, seconds):
+    """Pad a wav with trailing silence, in place. Returns whether anything was written.
+
+    Used for the gap between spoken fragments. Padding the fragment itself, rather than
+    inserting silence while joining, is what keeps streamed playback and the saved file
+    identical: the stream plays each fragment on its own and never sees a join.
+    """
+    if not seconds or seconds <= 0:
+        return False
+    params, raw = _read(path)
+    frames = int(params.framerate * float(seconds))
+    if frames <= 0:
+        return False
+    _write(path, params._replace(nframes=params.nframes + frames),
+           raw + b"\x00" * (frames * params.sampwidth * params.nchannels))
+    return True
+
+
 def apply_profile(path, speed=1.0, volume=1.0):
     """Apply whatever a provider could not realize itself. Never raises: a failed
     cosmetic transform must leave the original audio playable, not break synthesis."""

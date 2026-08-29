@@ -35,7 +35,7 @@ class ConfigTest(unittest.TestCase):
 
     def test_defaults_when_no_file(self):
         cfg = config.load()
-        self.assertEqual(cfg["provider"], "llamacpp")
+        self.assertEqual(cfg["provider"], "kokoro")
         self.assertTrue(cfg["play"])
 
     def test_file_overrides_defaults_without_dropping_siblings(self):
@@ -2301,6 +2301,106 @@ class ToneRealizationTest(unittest.TestCase):
 
     def test_command_audio_fx_defaults_to_off(self):
         self.assertIs(config.DEFAULTS["providers"]["command"]["audio_fx"], False)
+
+
+class PronunciationTest(unittest.TestCase):
+    """Word respellings applied before synthesis (text.apply_pronunciations)."""
+
+    ENTRIES = {"jarvis": "JAR-viss", "es:jarvis": "yarvis", "happy": "HAP-ee",
+               "new york": "noo york"}
+
+    def say(self, text, lang="en"):
+        return textutil.apply_pronunciations(text, self.ENTRIES, lang)
+
+    def test_bare_keys_apply_everywhere_and_scoped_keys_win(self):
+        self.assertEqual(self.say("Hello Jarvis", "en"), "Hello JAR-viss")
+        self.assertEqual(self.say("Hola Jarvis", "es"), "Hola yarvis")
+
+    def test_tone_markup_is_never_rewritten(self):
+        """An entry for "happy" must not turn <happy> into markup the tag parser no
+        longer recognizes -- which would change what is spoken, not just how."""
+        self.assertEqual(self.say("<happy>Fine</happy>"), "<happy>Fine</happy>")
+        self.assertEqual(self.say("<happy>happy</happy>"), "<happy>HAP-ee</happy>")
+
+    def test_escapes_survive(self):
+        self.assertEqual(self.say(r"a \<b\> jarvis"), r"a \<b\> JAR-viss")
+
+    def test_matching_is_whole_word_and_case_insensitive(self):
+        self.assertEqual(self.say("jarvisson JARVIS"), "jarvisson JAR-viss")
+
+    def test_longest_key_wins(self):
+        self.assertEqual(textutil.apply_pronunciations("new york", self.ENTRIES, "en"),
+                         "noo york")
+
+    def test_no_entries_is_a_noop(self):
+        self.assertEqual(textutil.apply_pronunciations("plain", {}, "en"), "plain")
+        self.assertEqual(textutil.apply_pronunciations("plain", None, "en"), "plain")
+
+
+class KokoroLanguageVoiceTest(unittest.TestCase):
+    """Kokoro names voices by language, so one flat `voice` cannot serve two."""
+
+    def build(self, call_lang, **overrides):
+        """`call_lang` is the --lang of the call; `lang=` in overrides is the *flat*
+        kokoro.lang setting -- the whole point of several of these tests is that those
+        two are not the same thing."""
+        settings = dict(config.DEFAULTS["providers"]["kokoro"],
+                        language_voices={"es": "ef_dora", "en": "bm_george"}, **overrides)
+        return KokoroProvider(settings, lang=call_lang)
+
+    def test_voice_and_phonemizer_language_follow_the_call(self):
+        self.assertEqual(self.build("es").resolved_voice(), "ef_dora")
+        self.assertEqual(self.build("es").resolved_lang(), "es")
+        self.assertEqual(self.build("en").resolved_voice(), "bm_george")
+        # en-gb, not en-us: bm_ is a British voice, and the prefix is what says so.
+        self.assertEqual(self.build("en").resolved_lang(), "en-gb")
+
+    def test_a_stale_flat_lang_does_not_override_the_chosen_voice(self):
+        """Picking a per-language voice and leaving `lang: es` in place is exactly how
+        English gets read with Spanish phonetics."""
+        self.assertEqual(self.build("en", lang="es").resolved_lang(), "en-gb")
+
+    def test_exact_tag_beats_the_base_language(self):
+        provider = self.build("es-MX")
+        provider.settings["language_voices"] = {"es": "ef_dora", "es-MX": "em_alex"}
+        self.assertEqual(provider.resolved_voice(), "em_alex")
+
+    def test_unmapped_language_falls_back_to_the_flat_setting(self):
+        self.assertEqual(self.build("de", voice="af_heart").resolved_voice(), "af_heart")
+
+
+class DeliveryTest(unittest.TestCase):
+    """Per-language pacing, over the built-in defaults."""
+
+    def build(self, lang, delivery=None):
+        settings = dict(config.DEFAULTS["providers"]["rvc"])
+        if delivery is not None:
+            settings["delivery"] = delivery
+        return RvcProvider(settings, lang=lang)
+
+    def test_named_language_wins_then_star_then_defaults(self):
+        from localtts.providers.rvc import DELIVERY_DEFAULTS
+        provider = self.build("es", {"es": {"pause_ms": 10}, "*": {"pause_ms": 99}})
+        self.assertEqual(provider.delivery()["pause_ms"], 10)
+        self.assertEqual(self.build("de", {"*": {"pause_ms": 99}}).delivery()["pause_ms"], 99)
+        self.assertEqual(self.build("de", {}).delivery(), DELIVERY_DEFAULTS)
+
+    def test_a_partial_entry_keeps_the_other_defaults(self):
+        from localtts.providers.rvc import DELIVERY_DEFAULTS
+        delivery = self.build("es", {"es": {"pause_ms": 10}}).delivery()
+        self.assertEqual(delivery["pause_ms"], 10)
+        self.assertEqual(delivery["pause_tone_ms"], DELIVERY_DEFAULTS["pause_tone_ms"])
+
+    def test_silence_is_padded_onto_the_fragment(self):
+        """Padding the fragment rather than inserting silence while joining is what
+        keeps streamed playback and the saved file identical."""
+        path = os.path.join(tempfile.mkdtemp(), "x.wav")
+        with open(path, "wb") as fh:
+            fh.write(_wav_bytes(1, frames=24000))
+        before = audio.duration(path)
+        self.assertTrue(audiofx.append_silence(path, 0.13))
+        self.assertAlmostEqual(audio.duration(path), before + 0.13, delta=0.01)
+        self.assertFalse(audiofx.append_silence(path, 0))
 
 
 class PlayerSelectionTest(unittest.TestCase):

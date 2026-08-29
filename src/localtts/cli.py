@@ -180,6 +180,10 @@ def speak(argv):
     if args.markdown or (args.markdown is None and is_markdown):
         text = textutil.strip_markdown(text)
     text = text.strip()
+    # Before anything else looks at the words: every backend benefits, --dry-run shows
+    # what will actually be spoken, and a provider composing another (rvc) passes the
+    # rewritten text down rather than each layer having to remember to do this.
+    text = textutil.apply_pronunciations(text, cfg.get("pronunciations"), args.lang or "")
     if not text:
         raise TTSError("nothing to speak: the input was empty")
 

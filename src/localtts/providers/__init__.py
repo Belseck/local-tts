@@ -19,10 +19,10 @@ REGISTRY = {
 }
 
 DESCRIPTIONS = {
-    "llamacpp": "local llama.cpp `llama-tts` binary (default)",
+    "llamacpp": "local llama.cpp `llama-tts` binary (English/Chinese/Japanese/Korean)",
     "openai": "any OpenAI-compatible /v1/audio/speech endpoint",
     "piper": "local piper ONNX voices",
-    "kokoro": "local Kokoro-82M via the kokoro-tts CLI, ~40 languages",
+    "kokoro": "local Kokoro-82M via the kokoro-tts CLI, ~40 languages (default)",
     "rvc": "voice conversion over another provider's output (rvc-python; not installed automatically)",
     "command": "custom shell template, e.g. espeak-ng or `say`",
 }

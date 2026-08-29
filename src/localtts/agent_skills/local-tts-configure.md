@@ -41,15 +41,16 @@ anything** — it usually names the exact problem.
 
 | Backend | Offline | Languages | Needs |
 | --- | --- | --- | --- |
-| `llamacpp` (default) | yes | **English, Chinese, Japanese, Korean only** | `llama-tts` binary |
+| `llamacpp` | yes | **English, Chinese, Japanese, Korean only** | `llama-tts` binary |
 | `piper` | yes | ~40 languages, fast | `piper` binary + a `.onnx` voice |
-| `kokoro` | yes | ~40 languages, small model | a `kokoro-tts` wrapper (set up below) |
+| `kokoro` (default) | yes | ~40 languages, small model | a `kokoro-tts` wrapper (set up below) |
 | `openai` | no | whatever the endpoint offers | a URL, and a key only for api.openai.com |
 | `rvc` | yes | inherits its base provider's | **not installed automatically** — see below |
 | `command` | yes | whatever the tool offers | any binary that writes a WAV |
 
 **The single most common problem:** the user's text is not in one of llamacpp's four
-languages, so it is pronounced with English phonetics. The fix is piper, not a setting.
+languages, so it is pronounced with English phonetics. The fix is a backend that speaks
+it -- kokoro (the default) or piper -- not a setting.
 
 **If the user has an existing `command.template`** wired to something that now has a real
 provider above (kokoro, rvc), run `tts config --detect-migrations` and offer to switch —
@@ -214,37 +215,148 @@ this — **ask before setting it up**, it's an extra background process, not a r
 ```bash
 cat > ~/.local/share/kokoro-venv/kokoro_server.py <<'EOF'
 #!/usr/bin/env python3
-import argparse, io, json, os, sys, threading, time, warnings
+"""Persistent Kokoro server: loads the model once, serves POST /synthesize over HTTP.
+Talked to by local-tts's kokoro provider when kokoro.server_url is set. Exits on its own
+after --idle-timeout seconds with no synthesis request, to release the loaded model; 0
+disables that."""
+import argparse
+import io
+import json
+import os
+import sys
+import threading
+import time
+import warnings
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
 warnings.filterwarnings("ignore")
+
 MODELS = os.path.expanduser("~/.local/share/kokoro-models")
+
+#: Vowels that can carry stress across the languages kokoro speaks. Used to find the
+#: vowel a primary-stress mark applies to, so a length mark lands on the vowel itself
+#: rather than on the consonant in front of it.
+VOWELS = set("aeiouɑɐɒæɛɜɪiɔoʊuʌyøœɵɤɯəɨʉ")
+_BACKENDS = {}
+
+
+def phonemes(text, lang):
+    """IPA for `text`, with stress marks. The backend is built once per language: it
+    loads espeak's data, which is not something to redo per request."""
+    if lang not in _BACKENDS:
+        import espeakng_loader
+        from phonemizer.backend import EspeakBackend
+        from phonemizer.backend.espeak.wrapper import EspeakWrapper
+        EspeakWrapper.set_library(espeakng_loader.get_library_path())
+        EspeakWrapper.set_data_path(espeakng_loader.get_data_path())
+        _BACKENDS[lang] = EspeakBackend(lang, preserve_punctuation=True, with_stress=True)
+    return _BACKENDS[lang].phonemize([text])[0].strip()
+
+
+def lengthen_stressed(ipa, marks):
+    """Append `marks` IPA length marks to the vowel carrying primary stress in each word.
+
+    This is emphasis the way a phonetician writes it: kˈasa -> kˈaːsa. Kokoro has the
+    length mark in its own vocabulary, so the model hears it rather than skipping it --
+    an isolated word measures 0.576s plain, 0.640s with one mark, 0.661s with two.
+    """
+    if marks <= 0:
+        return ipa
+    out, index = [], 0
+    while index < len(ipa):
+        char = ipa[index]
+        out.append(char)
+        index += 1
+        if char != "ˈ":                      # primary stress only, not secondary
+            continue
+        while index < len(ipa) and ipa[index] not in VOWELS:
+            out.append(ipa[index]); index += 1
+        while index < len(ipa) and ipa[index] in VOWELS:
+            out.append(ipa[index]); index += 1
+        out.append("ː" * marks)
+    return "".join(out)
+
 
 def make_handler(kokoro, last_activity):
     class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *a): pass
+        def log_message(self, *a):
+            pass
+
         def do_GET(self):
-            # not "activity" -- must not keep the process alive just because polled
+            # A health check is not "activity" -- it must not keep the process alive
+            # forever just because something is polling it.
             if self.path == "/health":
-                self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
             else:
-                self.send_response(404); self.end_headers()
+                self.send_response(404)
+                self.end_headers()
+
         def do_POST(self):
             if self.path != "/synthesize":
-                self.send_response(404); self.end_headers(); return
+                self.send_response(404)
+                self.end_headers()
+                return
             length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length) or b"{}")
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                self.send_response(400)
+                self.end_headers()
+                return
             text = (body.get("text") or "").strip()
             if not text:
-                self.send_response(400); self.end_headers(); return
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"no text")
+                return
+
             import soundfile as sf
-            samples, rate = kokoro.create(text, voice=body.get("voice") or "af_heart",
-                                          speed=float(body.get("speed") or 1.0),
-                                          lang=body.get("lang") or "en-us")
-            buf = io.BytesIO(); sf.write(buf, samples, rate, format="WAV")
+            lang = body.get("lang") or "en-us"
+            spoken, is_phonemes = text, False
+            marks = int(body.get("emphasis_lengthen") or 0)
+            if marks > 0:
+                try:
+                    spoken, is_phonemes = lengthen_stressed(phonemes(text, lang), marks), True
+                except Exception as exc:      # never lose the audio over a nicety
+                    print("emphasis skipped (%s: %s)" % (type(exc).__name__, exc),
+                          file=sys.stderr, flush=True)
+                    spoken, is_phonemes = text, False
+
+            kwargs = {}
+            for key in ("sentence_pause", "clause_pause"):
+                if body.get(key) is not None:
+                    kwargs[key] = float(body[key])
+            try:
+                samples, rate = kokoro.create(
+                    spoken,
+                    voice=body.get("voice") or "af_heart",
+                    speed=float(body.get("speed") or 1.0),
+                    lang=lang,
+                    is_phonemes=is_phonemes,
+                    **kwargs
+                )
+            except Exception as exc:
+                # Answer with an error instead of dying: an unknown voice used to take
+                # the whole server down mid-request, which reads as a network failure.
+                print("synthesis failed (%s: %s)" % (type(exc).__name__, exc),
+                      file=sys.stderr, flush=True)
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(str(exc).encode("utf-8", "replace")[:500])
+                return
+            buf = io.BytesIO()
+            sf.write(buf, samples, rate, format="WAV")
             last_activity[0] = time.time()
-            self.send_response(200); self.send_header("Content-Type", "audio/wav")
-            self.end_headers(); self.wfile.write(buf.getvalue())
+
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.end_headers()
+            self.wfile.write(buf.getvalue())
+
     return Handler
+
 
 def watch_idle(last_activity, idle_timeout):
     if idle_timeout <= 0:
@@ -255,19 +367,21 @@ def watch_idle(last_activity, idle_timeout):
             print("idle for %ds, exiting to release the model" % idle_timeout, file=sys.stderr)
             os._exit(0)
 
+
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--port", type=int, default=8765)
-    p.add_argument("--idle-timeout", type=int, default=300,
-                   help="exit after this many idle seconds; 0 disables")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--idle-timeout", type=int, default=300,
+                        help="exit after this many idle seconds; 0 disables")
+    args = parser.parse_args()
     from kokoro_onnx import Kokoro
     print("loading model...", file=sys.stderr)
-    kokoro = Kokoro(f"{MODELS}/kokoro-v1.0.onnx", f"{MODELS}/voices-v1.0.bin")
+    kokoro = Kokoro("%s/kokoro-v1.0.onnx" % MODELS, "%s/voices-v1.0.bin" % MODELS)
     last_activity = [time.time()]
     threading.Thread(target=watch_idle, args=(last_activity, args.idle_timeout), daemon=True).start()
     print("ready on port %d (idle timeout %ds)" % (args.port, args.idle_timeout), file=sys.stderr)
     HTTPServer(("127.0.0.1", args.port), make_handler(kokoro, last_activity)).serve_forever()
+
 
 if __name__ == "__main__":
     main()
@@ -834,6 +948,57 @@ tts config --set player_args.ffplay=                        # empty value remove
 Worth trying when a device resamples badly or underruns; **verify by ear rather than
 assuming**, since these are machine-specific and some combinations make things worse.
 `tts check` prints which player is being used and any tuning in effect.
+
+## Pronunciation dictionary
+
+Say these words this way — applied before synthesis on every backend:
+
+```bash
+tts config --set pronunciations.jarvis="JAR-viss"
+tts config --set pronunciations.es:jarvis="yarvis"   # Spanish only
+tts config --set pronunciations.jarvis=                # empty removes it
+```
+
+Keys match whole words, case-insensitively; the replacement is used exactly as written. A
+bare key applies everywhere, `<lang>:<word>` to one language. Tone-tag markup is never
+rewritten. Reach for this when a user says a name or a technical term comes out wrong —
+it is almost always the right fix, and much cheaper than changing voices.
+
+## Kokoro voices per language
+
+Kokoro names voices by language (`a`/`b` English, `e` Spanish, `f` French, ...), so one
+flat `voice` cannot serve two languages:
+
+```bash
+tts config --set kokoro.language_voices.en=bm_george
+tts config --set kokoro.language_voices.es=ef_dora
+```
+
+The phonemizer language is then derived from the chosen voice, not from `lang` — a stale
+`lang` is how one language ends up read with another's phonetics. Clear the flat
+`kokoro.voice`/`kokoro.lang` once a map is in place, or an unmapped language silently
+inherits them.
+
+**Voice prefixes:** `af_`/`am_` US English, `bf_`/`bm_` British English, `ef_`/`em_`
+Spanish, `ff_` French, `hf_`/`hm_` Hindi, `if_`/`im_` Italian, `jf_`/`jm_` Japanese,
+`pf_`/`pm_` Brazilian Portuguese, `zf_`/`zm_` Mandarin.
+
+## Delivery: pacing, pauses, emphasis
+
+```bash
+tts config --set 'rvc.delivery.es={"speed": 1.0, "pause_ms": 45, "pause_tone_ms": 130, "emphasis_lengthen": 2}'
+tts config --set 'rvc.delivery.en={"speed": 1.0, "pause_ms": 60, "pause_tone_ms": 160}'
+```
+
+`pause_ms` is the gap between fragments delivered the same way; `pause_tone_ms` the
+longer one where the tone changes — the breath. `"*"` covers unnamed languages.
+
+`emphasis_lengthen` puts N IPA length marks on the vowel carrying primary stress
+(`kˈasa` → `kˈaːsa`). It needs a **kokoro base with the persistent server**, since that
+is where the phonemizer lives; the server falls back to plain text if phonemization
+fails, so it can never cost the user their audio. The effect is subtle on a long
+sentence and clearest on short, emphatic spans — have the user judge it by ear before
+raising the number.
 
 ## Streaming playback (on by default)
 

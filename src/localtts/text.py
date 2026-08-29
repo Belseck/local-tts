@@ -269,6 +269,62 @@ def resolve_tone_segments(text, auto_tone=False):
     return [(chunk.strip(), profile) for chunk, profile in merged if chunk.strip()] or [(text, None)]
 
 
+#: Tone-tag markup and backslash escapes -- the parts of the text that are notation
+#: rather than words, and so must survive a pronunciation rewrite untouched.
+#: Capturing, so re.split() hands the markup back instead of deleting it.
+_MARKUP = re.compile(r"(\\.|</?[A-Za-z][\w.-]*>)")
+
+
+def pronunciation_entries(entries, lang=""):
+    """The dictionary entries that apply to this call.
+
+    A bare key applies to every language; a key written `<lang>:<word>` applies only to
+    that one, so "live" can be respelled differently for English and Spanish in a single
+    map without needing a nested structure (and so `--set` can still reach one entry at
+    a time). An exact tag beats its base language, matching the language memory.
+    """
+    tag = (lang or "").strip().lower()
+    candidates = []
+    if tag:
+        candidates = [tag, tag.replace("_", "-"), tag.split("-")[0].split("_")[0]]
+    general, scoped = {}, {}
+    for key, value in (entries or {}).items():
+        head, sep, word = str(key).partition(":")
+        if not sep:
+            general[key.lower()] = value
+            continue
+        if head.strip().lower() in candidates:
+            scoped[word.strip().lower()] = value
+    general.update(scoped)          # a language-specific entry wins over a general one
+    return general
+
+
+def apply_pronunciations(text, entries, lang=""):
+    """Rewrite words the user has respelled, so a name or a piece of jargon comes out
+    the way they want it said.
+
+    Matching is whole-word and case-insensitive; the replacement is used exactly as
+    written, because a respelling's own capitalization is often load-bearing ("EM ai"
+    is not "Em Ai"). Tone-tag markup and escapes are left alone -- a dictionary entry
+    for "happy" must not rewrite `<happy>` into something the tag parser no longer
+    recognizes.
+    """
+    applicable = pronunciation_entries(entries, lang)
+    if not applicable or not text:
+        return text
+    # Longest first so a multi-word phrase wins over its own first word.
+    pattern = re.compile(
+        r"(?<!\w)(%s)(?!\w)" % "|".join(
+            re.escape(key) for key in sorted(applicable, key=len, reverse=True)),
+        re.IGNORECASE)
+
+    def rewrite(piece):
+        return pattern.sub(lambda m: applicable[m.group(1).lower()], piece)
+
+    return "".join(part if _MARKUP.fullmatch(part) else rewrite(part)
+                   for part in _MARKUP.split(text) if part is not None)
+
+
 def strip_tone_tags(text):
     """Remove <name>...</name> tone tags -- keeping the words inside them, unescaping
     \\<, \\>, \\\\ -- for any backend that doesn't understand them (see tone_segments()),

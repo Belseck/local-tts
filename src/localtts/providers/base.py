@@ -92,6 +92,22 @@ class Provider:
         if sink:
             sink(path)
 
+    def for_language(self, mapping, default=""):
+        """This call's entry from a {language tag: value} map, or `default`.
+
+        An exact tag beats its base language (es-MX before es), matching how the language
+        memory itself resolves, so a general Spanish entry can sit alongside a Mexican
+        one. Shared because more than one provider maps per-language settings this way:
+        rvc picks a resident voice model, kokoro picks a voice.
+        """
+        tag = (self.lang or "").strip()
+        if not tag or not mapping:
+            return default
+        for candidate in (tag, tag.replace("_", "-"), tag.split("-")[0].split("_")[0]):
+            if candidate in mapping:
+                return mapping[candidate]
+        return default
+
     def speed_settings(self, speed):
         """Settings that make this backend synthesize at `speed` times its normal rate,
         or None if it has no rate control of its own.

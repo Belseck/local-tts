@@ -18,6 +18,18 @@ from localtts.errors import TTSError
 from localtts.providers.base import Provider
 
 
+#: Delivery knobs, with the values used when a language names none. Pauses are in
+#: milliseconds because that is the unit anyone reasoning about speech rhythm uses; the
+#: previous behavior was a hardcoded 350 ms between every fragment, which reads as a
+#: stall rather than a breath.
+DELIVERY_DEFAULTS = {
+    "speed": 1.0,
+    "pause_ms": 45,             # between fragments delivered the same way
+    "pause_tone_ms": 130,       # when the tone changes -- the breath
+    "emphasis_lengthen": 0,     # IPA length marks on the stressed vowel (kokoro only)
+}
+
+
 class RvcProvider(Provider):
     name = "rvc"
     default_format = "wav"
@@ -64,13 +76,8 @@ class RvcProvider(Provider):
         loaded first. Language-specific mapping wins over the flat default, and an exact
         tag beats its base language (es-MX before es), matching how the language memory
         itself resolves. Public because `tts check` and --dry-run both report it."""
-        by_lang = self.settings.get("language_models") or {}
-        tag = (self.lang or "").strip()
-        if tag and by_lang:
-            for candidate in (tag, tag.replace("_", "-"), tag.split("-")[0].split("_")[0]):
-                if candidate in by_lang:
-                    return by_lang[candidate]
-        return self.settings.get("server_model") or ""
+        return self.for_language(self.settings.get("language_models") or {},
+                                 self.settings.get("server_model") or "")
 
     def _base_name(self):
         return self.settings.get("base_provider") or (self.cfg or {}).get("provider") or "piper"
@@ -128,13 +135,24 @@ class RvcProvider(Provider):
 
         # Each tagged span makes its own trip through the converter: rvc works on audio,
         # so a span's delivery has to already be in the wav it receives.
+        from localtts import audiofx
+
+        delivery = self.delivery()
         work = tempfile.mkdtemp(prefix="local-tts-rvc-tone-")
         parts = [os.path.join(work, "%04d.wav" % index) for index in range(len(segments))]
         try:
-            for (chunk, profile), part in zip(segments, parts):
+            for index, ((chunk, profile), part) in enumerate(zip(segments, parts)):
                 self._synthesize_one(base, chunk, part, voice, profile)
+                if index < len(segments) - 1:
+                    # A change of tone gets a longer gap than an ordinary one -- the
+                    # breath a speaker takes when the delivery shifts. Padded onto the
+                    # fragment rather than inserted while joining, so the streamed and
+                    # the saved audio are the same sound.
+                    changing = profile != segments[index + 1][1]
+                    gap = delivery["pause_tone_ms"] if changing else delivery["pause_ms"]
+                    audiofx.append_silence(part, gap / 1000.0)
                 self.emit_part(part)
-            audiomod.concat_wavs(parts, out_path)
+            audiomod.concat_wavs(parts, out_path, gap_seconds=0)
         finally:
             for part in parts:
                 if os.path.exists(part):
@@ -142,6 +160,21 @@ class RvcProvider(Provider):
             if os.path.isdir(work):
                 os.rmdir(work)
         return out_path
+
+    def delivery(self):
+        """This language's delivery settings, over the built-in defaults.
+
+        Pacing is language-specific in a way a single number cannot cover: Spanish runs
+        faster with shorter gaps than English, and both differ from what a <tag> asks for
+        on top. Falls back to `delivery["*"]`, then to DELIVERY_DEFAULTS, so a config
+        that names only one language still works for the others.
+        """
+        by_lang = self.settings.get("delivery") or {}
+        chosen = self.for_language(by_lang, by_lang.get("*") or {})
+        merged = dict(DELIVERY_DEFAULTS)
+        if isinstance(chosen, dict):
+            merged.update({k: v for k, v in chosen.items() if k in DELIVERY_DEFAULTS})
+        return merged
 
     def _synthesize_one(self, base, chunk, out_path, voice, profile):
         """Base synthesis -> conversion -> whatever tone is still unrealized.
@@ -161,9 +194,13 @@ class RvcProvider(Provider):
         from localtts import audiofx
         from localtts import text as textutil
 
-        speed = profile["speed"] if profile else 1.0
+        speed = (profile["speed"] if profile else 1.0) * float(self.delivery()["speed"])
         volume = profile["volume"] if profile else 1.0
         residual_speed = speed
+        marks = int(self.delivery()["emphasis_lengthen"] or 0)
+        if marks > 0:
+            # Harmless on a base that has no such setting -- it simply never reads it.
+            base = base.with_settings({"emphasis_lengthen": marks})
         if abs(speed - 1.0) >= audiofx.EPSILON:
             # getattr rather than a direct call: the base is duck-typed here (see the
             # auto_tone lookup in synthesize()), so anything without the hook simply

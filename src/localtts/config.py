@@ -12,8 +12,12 @@ APP_NAME = "local-tts"
 ENV_PREFIX = "LOCALTTS_"
 
 DEFAULTS = {
-    # Provider used when --provider is not given.
-    "provider": "llamacpp",
+    # Provider used when --provider is not given. Kokoro speaks ~40 languages from a
+    # single 82M model, where llama.cpp's OuteTTS covers only English, Chinese, Japanese
+    # and Korean -- so the old default silently mispronounced most of the world with
+    # English phonetics. llamacpp is still a provider, just not the one you get by
+    # accident.
+    "provider": "kokoro",
     # Play the generated audio after synthesis (unless --output is given).
     "play": True,
     # Force a specific playback command (e.g. "ffplay"). Empty => autodetect, which
@@ -26,6 +30,13 @@ DEFAULTS = {
     # Inserted just before the file argument. Audio stacks differ per box (WSL's pulse
     # bridge, a resampling ALSA default, a device that wants a bigger buffer), and the
     # fix is nearly always a flag rather than a code change -- so it is configuration.
+    # Say these words this way. Keys are matched whole-word and case-insensitively;
+    # the value is a respelling used exactly as written, e.g.
+    #   {"jarvis": "JAR-viss", "es:jarvis": "yarvis", "kubectl": "cube cuddle"}
+    # A bare key applies to every language; `<lang>:<word>` applies to that one only, so
+    # a word said differently in two languages needs no nested structure. Applied before
+    # synthesis, on every backend; <tag> markup is left untouched.
+    "pronunciations": {},
     "player_args": {},
     # Environment applied to the player process only, e.g.
     #   {"SDL_AUDIODRIVER": "pulseaudio", "PULSE_LATENCY_MSEC": "90"}
@@ -121,7 +132,26 @@ DEFAULTS = {
             "model_dir": "",
             "voice": "",    # empty => the binary's own default
             "lang": "",     # empty => the binary's own default
+            # Which voice speaks which language, e.g.
+            #   {"es": "ef_dora", "en": "bm_george"}
+            # Kokoro voices are per-language -- the first letter of the name says which
+            # (a/b English, e Spanish, f French, ...) -- so one flat `voice` cannot serve
+            # two languages. An exact tag beats its base language, and the phonemizer
+            # language is then taken from the chosen voice rather than from `lang`, which
+            # would otherwise stay stale and read one language with another's phonetics.
+            "language_voices": {},
             "speed": 1.0,
+            # Emphasis as a phonetician writes it: N IPA length marks on the vowel
+            # carrying primary stress (kˈasa -> kˈaːsa). Kokoro has the length mark in
+            # its own vocabulary, so the model hears it -- an isolated word measures
+            # 0.576s plain, 0.640s with one mark, 0.661s with two. 0 disables it, and
+            # it needs the persistent server, which is where the phonemizer lives.
+            "emphasis_lengthen": 0,
+            # Kokoro's own within-utterance pauses, in seconds (its defaults are 0.25
+            # and 0.1). Empty leaves them alone. Distinct from rvc's pause_ms, which is
+            # the gap *between* fragments.
+            "sentence_pause": "",
+            "clause_pause": "",
             "auto_tone": False,    # see openai.auto_tone above -- kokoro has no volume
                                    # knob at all, so only a <tag>'s speed is realized here
             "extra_args": [],
@@ -165,6 +195,19 @@ DEFAULTS = {
             # second copy of torch in memory). `server_models` maps the name the server
             # was started with to the files behind it -- local-tts never loads these
             # itself, it only names one in the request and reports them in `tts check`.
+            # How each language is delivered, over the built-in defaults (see
+            # providers/rvc.py DELIVERY_DEFAULTS). "*" applies to any language not named.
+            #   speed          rate multiplier, folded into the base provider's own
+            #                  rate control alongside a <tag>'s speed
+            #   pause_ms       silence between fragments delivered the same way
+            #   pause_tone_ms  silence where the tone changes -- the breath a speaker
+            #                  takes when the delivery shifts
+            # Spanish runs faster with shorter gaps than English, which is why this is
+            # per-language rather than one number.
+            "delivery": {
+                "es": {"speed": 1.0, "pause_ms": 45, "pause_tone_ms": 130},
+                "en": {"speed": 1.0, "pause_ms": 60, "pause_tone_ms": 160},
+            },
             "server_models": {},       # {"jarvis": {"model": "...pth", "index": "...index"}}
             # Which of those names to ask for. `language_models` wins when the call has
             # a --lang; `server_model` is the fallback for everything else. Both empty
@@ -195,10 +238,10 @@ DEFAULTS = {
 
 
 TOP_LEVEL_KEYS = ("provider", "play", "player", "terminal_title", "stream",
-                  "player_args", "player_env")
+                  "player_args", "player_env", "pronunciations")
 #: Top-level settings that are maps, so `--set` takes one more level:
 #: `player_args.ffplay="-af aresample=48000"`, `player_env.SDL_AUDIODRIVER=pulseaudio`.
-TOP_LEVEL_MAPS = ("player_args", "player_env")
+TOP_LEVEL_MAPS = ("player_args", "player_env", "pronunciations")
 LANGUAGE_KEYS = ("provider", "voice")
 
 
@@ -422,6 +465,16 @@ def set_values(assignments):
                     bucket[sub] = target
                 if raw == "":
                     target.pop(entry, None)
+                elif raw.lstrip()[:1] in ("{", "["):
+                    # A nested value (rvc.delivery.es={"speed": 1.0, ...}) would otherwise
+                    # be stored as its own JSON text. Only braces/brackets are parsed, so
+                    # an ordinary value like `es=cortana-es` -- or one that merely looks
+                    # numeric -- still stays the string it was typed as.
+                    try:
+                        target[entry] = json.loads(raw)
+                    except ValueError:
+                        raise TTSError("%s looks like JSON but does not parse: %s"
+                                       % (key, raw))
                 else:
                     target[entry] = raw
             else:

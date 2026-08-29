@@ -21,6 +21,16 @@ from localtts.providers.base import Provider
 #: model path internally and needs neither this setting nor these files checked here.
 MODEL_FILES = ("kokoro-v1.0.onnx", "voices-v1.0.bin")
 
+#: Kokoro names every voice <language letter><gender>_<name> (af_heart, ef_dora,
+#: bm_george), so the voice itself says which language it speaks. Used to pick the
+#: phonemizer language when a voice was chosen per language -- otherwise a Spanish voice
+#: could be handed English phonetics, which is exactly the failure the language memory
+#: exists to prevent. `kokoro.lang` still wins when set and no per-language voice applies.
+VOICE_LANGS = {
+    "a": "en-us", "b": "en-gb", "e": "es", "f": "fr-fr", "h": "hi",
+    "i": "it", "j": "ja", "p": "pt-br", "z": "cmn",
+}
+
 
 class KokoroProvider(Provider):
     name = "kokoro"
@@ -43,6 +53,30 @@ class KokoroProvider(Provider):
                            % (", ".join(missing), model_dir))
         return model_dir
 
+    def resolved_voice(self, voice=None):
+        """The voice for this call: an explicit --voice, else this language's entry from
+        `language_voices`, else the flat `voice` setting."""
+        if voice:
+            return voice
+        return (self.for_language(self.settings.get("language_voices") or {})
+                or self.settings.get("voice") or "")
+
+    def resolved_lang(self, voice=None):
+        """The phonemizer language for this call.
+
+        Derived from the voice's own prefix when the voice came from `language_voices`,
+        because picking a per-language voice and then leaving a stale flat `lang` in place
+        is how a Spanish voice ends up reading English phonetics. A flat `lang` still
+        applies whenever no per-language voice was chosen.
+        """
+        per_language = self.for_language(self.settings.get("language_voices") or {})
+        chosen = voice or per_language
+        if chosen and (per_language or not self.settings.get("lang")):
+            derived = VOICE_LANGS.get(chosen[:1].lower())
+            if derived:
+                return derived
+        return self.settings.get("lang") or ""
+
     def speed_settings(self, speed):
         """kokoro's speed is a direct rate multiplier, so it just compounds."""
         return {"speed": float(self.settings.get("speed") or 1.0) * speed}
@@ -61,10 +95,10 @@ class KokoroProvider(Provider):
         exe = self.resolve_binary("binary", "kokoro-tts")
         cmd = [exe, "-o", out_path]
 
-        chosen_voice = voice or self.settings.get("voice")
+        chosen_voice = self.resolved_voice(voice)
         if chosen_voice:
             cmd += ["-v", chosen_voice]
-        lang = self.settings.get("lang")
+        lang = self.resolved_lang(voice)
         if lang:
             cmd += ["-l", lang]
         effective_speed = speed if speed is not None else self.settings.get("speed")
@@ -123,15 +157,25 @@ class KokoroProvider(Provider):
         self.ensure_server(server_url, self.settings.get("server_start"),
                            float(self.settings.get("server_timeout") or 30))
         payload = {"text": text}
-        chosen_voice = voice or self.settings.get("voice")
+        chosen_voice = self.resolved_voice(voice)
         if chosen_voice:
             payload["voice"] = chosen_voice
-        lang = self.settings.get("lang")
+        lang = self.resolved_lang(voice)
         if lang:
             payload["lang"] = lang
         effective_speed = speed if speed is not None else self.settings.get("speed")
         if effective_speed and float(effective_speed) != 1.0:
             payload["speed"] = float(effective_speed)
+        # Server-only: the server has the phonemizer and kokoro's own pause arguments.
+        # A server that predates these simply ignores unknown keys, so sending them is
+        # always safe; the subprocess CLI wrapper has no equivalent flags.
+        marks = int(self.settings.get("emphasis_lengthen") or 0)
+        if marks > 0:
+            payload["emphasis_lengthen"] = marks
+        for key in ("sentence_pause", "clause_pause"):
+            value = self.settings.get(key)
+            if value not in (None, ""):
+                payload[key] = float(value)
         audio_bytes = self.post_for_audio(server_url, "/synthesize", payload)
         with open(out_path, "wb") as fh:
             fh.write(audio_bytes)

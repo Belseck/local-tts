@@ -50,8 +50,9 @@ tts --lang en "Done — the tests pass."
 If the language you need is **not** recorded, do not guess silently. Pick a sane default,
 say which one you used, and offer to remember it:
 
-- The default `llamacpp` backend only speaks **English, Chinese, Japanese and Korean**.
-  Anything else comes out with English phonetics and sounds wrong.
+- The default is `kokoro`, which speaks ~40 languages. `llamacpp` only speaks
+  **English, Chinese, Japanese and Korean** -- anything else comes out with English
+  phonetics and sounds wrong, so don't reach for it outside those four.
 - For any other language, `piper` or `kokoro` are the right backends — both cover ~40
   languages, but need a voice installed first. If neither is set up, use the
   `local-tts-configure` skill rather than guessing which one to install.

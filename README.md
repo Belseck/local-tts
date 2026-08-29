@@ -15,8 +15,8 @@
 
 Make your coding agent talk to you!
 
-A tiny command-line text-to-speech tool. It shells out to **llama.cpp's `llama-tts`**
-by default, so speech is generated locally and offline.
+A tiny command-line text-to-speech tool. It shells out to **Kokoro-82M** by default —
+~40 languages from one small model — so speech is generated locally and offline.
 
 ```console
 $ tts "Hello from my terminal."
@@ -30,8 +30,52 @@ plus binaries you already have (or install once, on your terms).
 
 ---
 
+## Make Claude talk like Jarvis. Or Cortana. In Spanish.
+
+Your coding agent already writes your code. With an RVC voice model it can *sound* like
+whoever you want while it does — offline, on your own machine, no API key.
+
+```console
+$ tts --lang en "Good evening. The tests are passing, sir."
+$ tts --lang es "Buenas noches. Todas las pruebas pasaron."
+```
+
+One `rvc` server holds both voices resident and picks one per language:
+
+```bash
+tts config --set rvc.base_provider=kokoro          # Kokoro speaks; RVC changes who
+tts config --set kokoro.language_voices.en=bm_george
+tts config --set kokoro.language_voices.es=ef_dora
+tts config --set rvc.language_models.en=jarvis     # your own trained .pth
+tts config --set rvc.language_models.es=cortana-es
+tts languages --set en=rvc
+tts languages --set es=rvc
+```
+
+Now every agent on the machine that knows about `tts` speaks in that voice, in the right
+language, because the preference lives in one config file rather than in one chat.
+
+**It acts, too.** Tone tags change the delivery per sentence:
+
+```console
+$ tts "<calm>Deploy finished.</calm> <urgent>But staging is down.</urgent>"
+```
+
+**And it answers fast.** Fragments start playing as soon as the first one is
+synthesized, so a long passage begins in about a second instead of after the whole
+thing renders — measured on a 19-span story, 9.6s to first sound instead of 40.5s.
+
+> Bring your own `.pth` — local-tts wires up a voice model you already have or trained;
+> it does not distribute voices, and cloning a real person's voice without their consent
+> is not what this is for.
+
+See [Providers → `rvc`](#rvc--voice-conversion-not-installed-automatically) for the full setup.
+
+---
+
 ## Contents
 
+- [Make Claude talk like Jarvis. Or Cortana. In Spanish.](#make-claude-talk-like-jarvis-or-cortana-in-spanish)
 - [Requirements](#requirements)
 - [Install](#install)
   - [Install with an AI agent](#install-with-an-ai-agent)
@@ -178,7 +222,7 @@ tts check
 
 ```
 config file : /home/you/.config/local-tts/config.json (not created yet)
-default     : llamacpp
+default     : kokoro
 
 [ok] llamacpp  /usr/local/bin/llama-tts -> default OuteTTS (downloaded on first run)
 [--] openai    https://api.openai.com/v1 (no api_key and $OPENAI_API_KEY is unset)
@@ -271,7 +315,7 @@ tts config [--show | --path | --init | --set KEY=VALUE]
 | `-f, --file FILE` | Read the text from a file (`-` for stdin). |
 | `--markdown` / `--no-markdown` | Force markdown stripping on or off (automatic for `.md` files). |
 | `-o, --output FILE` | Write the audio here instead of playing it. |
-| `-p, --provider NAME` | `llamacpp` (default), `openai`, `piper`, `command`. |
+| `-p, --provider NAME` | `kokoro` (default), `piper`, `rvc`, `llamacpp`, `openai`, `command`. |
 | `-l, --lang CODE` | Use the backend and voice remembered for this language. |
 | `-v, --voice VOICE` | Speaker file (llamacpp), `.onnx` voice (piper), or voice name (openai). |
 | `-m, --model MODEL` | Override the provider's model for this run. |
@@ -532,7 +576,7 @@ with `LOCALTTS_LANG_ES=piper:/path/voice.onnx`.
 tts providers
 ```
 
-### `llamacpp` — default, local, offline
+### `llamacpp` — local, offline, four languages
 
 Runs `llama-tts`. Zero configuration: with no model set it passes
 `--tts-oute-default` and llama.cpp handles the weights.
@@ -735,6 +779,34 @@ tts -p kokoro "Prueba de voz con Kokoro."
 | `server_url` | *(empty)* | Optional. See [Optional: a persistent server](#optional-a-persistent-server-kokoro--rvc) below. |
 | `server_start`, `server_timeout` | *(empty)*, `30` | Command to auto-start the server, and how long to wait for it. |
 
+#### Per-language voices
+
+Kokoro names every voice by language — `a`/`b` English, `e` Spanish, `f` French, and so
+on — so one flat `voice` cannot serve two languages. Map them instead:
+
+```bash
+tts config --set kokoro.language_voices.en=bm_george   # British male
+tts config --set kokoro.language_voices.es=ef_dora     # Spanish female
+```
+
+An exact tag beats its base language (`es-MX` before `es`), and the phonemizer language
+is taken from the chosen voice rather than from `lang` — otherwise switching languages
+leaves a stale `lang` behind and one language gets read with another's phonetics.
+
+#### Emphasis, and kokoro's own pauses
+
+```bash
+tts config --set kokoro.emphasis_lengthen=2   # IPA length marks on the stressed vowel
+tts config --set kokoro.sentence_pause=0.25   # kokoro's own within-utterance pauses
+tts config --set kokoro.clause_pause=0.1
+```
+
+`emphasis_lengthen` is emphasis the way a phonetician writes it: N length marks on the
+vowel carrying primary stress, `kˈasa` → `kˈaːsa`. Kokoro has `ː` in its own vocabulary,
+so the model hears it — an isolated word measures 0.576s plain, 0.640s with one mark,
+0.661s with two. It needs the persistent server, which is where the phonemizer lives, and
+`0` disables it.
+
 ### `rvc` — voice conversion (not installed automatically)
 
 [rvc-python](https://github.com/daswer123/rvc-python) does **audio-to-audio voice
@@ -936,6 +1008,47 @@ tts -p openai -s model=tts-1-hd -s speed=1.15 "faster, nicer"
 
 ---
 
+### Pronunciation dictionary
+
+Say these words this way. Applied before synthesis on every backend, so a name or a piece
+of jargon comes out right no matter which voice is speaking:
+
+```bash
+tts config --set pronunciations.jarvis="JAR-viss"
+tts config --set pronunciations.kubectl="cube cuddle"
+tts config --set pronunciations.es:jarvis="yarvis"   # Spanish only
+tts config --set pronunciations.jarvis=                # empty value removes it
+```
+
+Keys match whole words, case-insensitively; the replacement is used exactly as written,
+because a respelling's own capitalization is often load-bearing. A bare key applies to
+every language, and `<lang>:<word>` applies to that one only — so a word said differently
+in two languages needs no nested structure. Tone-tag markup is left untouched: an entry
+for `happy` will not rewrite `<happy>`.
+
+### Delivery: pacing and pauses
+
+How each language is delivered, on top of whatever a tone tag asks for:
+
+```bash
+tts config --set 'rvc.delivery.es={"speed": 1.0, "pause_ms": 45, "pause_tone_ms": 130, "emphasis_lengthen": 2}'
+tts config --set 'rvc.delivery.en={"speed": 1.0, "pause_ms": 60, "pause_tone_ms": 160}'
+```
+
+| Key | Meaning |
+| --- | --- |
+| `speed` | Rate multiplier, folded into the base provider's own rate control |
+| `pause_ms` | Silence between fragments delivered the same way |
+| `pause_tone_ms` | Silence where the tone changes — the breath a speaker takes |
+| `emphasis_lengthen` | IPA length marks on the stressed vowel (kokoro base only) |
+
+`"*"` applies to any language not named. Spanish runs faster with shorter gaps than
+English, which is why this is per-language rather than one number — and why the previous
+behavior, a hardcoded 350 ms between every fragment, read as a stall rather than a breath.
+
+The pause is padded onto the fragment itself rather than inserted while joining, so
+streamed playback and the saved file are the same sound.
+
 ## Audio playback
 
 There is no audio library to install.
@@ -1054,7 +1167,7 @@ src/localtts/
 ├── errors.py         TTSError -> a clean one-line message
 └── providers/
     ├── base.py       Provider contract + subprocess helpers
-    ├── llamacpp.py   default backend
+    ├── llamacpp.py   llama.cpp backend
     ├── openai.py     OpenAI-compatible HTTP
     ├── piper.py      Piper ONNX voices
     └── command.py    user-defined template
