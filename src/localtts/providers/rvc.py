@@ -27,6 +27,7 @@ DELIVERY_DEFAULTS = {
     "pause_ms": 45,             # between fragments delivered the same way
     "pause_tone_ms": 130,       # when the tone changes -- the breath
     "emphasis_lengthen": 0,     # IPA length marks on the stressed vowel (kokoro only)
+    "language_tags": False,     # honor <en>...</en> inside this language's text
 }
 
 
@@ -82,7 +83,26 @@ class RvcProvider(Provider):
     def _base_name(self):
         return self.settings.get("base_provider") or (self.cfg or {}).get("provider") or "piper"
 
-    def base_provider_instance(self):
+    def known_languages(self):
+        """Language codes a `<xx>` tag may name: the ones the user has actually recorded
+        or given a voice to. Restricting it to these is what keeps a tone tag nobody
+        anticipated from silently becoming a language switch."""
+        cfg = self.cfg or {}
+        codes = set(cfg.get("languages") or {})
+        for provider in (cfg.get("providers") or {}).values():
+            if isinstance(provider, dict):
+                codes.update(provider.get("language_voices") or {})
+        codes.update(self.settings.get("language_models") or {})
+        return codes
+
+    def _base_for(self, lang):
+        """The base provider as it would be built for `lang` -- same object for the call's
+        own language, a fresh one per borrowed language."""
+        if not lang or lang == self.lang:
+            return self.base_provider_instance()
+        return self.base_provider_instance(lang=lang)
+
+    def base_provider_instance(self, lang=None):
         base_name = self._base_name()
         if base_name == self.name:
             raise TTSError("rvc.base_provider cannot be rvc itself")
@@ -92,7 +112,8 @@ class RvcProvider(Provider):
                 "base provider (internal error -- report this)"
             )
         from localtts import providers as providers_module   # local: avoids a cycle at import time
-        return providers_module.build(base_name, self.cfg, verbose=self.verbose, lang=self.lang)
+        return providers_module.build(base_name, self.cfg, verbose=self.verbose,
+                                      lang=self.lang if lang is None else lang)
 
     def build_command(self, wav_in, out_path):
         """The voice-conversion half only. There is no single command for the whole
@@ -127,10 +148,24 @@ class RvcProvider(Provider):
         from localtts import text as textutil   # local: text.py doesn't import providers,
                                                  # kept local anyway for symmetry with above
         base = self.base_provider_instance()
-        segments = textutil.resolve_tone_segments(
-            text, auto_tone=bool(base.settings.get("auto_tone")) if hasattr(base, "settings") else False)
+        auto_tone = bool(base.settings.get("auto_tone")) if hasattr(base, "settings") else False
+
+        # Language first, tone within it: a borrowed word keeps its own phonetics, and
+        # the tone markup around it survives the cut (see split_language_spans).
+        if self.delivery()["language_tags"]:
+            language_spans = textutil.split_language_spans(
+                text, self.lang, self.known_languages())
+        else:
+            language_spans = [(text, self.lang)]
+
+        segments = []
+        for span_text, span_lang in language_spans:
+            span_base = base if span_lang == self.lang else self._base_for(span_lang)
+            for chunk, profile in textutil.resolve_tone_segments(span_text, auto_tone=auto_tone):
+                segments.append((chunk, profile, span_base))
+
         if len(segments) == 1 and segments[0][1] is None:
-            self._synthesize_one(base, text, out_path, voice, profile=None)
+            self._synthesize_one(segments[0][2], segments[0][0], out_path, voice, profile=None)
             return out_path
 
         # Each tagged span makes its own trip through the converter: rvc works on audio,
@@ -141,8 +176,8 @@ class RvcProvider(Provider):
         work = tempfile.mkdtemp(prefix="local-tts-rvc-tone-")
         parts = [os.path.join(work, "%04d.wav" % index) for index in range(len(segments))]
         try:
-            for index, ((chunk, profile), part) in enumerate(zip(segments, parts)):
-                self._synthesize_one(base, chunk, part, voice, profile)
+            for index, ((chunk, profile, span_base), part) in enumerate(zip(segments, parts)):
+                self._synthesize_one(span_base, chunk, part, voice, profile)
                 if index < len(segments) - 1:
                     # A change of tone gets a longer gap than an ordinary one -- the
                     # breath a speaker takes when the delivery shifts. Padded onto the

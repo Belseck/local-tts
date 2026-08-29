@@ -2303,6 +2303,52 @@ class ToneRealizationTest(unittest.TestCase):
         self.assertIs(config.DEFAULTS["providers"]["command"]["audio_fx"], False)
 
 
+class LanguageSpanTest(unittest.TestCase):
+    """<en>...</en> inside another language's text (text.split_language_spans)."""
+
+    KNOWN = ("es", "en")
+
+    def test_a_borrowed_span_becomes_its_own_language(self):
+        self.assertEqual(
+            textutil.split_language_spans("Sube el <en>pull request</en> ya", "es", self.KNOWN),
+            [("Sube el ", "es"), ("pull request", "en"), (" ya", "es")])
+
+    def test_tone_tags_are_rebalanced_across_the_cut(self):
+        """Each span is tone-parsed on its own afterwards, so a tag straddling the cut
+        has to be closed and reopened -- half a tag raises rather than guessing."""
+        spans = textutil.split_language_spans(
+            "<calm>Hola <en>hello</en> adios</calm>", "es", self.KNOWN)
+        self.assertEqual([lang for _, lang in spans], ["es", "en", "es"])
+        for chunk, _ in spans:
+            textutil.resolve_tone_segments(chunk)      # must not raise
+        self.assertTrue(all(c.startswith("<calm>") and c.endswith("</calm>")
+                            for c, _ in spans))
+
+    def test_only_configured_languages_count(self):
+        """Otherwise a tone tag nobody anticipated silently becomes a language switch."""
+        self.assertEqual(
+            textutil.split_language_spans("Un <it>ciao</it> aqui", "es", self.KNOWN),
+            [("Un <it>ciao</it> aqui", "es")])
+
+    def test_escaped_brackets_stay_literal(self):
+        text = r"escaped \<en\> stays"
+        self.assertEqual(textutil.split_language_spans(text, "es", self.KNOWN),
+                         [(text, "es")])
+
+    def test_no_known_languages_is_the_untagged_path(self):
+        self.assertEqual(textutil.split_language_spans("<en>x</en>", "es", ()),
+                         [("<en>x</en>", "es")])
+
+    def test_explicit_lang_prefix_and_region_tags(self):
+        self.assertEqual(
+            textutil.split_language_spans("a <lang:en>b</lang:en> c", "es", self.KNOWN),
+            [("a ", "es"), ("b", "en"), (" c", "es")])
+        self.assertEqual(
+            [l for _, l in textutil.split_language_spans("a <es-MX>b</es-MX>", "en",
+                                                         ("en", "es-MX"))],
+            ["en", "es-MX"])
+
+
 class PronunciationTest(unittest.TestCase):
     """Word respellings applied before synthesis (text.apply_pronunciations)."""
 

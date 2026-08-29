@@ -191,6 +191,11 @@ EOF
 chmod +x ~/.local/bin/kokoro-tts
 ```
 
+**Set up English plus the user's own language, not just one.** Language tags (below) can
+only name languages that are configured, and a borrowed English word inside another
+language is the common case. Kokoro holds one model for every language, so a second entry
+in `language_voices` costs nothing at runtime.
+
 Ask which voice and language the user wants — voice IDs are per-language (e.g. `af_heart`
 for US English, `ef_dora` for Spanish; the underlying model card lists the full set) —
 then register and record it the same way as piper:
@@ -948,6 +953,37 @@ tts config --set player_args.ffplay=                        # empty value remove
 Worth trying when a device resamples badly or underruns; **verify by ear rather than
 assuming**, since these are machine-specific and some combinations make things worse.
 `tts check` prints which player is being used and any tuning in effect.
+
+## Language tags: a borrowed word said properly
+
+Real speech mixes languages, and "Ya subí el pull request" read entirely with Spanish
+phonetics sounds wrong. A tagged span is synthesized with that language's voice:
+
+```console
+$ tts --lang es "Ya subí el <en>pull request</en> al repositorio."
+```
+
+With `rvc` every span still converts to the same target voice, so it remains one
+character speaking — only the base pronunciation changes. Enabled per language:
+
+```bash
+tts config --set 'rvc.delivery.es={"pause_ms": 45, "language_tags": true}'
+```
+
+Only languages the user has actually configured count as language tags, so **set up at
+least English and Spanish whenever you install a voice model** — a language that is not
+configured cannot be tagged, and the tag is left as literal text instead. When installing
+kokoro (or any base for rvc), map both by default rather than only the user's primary
+language:
+
+```bash
+tts config --set kokoro.language_voices.en=bm_george
+tts config --set kokoro.language_voices.es=ef_dora
+```
+
+Ask which specific voices they want, but do not ship a single-language setup by default —
+English words inside another language are the common case, not the exception, and the
+second voice costs nothing extra at runtime (kokoro holds one model for all languages).
 
 ## Pronunciation dictionary
 

@@ -325,6 +325,82 @@ def apply_pronunciations(text, entries, lang=""):
                    for part in _MARKUP.split(text) if part is not None)
 
 
+#: Any tag, plus escapes so `\\<en\\>` stays literal text. Language tags are recognized
+#: from this by matching against the languages actually configured (see
+#: split_language_spans) rather than any two-letter word, so adding a tone tag can never
+#: silently become a language switch.
+_ANY_TAG = re.compile(r"\\.|<(/?)(?:lang:)?([A-Za-z][\w-]*)>")
+
+
+def _normalize_tag(code):
+    return code.strip().replace("_", "-").lower()
+
+
+def split_language_spans(text, default_lang="", known=()):
+    """Split `text` into (chunk, language) runs on `<en>`-style language tags.
+
+    A borrowed word keeps its own phonetics: "descarga el <en>pull request</en>" should
+    say "pull request" the English way rather than reading it with Spanish vowels. This
+    runs *before* tone segmentation and removes only the language markup, leaving every
+    other tag in the chunk, so tone handling afterwards is unchanged.
+
+    Tone tags that straddle a language boundary are re-balanced across the cut -- closed
+    at the end of one span and reopened at the start of the next -- because each span is
+    parsed on its own afterwards, and half a tag raises rather than guessing.
+
+    Only codes in `known` are treated as languages; anything else stays literal text.
+    Returns a single (text, default_lang) span when nothing matches, which is exactly the
+    untagged path.
+    """
+    # Normalized for matching, but the *configured* spelling is what gets returned: a
+    # span reported as "es-mx" would no longer match an "es-MX" key downstream, quietly
+    # falling back to plain Spanish.
+    allowed = {_normalize_tag(code): code for code in known if code}
+    if not allowed or not text:
+        return [(text, default_lang)]
+
+    spans, lang_stack, tone_stack, buf = [], [], [], []
+    pos = 0
+
+    def flush():
+        chunk = "".join(buf)
+        buf.clear()
+        if chunk.strip():
+            # Close what is still open so this span parses standalone...
+            chunk += "".join("</%s>" % name for name in reversed(tone_stack))
+            spans.append((chunk, lang_stack[-1] if lang_stack else default_lang))
+        # ...and reopen it for whatever comes next.
+        buf.append("".join("<%s>" % name for name in tone_stack))
+
+    for match in _ANY_TAG.finditer(text):
+        if match.group(0).startswith("\\"):
+            continue                              # escaped: not markup at all
+        closing, name = match.group(1), match.group(2)
+        code = allowed.get(_normalize_tag(name))
+        if code is not None:
+            buf.append(text[pos:match.start()])
+            pos = match.end()
+            flush()
+            if closing:
+                if lang_stack and lang_stack[-1] == code:
+                    lang_stack.pop()
+            else:
+                lang_stack.append(code)
+            continue
+        # A tone tag: it stays in the text, but we track it so a language cut inside it
+        # can be re-balanced.
+        buf.append(text[pos:match.end()])
+        pos = match.end()
+        if closing:
+            if tone_stack and tone_stack[-1] == name:
+                tone_stack.pop()
+        else:
+            tone_stack.append(name)
+    buf.append(text[pos:])
+    flush()
+    return spans or [(text, default_lang)]
+
+
 def strip_tone_tags(text):
     """Remove <name>...</name> tone tags -- keeping the words inside them, unescaping
     \\<, \\>, \\\\ -- for any backend that doesn't understand them (see tone_segments()),

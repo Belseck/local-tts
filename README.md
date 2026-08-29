@@ -1008,6 +1008,30 @@ tts -p openai -s model=tts-1-hd -s speed=1.15 "faster, nicer"
 
 ---
 
+### Language tags — a borrowed word, said properly
+
+Real speech mixes languages. `"Ya subí el pull request"` read entirely with Spanish
+phonetics sounds wrong, because "pull request" is English. Tag the span and it is
+synthesized with that language's voice:
+
+```console
+$ tts --lang es "Ya subí el <en>pull request</en> al repositorio."
+```
+
+The Spanish parts use the Spanish voice, the tagged span uses the English one — and with
+`rvc` **all of it still converts to the same target voice**, so it stays one character
+speaking, just with the right phonetics for each word.
+
+```bash
+tts config --set 'rvc.delivery.es={"pause_ms": 45, "language_tags": true}'
+```
+
+Enabled per language, so it can be on for Spanish and off elsewhere. `<lang:en>` works
+too, as do region tags (`<es-MX>`). Only languages you have actually configured count as
+language tags — otherwise a tone tag nobody anticipated would silently become a language
+switch. Tone tags straddling a language boundary are re-balanced across the cut, so
+`<calm>Hola <en>hello</en> adios</calm>` still reads calmly throughout.
+
 ### Pronunciation dictionary
 
 Say these words this way. Applied before synthesis on every backend, so a name or a piece

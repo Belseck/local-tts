@@ -204,9 +204,13 @@ DEFAULTS = {
             #                  takes when the delivery shifts
             # Spanish runs faster with shorter gaps than English, which is why this is
             # per-language rather than one number.
+            #   language_tags  honor <en>...</en> inside this language's text, so a
+            #                  borrowed word keeps its own phonetics
             "delivery": {
-                "es": {"speed": 1.0, "pause_ms": 45, "pause_tone_ms": 130},
-                "en": {"speed": 1.0, "pause_ms": 60, "pause_tone_ms": 160},
+                "es": {"speed": 1.0, "pause_ms": 45, "pause_tone_ms": 130,
+                       "language_tags": True},
+                "en": {"speed": 1.0, "pause_ms": 60, "pause_tone_ms": 160,
+                       "language_tags": True},
             },
             "server_models": {},       # {"jarvis": {"model": "...pth", "index": "...index"}}
             # Which of those names to ask for. `language_models` wins when the call has
