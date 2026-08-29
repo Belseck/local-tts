@@ -23,7 +23,10 @@ The human triggers you with something like:
    not interrupt the human six times.
 4. **Report honestly.** If a step fails, say so and stop; do not paper over it or claim
    success. If you skip something, say what and why.
-5. **Do not modify the user's shell config** (`.bashrc`, `.zshrc`, `PATH` exports) unless
+5. **Recommend the persistent server for `kokoro` and `rvc`.** Both reload their model
+   on every call otherwise. Recommending is not deciding: it is still an **ASK**, because
+   it leaves a background process running.
+6. **Do not modify the user's shell config** (`.bashrc`, `.zshrc`, `PATH` exports) unless
    they explicitly ask. Prefer the symlink approach in Step 5.
 
 ### Consent shortcuts
@@ -34,8 +37,10 @@ answered:
 | If they said… | Treat as answered |
 | --- | --- |
 | "with the link", "make it global", "on my PATH" | Step 5 (symlink) = **yes** |
-| "with piper", "for Spanish/French/German/…", "for <language>" | Step 4 (piper) = **yes** |
-| "just the CLI", "no extras" | Steps 4 and 5 = **no** |
+| "with piper", "with kokoro", "with rvc" | that backend's step = **yes** |
+| "for Spanish/French/German/…", "for <language>" | Step 3 (kokoro, with a voice for that language) = **yes** |
+| "make it fast", "don't wait every time" | the persistent server in Step 3 = **yes** |
+| "just the CLI", "no extras" | Steps 3b, 4 and 5 = **no** |
 | "install everything", "all of it", "don't ask" | All steps = **yes**, but still show the plan before running |
 
 Anything they did not cover, you still ask.
@@ -55,9 +60,11 @@ python3 -c "import ensurepip" 2>&1      # if this errors, venv creation will fai
 # is local-tts already installed?
 command -v tts && tts --version
 
-# backends
-command -v llama-tts && llama-tts --version 2>&1 | head -1
+# backends -- kokoro is the default, check it first
+command -v kokoro-tts || ls ~/.local/share/kokoro-venv/bin/python 2>/dev/null
+ls ~/.local/share/kokoro-models/ 2>/dev/null
 command -v piper || ls ~/.local/share/piper-venv/bin/piper 2>/dev/null
+command -v llama-tts && llama-tts --version 2>&1 | head -1
 
 # audio players (any one is enough)
 for p in ffplay paplay aplay afplay play mpv cvlc; do command -v $p; done
@@ -69,12 +76,17 @@ ls -la ~/.local/bin/tts 2>/dev/null && echo "WARNING: ~/.local/bin/tts already e
 ```
 
 Summarize for the human as a short table: **present / missing** for each of python, venv
-support, llama.cpp, piper, an audio player.
+support, kokoro, piper, llama.cpp, an audio player.
 
 **ASK now**, in one message, only about what is missing or undecided:
 
-- Install llama.cpp? (needed for the default provider — skip only if they will use piper or openai exclusively)
-- Install piper, and for which language/voice?
+- Install kokoro? (**the default provider** — ~40 languages; this is the one to install
+  unless they specifically want something else)
+- Run kokoro as a persistent server? (**recommended** — see Step 3; it is the difference
+  between about a second per sentence and several, and IPA phonetics need it)
+- Install piper as well, and for which language/voice?
+- Install llama.cpp? (only if they specifically want it — English, Chinese, Japanese and
+  Korean only)
 - Create the global symlink?
 - Install an audio player if none was found?
 
@@ -126,9 +138,67 @@ The project metadata uses PEP 639 licence fields, which need **pip ≥ 24.2** an
 
 ---
 
-## Step 3 — llama.cpp (default provider) — **ASK**
+## Step 3 — kokoro (the default provider) — **ASK**
 
-The default provider shells out to `llama-tts`. This repo neither bundles nor builds
+`kokoro` is what `tts` uses with no configuration at all: Kokoro-82M, fully offline, ~40
+languages, small. There is no single official CLI, so this installs the `kokoro-onnx`
+package in **its own venv** (never into `.venv` — local-tts has zero runtime dependencies
+and must keep them) plus a small wrapper the `kokoro.binary` default finds on `PATH`.
+
+```bash
+python3 -m venv ~/.local/share/kokoro-venv
+~/.local/share/kokoro-venv/bin/pip install kokoro-onnx soundfile
+
+mkdir -p ~/.local/share/kokoro-models
+# fetch kokoro-v1.0.onnx and voices-v1.0.bin into it, e.g. from
+# https://github.com/nazdridoy/kokoro-tts/releases
+```
+
+The wrapper script and the `~/.local/bin/kokoro-tts` shim are in the README's
+[kokoro section](https://github.com/rperez93/local-tts#kokoro--the-default-small-fast-offline-many-languages)
+and in the `local-tts-configure` skill — **copy them verbatim**, they are not worth
+improvising. Then pick a voice for the human's language and prove it works:
+
+```bash
+.venv/bin/tts config --set kokoro.language_voices.en=af_heart
+.venv/bin/tts config --set kokoro.language_voices.es=ef_dora   # if they speak Spanish
+.venv/bin/tts -p kokoro --no-play -o /tmp/k.wav "Kokoro is installed."
+```
+
+### Then offer the persistent server — **ASK, and recommend it**
+
+The wrapper above reloads the whole model from disk on **every call**. That load, not the
+synthesis, is most of the wait. Put it to the human as a recommendation, not a neutral
+option:
+
+- **Faster:** a warm server answers a sentence in about a second; without one, every
+  single call pays several seconds of model loading first.
+- **It is the only way to get phonetics.** `kokoro.emphasis_lengthen` and IPA
+  pronunciation entries need the phonemizer, and the phonemizer lives in the server. On
+  the subprocess wrapper they silently do nothing.
+- **One server, many voices/languages** — one process, one model in RAM.
+- **The cost:** a background process holding RAM while it lives, exiting on its own after
+  5 idle minutes and restarting transparently on the next call.
+
+The server script is in the `local-tts-configure` skill (self-contained, stdlib only).
+Copy it into `~/.local/share/kokoro-venv/`, then:
+
+```bash
+.venv/bin/tts config --set kokoro.server_url=http://127.0.0.1:8765
+.venv/bin/tts config --set 'kokoro.server_start=~/.local/share/kokoro-venv/bin/python ~/.local/share/kokoro-venv/kokoro_server.py --port 8765'
+.venv/bin/tts check          # says whether it is running or will auto-start
+```
+
+**Never start a background process without asking first.** If they decline, leave
+`server_url` empty — the per-call path works, just slower and without phonetics.
+
+---
+
+## Step 3b — llama.cpp — **ASK, only if they want it**
+
+Not the default, and worth installing only if the human asked for it or already has it:
+the default OuteTTS weights speak **English, Chinese, Japanese and Korean only** and read
+every other language with English phonetics. This repo neither bundles nor builds
 llama.cpp.
 
 ```bash
@@ -160,14 +230,17 @@ into `~/.cache/huggingface/hub`). Tell the human the first run will be slow.
 
 ⚠️ **Language limit — surface this proactively.** The default OuteTTS weights speak
 **English, Chinese, Japanese and Korean only**. Any other language is rendered with
-English phonetics and sounds wrong. If the human mentioned another language, recommend
-Step 4 instead of treating it as optional.
+English phonetics and sounds wrong. If the human mentioned another language, point them
+back at Step 3 (kokoro) or on to Step 4 (piper) rather than leaving this as their
+backend.
 
 ---
 
-## Step 4 — piper (other languages, faster) — **ASK**
+## Step 4 — piper (an alternative to kokoro) — **ASK**
 
-Piper covers ~40 languages and runs ~7× realtime on CPU.
+Piper covers ~40 languages and runs ~7× realtime on CPU. It is not needed if kokoro is
+installed and the human is happy with its voices — install it when they want a different
+voice for a language, or one flat `.onnx` file per voice.
 
 Two upstreams; know the difference before you answer questions about it:
 
@@ -289,13 +362,15 @@ Then record which backend speaks the human's language, so the preference is shar
 agent instead of living in one session:
 
 ```bash
-tts languages --set es=piper:~/.local/share/piper-voices/es_MX-claude-high.onnx
-tts languages --set en=llamacpp
+tts languages --set es=kokoro:ef_dora
+tts languages --set en=kokoro:af_heart
+tts languages --set de=piper:~/.local/share/piper-voices/de_DE-thorsten-high.onnx
 tts languages
 ```
 
-If you installed piper in Step 4, **record its language here** — otherwise the next agent
-will not know it exists and will fall back to llama.cpp with the wrong phonetics.
+If you installed piper or llama.cpp in Step 4 or 3b, **record which language each one
+speaks here** — otherwise the next agent will not know it exists and will fall back to the
+default provider, which may have the wrong phonetics for that language.
 
 Tell the human that skills only take effect after restarting their agent.
 
@@ -354,8 +429,10 @@ Close with a short summary containing:
 | `ensurepip is not available` | Debian/Ubuntu without `python3-venv` | `sudo apt install python3-venv`, or use a pyenv interpreter |
 | `.venv/bin/python -V` reports an unexpected version | leftover `.venv` from a failed run | `rm -rf .venv` and recreate |
 | `configuration error: project.license must be string` | pip/setuptools too old for PEP 639 | `pip install --upgrade pip`, then reinstall |
-| pip installs numpy/onnxruntime into the project venv | piper installed in the wrong environment | undo; use a separate venv per Step 4 |
-| Speech is in the right words but the wrong accent | OuteTTS used for a language it does not support | switch to piper (Step 4) |
+| pip installs numpy/onnxruntime into the project venv | kokoro or piper installed in the wrong environment | undo; use a separate venv per Step 3 / Step 4 |
+| Speech is in the right words but the wrong accent | a backend used for a language it does not support, e.g. OuteTTS outside EN/ZH/JA/KO | switch to kokoro (Step 3) or piper (Step 4), and record it in `tts languages` |
+| Every call takes several seconds before any audio | kokoro or rvc running per-call instead of as a server | set up the persistent server (Step 3) |
+| An IPA pronunciation entry does nothing | the backend has no phonemizer | it needs kokoro with `server_url` set; `tts check` says which backends honour them |
 | `tts` not found after the symlink | `~/.local/bin` not on `PATH` | report it; ask before editing shell config |
 | `command not found: <binary>` from `tts` | a configured provider binary is missing | `tts check` names it; fix the path with `tts config --set <provider>.binary=…` |
 | Traceback instead of a one-line error | a genuine bug | report it; the CLI is supposed to print `tts: error: …` |

@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "local-tts"
 version = "1.9.2"
-description = "Ultralight CLI for local text-to-speech, powered by llama.cpp by default"
+description = "Ultralight CLI for local text-to-speech, powered by Kokoro by default"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
-keywords = ["tts", "text-to-speech", "llama.cpp", "cli", "offline"]
+keywords = ["tts", "text-to-speech", "kokoro", "piper", "llama.cpp", "cli", "offline"]
 classifiers = [
     "Environment :: Console",
     "Programming Language :: Python :: 3",

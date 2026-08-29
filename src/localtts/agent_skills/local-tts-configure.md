@@ -1,6 +1,6 @@
 ---
 name: local-tts-configure
-description: Install, diagnose, and configure the local `tts` CLI (local-tts) — backends (kokoro by default, piper, RVC, llama.cpp, OpenAI-compatible), a voice per language, mixed-language text (`<en>…</en>` spans reading a borrowed word with its own phonetics, and which voice or RVC model handles it), pronunciation dictionaries, persistent model servers, streamed playback, player selection and per-machine player tuning, and the per-language provider memory. TRIGGER whenever the user asks to install, add, set up, enable or switch to ANY provider or backend by name ("install piper", "add kokoro", "set up rvc", "use OpenAI for speech") — that request means follow this skill's install steps, not improvise your own. Also use when text-to-speech is missing or broken, when the user wants a different or better voice, when they need a new language, when speech is slow and could use a persistent server, or when they ask to change any speech setting — including adding a second language for pronunciation, mapping a voice to a language, or asking what a setting does. Contains a complete reference of every setting local-tts has. For speech that already works but *sounds* wrong (robotic, noisy, too fast, choppy), use local-tts-tune instead.
+description: Install, diagnose, and configure the local `tts` CLI (local-tts) — backends (kokoro by default, piper, RVC, llama.cpp, OpenAI-compatible), a voice per language, mixed-language text (`<en>…</en>` spans reading a borrowed word with its own phonetics, and which voice or RVC model handles it), pronunciation dictionaries, persistent model servers, streamed playback, player selection and per-machine player tuning, and the per-language provider memory. TRIGGER whenever the user asks to install, add, set up, enable or switch to ANY speech backend, provider, TTS engine or voice model — named ("install piper", "add kokoro", "set up rvc", "use OpenAI for speech") or not ("install a TTS backend", "add another voice engine", "I want a better/second/offline TTS", "instala un backend de voz") — that request means follow this skill's install steps, not improvise your own, and it applies to a backend this skill does not list too: the answer there is `command` or a new provider, never an ad-hoc install. kokoro and rvc are meant to run as a persistent server, and setting that up is part of installing them. Also use when text-to-speech is missing or broken, when the user wants a different or better voice, when they need a new language, when speech is slow and could use a persistent server, or when they ask to change any speech setting — including adding a second language for pronunciation, mapping a voice to a language, or asking what a setting does. Contains a complete reference of every setting local-tts has. For speech that already works but *sounds* wrong (robotic, noisy, too fast, choppy), use local-tts-tune instead.
 ---
 
 # Configuring `local-tts`
@@ -30,8 +30,11 @@ anything** — it usually names the exact problem.
   because each backend has a specific trap: piper needs a separate venv or it drags
   onnxruntime into local-tts, kokoro needs a wrapper script, rvc needs a trained model
   the user must already have. Improvising an install is how those get missed.
-- **After installing any of kokoro or rvc, offer server mode** — see "Offer the server,
-  don't assume it". It is the difference between ~1s and several seconds per call.
+- **kokoro and rvc are meant to run as a persistent server. Recommend it, every time.**
+  Not a neutral option you mention: it is the difference between ~1s and several seconds
+  per call, and IPA phonetics and `emphasis_lengthen` do not work without it. Still an
+  **ask** — it leaves a background process running — but ask with a recommendation. See
+  "Recommend the server, then ask".
 - Show `tts check` output to the user rather than paraphrasing it.
 - Never edit the config JSON by hand; use `tts config --set` so validation applies.
 - If `tts` itself is missing, that is a full install: follow `AGENT_INSTALL.md` in the
@@ -212,11 +215,16 @@ tts --lang es "Prueba de voz con Kokoro."
 (one that resolves its model files from its own working directory rather than managing
 them internally, like this wrapper does) — leave it unset for the setup above.
 
-### Optional: keep the model loaded (a persistent server)
+### Recommended: keep the model loaded (a persistent server)
 
-The CLI wrapper above reloads the whole model from disk on every single call. For someone
-speaking frequently, that per-call cost adds up. If they ask for that to be faster, offer
-this — **ask before setting it up**, it's an extra background process, not a routine step:
+**This is how kokoro is meant to run.** The CLI wrapper above reloads the whole model from
+disk on every single call, and that load — not the synthesis — is most of the wait. It is
+also where the phonemizer lives, so `emphasis_lengthen` and IPA pronunciation entries do
+nothing without it: they are not "slower" off the server, they are absent.
+
+So treat this as the second half of installing kokoro, not an extra. **Still ask** — it
+leaves a background process running — but ask with a recommendation, and say what they
+lose by declining:
 
 ```bash
 cat > ~/.local/share/kokoro-venv/kokoro_server.py <<'EOF'
@@ -451,15 +459,17 @@ tts -p rvc "Test of the converted voice."
 CUDA-enabled torch installed. There is no `rvc.voice` — voice comes entirely from which
 `.pth` model is configured, not a per-call flag.
 
-### Optional: keep the models loaded (a persistent server)
+### Recommended: keep the models loaded (a persistent server)
 
-RVC's model load (torch, plus the checkpoint itself) is the slow part of every call — a
-persistent server pays that cost once instead of per call, and it can hold **several
-voices resident at the same time**, picking one per request. That is what makes a second
-language cheap: one server, one copy of torch, one GPU context, N voices.
+**This is how rvc is meant to run** — more so than kokoro, because the per-call load
+includes importing torch. That load is the slow part of every call; a persistent server
+pays it once, and it can hold **several voices resident at the same time**, picking one
+per request. That is what makes a second language cheap: one server, one copy of torch,
+one GPU context, N voices.
 
-**Ask before setting this up** — see "Offer the server, don't assume it" below for how to
-put the choice to the user.
+Running rvc per call is a fallback for a machine that cannot spare the RAM, not the normal
+setup. **Still ask before starting it** — see "Recommend the server, then ask" below for
+how to put it to the user.
 
 ```bash
 cat > ~/.local/share/rvc-venv/rvc_server.py <<'EOF'
@@ -643,23 +653,30 @@ request** (`--idle-timeout`, seconds — `0` disables). Worth knowing here speci
 because torch models held resident use real memory (and VRAM on `cuda:0`) the whole time,
 and with several voices loaded that is now N models, not one.
 
-### Offer the server, don't assume it
+### Recommend the server, then ask
 
-Whenever you set up or repair `kokoro` or `rvc`, **ask the user whether to run it in
-server mode** rather than deciding for them. Lead with the concrete win and the concrete
-cost:
+Whenever you set up or repair `kokoro` or `rvc`, **recommend server mode and then ask** —
+recommend, because per-call loading is the wrong way to run either of them; ask, because
+starting a background process on someone's machine is their call, never yours.
+
+Lead with the win, name the cost, and let them decide:
 
 - **Faster:** the model and torch load once, not per call. On a warm server a sentence
   comes back in about a second; cold, the same call pays several seconds of load every
   single time.
+- **Phonetics only exist here:** `kokoro.emphasis_lengthen` and IPA entries in the
+  pronunciation dictionary need the phonemizer, which lives in the server. Off the server
+  they are silently ignored — mention this explicitly if they have any IPA entries or have
+  asked about pronunciation.
 - **One server, many voices:** several languages share one process and one GPU context.
 - **The cost:** a background process holding RAM (and VRAM) while it lives, released
-  automatically after the idle timeout.
+  automatically after the idle timeout and restarted transparently on the next call.
 
 If they say yes, write the script, put the conversion flags on the command line, set
-`language_models`, and verify with `tts check`. If they say no, leave `server_url` empty —
-the per-call CLI path keeps working, just slower. Never start a background process on a
-machine without asking first.
+`language_models`, and verify with `tts check`. If they say no, that is a fine answer:
+leave `server_url` empty, the per-call CLI path keeps working — just say once that speech
+will be several seconds slower per call and IPA entries will not apply, so it is not a
+surprise later. Never start a background process on a machine without asking first.
 
 ## The language memory
 

@@ -100,51 +100,42 @@ See [Providers → `rvc`](#rvc--voice-conversion-not-installed-automatically) fo
 | --- | --- | --- |
 | Python ≥ 3.9 | runs the CLI | yes |
 | Linux, macOS or Windows | all three supported | — |
-| `llama-tts` from llama.cpp | the default speech backend | yes, for the default provider |
+| One speech backend | actually producing audio | yes — `kokoro` by default |
 | An audio player (`ffplay`, `paplay`, `aplay`, …) | playing the result | only if you want playback |
 
-### Installing llama.cpp
+### Installing a speech backend
 
-`local-tts` calls the `llama-tts` binary; it does **not** bundle or build llama.cpp.
+`local-tts` does not bundle, build or ship any speech model. It drives a backend you
+install separately, and **the default provider is `kokoro`** — small, fully offline, and
+good for ~40 languages. Its setup lives with the provider itself:
 
-```bash
-# macOS / Linux (Homebrew)
-brew install llama.cpp
+| Backend | Install | Good for |
+| --- | --- | --- |
+| **`kokoro`** *(default)* | [kokoro section](#kokoro--the-default-small-fast-offline-many-languages) | ~40 languages, small and fast — start here |
+| `piper` | [piper section](#piper--small-fast-offline-many-languages) | ~40 languages, ~7× realtime on CPU |
+| `llamacpp` | [llamacpp section](#llamacpp--local-offline-four-languages) | English, Chinese, Japanese, Korean only |
+| `openai` | [openai section](#openai--any-openai-compatible-endpoint) | any OpenAI-compatible endpoint, not offline |
+| `rvc` | [rvc section](#rvc--voice-conversion-not-installed-automatically) | converting another backend's output to a trained voice |
+| `command` | [command section](#command--anything-else) | anything else that writes a WAV |
 
-# Windows
-winget install llama.cpp
+> **Run `kokoro` and `rvc` as a persistent server.** Both reload their model from disk on
+> every call otherwise, which dominates the time you wait. See
+> [the server section](#recommended-a-persistent-server-kokoro--rvc) — it is the
+> difference between roughly a second per sentence and several.
 
-# Prebuilt binaries for every platform
-# https://github.com/ggml-org/llama.cpp/releases  (grab llama-<build>-bin-<platform>.zip)
-
-# Or build from source
-git clone https://github.com/ggml-org/llama.cpp
-cd llama.cpp
-cmake -B build
-cmake --build build --config Release -j
-# binaries land in build/bin — put that on your PATH, or see "Configuration" below
-```
-
-Verify it is reachable:
-
-```bash
-llama-tts --version
-```
-
-If `llama-tts` is not on your `PATH`, point `local-tts` at it directly:
-
-```bash
-tts config --set llamacpp.binary=/path/to/llama.cpp/build/bin/llama-tts
-```
+Prefer to be walked through it? [Install with an AI agent](#install-with-an-ai-agent)
+does the whole thing, asking before each step.
 
 ### Speech models
 
-You do not need to download anything by hand. On the first run, `llama-tts`
-fetches its default [OuteTTS](https://huggingface.co/OuteAI) weights plus the
-WavTokenizer vocoder into the Hugging Face cache (`~/.cache/huggingface/hub`,
-about **640 MB** total). Later runs use the cache and work fully offline.
+Model weights are the backend's business, not this tool's: `kokoro` needs
+`kokoro-v1.0.onnx` plus `voices-v1.0.bin` (fetched once — see the
+[kokoro section](#kokoro--the-default-small-fast-offline-many-languages)), piper needs a
+`.onnx` voice per language (~60 MB each), and `llamacpp` downloads its default OuteTTS
+weights on first use. Every one of them works fully offline afterwards.
 
-To use your own GGUF weights instead, see [Using your own models](#using-your-own-models).
+Each backend points at its own weights through its own settings; see its section under
+[Providers](#providers).
 
 ---
 
@@ -580,10 +571,46 @@ with `LOCALTTS_LANG_ES=piper:/path/voice.onnx`.
 tts providers
 ```
 
+`kokoro` is the default. The others are there because each one wins at something the
+default does not do: a voice you trained yourself (`rvc`), a language kokoro reads badly
+(`piper`), a hosted endpoint (`openai`), or a binary you already have (`command`).
+
 ### `llamacpp` — local, offline, four languages
 
-Runs `llama-tts`. Zero configuration: with no model set it passes
-`--tts-oute-default` and llama.cpp handles the weights.
+Runs `llama-tts`. **Not the default** — it speaks English, Chinese, Japanese and Korean
+only, and reads every other language with English phonetics. Zero configuration: with no
+model set it passes `--tts-oute-default` and llama.cpp handles the weights.
+
+`local-tts` calls the `llama-tts` binary; it does **not** bundle or build llama.cpp:
+
+```bash
+# macOS / Linux (Homebrew)
+brew install llama.cpp
+
+# Windows
+winget install llama.cpp
+
+# Prebuilt binaries for every platform
+# https://github.com/ggml-org/llama.cpp/releases  (grab llama-<build>-bin-<platform>.zip)
+
+# Or build from source
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+cmake -B build
+cmake --build build --config Release -j
+# binaries land in build/bin — put that on your PATH, or see "Configuration" below
+```
+
+Verify it is reachable, and point `local-tts` at it if it is not on your `PATH`:
+
+```bash
+llama-tts --version
+tts config --set llamacpp.binary=/path/to/llama.cpp/build/bin/llama-tts
+```
+
+On the first run it fetches its default [OuteTTS](https://huggingface.co/OuteAI) weights
+plus the WavTokenizer vocoder into the Hugging Face cache (`~/.cache/huggingface/hub`,
+about **640 MB**). Later runs use the cache and work offline.
 
 | Setting | Default | Description |
 | --- | --- | --- |
@@ -601,7 +628,8 @@ Runs `llama-tts`. Zero configuration: with no model set it passes
 
 Output is 24 kHz mono WAV. The default OuteTTS weights speak **English, Chinese,
 Japanese and Korean**; other languages come out with English phonetics, so use the
-[`piper`](#piper--small-fast-offline-many-languages) provider for those. Quality also
+default [`kokoro`](#kokoro--the-default-small-fast-offline-many-languages) or
+[`piper`](#piper--small-fast-offline-many-languages) for those. Quality also
 drops on long prompts, which is why `max_words` splits them — raise or lower it to trade
 continuity against reliability.
 
@@ -664,9 +692,9 @@ extension picks the format (`wav`, `mp3`, `opus`, `aac`, `flac`, `pcm`).
 ### `piper` — small, fast, offline, many languages
 
 [Piper](https://github.com/OHF-Voice/piper1-gpl) runs neural ONNX voices on the CPU at
-roughly 7x realtime, with good models for ~40 languages. Use it when `llamacpp` does not
-cover your language: the default OuteTTS weights handle English, Chinese, Japanese and
-Korean only, and will read anything else with English phonetics.
+roughly 7x realtime, with good models for ~40 languages. Reach for it when the default
+`kokoro` does not have a voice you like for your language, or when you want one flat
+`.onnx` file per voice instead of kokoro's wrapper script.
 
 Piper is distributed as a Python wheel (`piper-tts`, GPL-3.0). Install it in its **own**
 virtualenv so its ~200 MB of dependencies (onnxruntime, numpy) stay out of this project,
@@ -706,11 +734,12 @@ tts -p piper -f article.md -o article.wav
 | `auto_tone` | `false` | Derive tone from `?`/`!`/`.` where no `<tag>` is active — see [Tone and emotion tags](#tone-and-emotion-tags). |
 | `extra_args` | `[]` | Extra flags appended verbatim. |
 
-### `kokoro` — small, fast, offline, many languages
+### `kokoro` — the default: small, fast, offline, many languages
 
-An alternative to piper with similar footprint and language coverage (Kokoro-82M). There
-is no single official CLI, so the straightforward path is a minimal wrapper around the
-`kokoro`/`kokoro-onnx` Python package, in its own venv:
+**This is the provider you get with no configuration at all.** Kokoro-82M covers ~40
+languages in a footprint comparable to piper's. There is no single official CLI, so the
+straightforward path is a minimal wrapper around the `kokoro`/`kokoro-onnx` Python
+package, in its own venv:
 
 ```bash
 python -m venv ~/.local/share/kokoro-venv
@@ -771,6 +800,11 @@ tts config --set kokoro.lang=es
 tts -p kokoro "Prueba de voz con Kokoro."
 ```
 
+Once this works, **set up the persistent server** — the wrapper above reloads the model on
+every single call, and [the server](#recommended-a-persistent-server-kokoro--rvc) is both
+much faster and the only way to get `emphasis_lengthen` and IPA phonetics, which live in
+the phonemizer the server holds.
+
 | Setting | Default | Description |
 | --- | --- | --- |
 | `binary` | `kokoro-tts` | Path to or name of the executable. |
@@ -780,7 +814,7 @@ tts -p kokoro "Prueba de voz con Kokoro."
 | `speed` | `1.0` | Playback speed multiplier. |
 | `auto_tone` | `false` | Derive tone from `?`/`!`/`.` where no `<tag>` is active — see [Tone and emotion tags](#tone-and-emotion-tags). Speed only; kokoro has no volume knob. |
 | `extra_args` | `[]` | Extra flags appended verbatim. |
-| `server_url` | *(empty)* | Optional. See [Optional: a persistent server](#optional-a-persistent-server-kokoro--rvc) below. |
+| `server_url` | *(empty)* | **Recommended.** See [Recommended: a persistent server](#recommended-a-persistent-server-kokoro--rvc) below. |
 | `server_start`, `server_timeout` | *(empty)*, `30` | Command to auto-start the server, and how long to wait for it. |
 
 #### Per-language voices
@@ -846,18 +880,35 @@ tts -p rvc "Test of the converted voice."
 | `method` | *(empty)* | Pitch extraction algorithm: `harvest`, `crepe`, `rmvpe`, `pm`. Empty uses rvc-python's default. |
 | `index_rate`, `protect` | *(empty)* | Passed through to rvc-python when set. |
 | `extra_args` | `[]` | Extra flags appended verbatim. |
-| `server_url` | *(empty)* | Optional. See [Optional: a persistent server](#optional-a-persistent-server-kokoro--rvc) below. |
+| `server_url` | *(empty)* | **Recommended.** See [Recommended: a persistent server](#recommended-a-persistent-server-kokoro--rvc) below. |
 | `server_start`, `server_timeout` | *(empty)*, `60` | Command to auto-start the server, and how long to wait for it (a torch load is slower than kokoro's). |
 
 There is no `rvc.voice` — the voice comes entirely from which `.pth` model is configured.
 
-### Optional: a persistent server (kokoro / rvc)
+### Recommended: a persistent server (kokoro / rvc)
 
-Both providers above reload their model from disk on every call by default. If that's slow
-enough to matter, either can instead talk to a small persistent server that loads the model
-once and serves requests over `localhost` — this tool never runs that server itself, it's a
-short script you write into the provider's own venv (the `local-tts-configure` skill has
-the exact script for both, self-contained, stdlib `http.server` only):
+**For `kokoro` and `rvc`, this is the way to run them.** Both reload their model from disk
+on *every* call otherwise, and that load — not the synthesis — is most of what you wait
+for: a sentence that comes back in about a second from a warm server pays several seconds,
+every single time, without one. `rvc` is the worse case, because the cost includes
+importing torch.
+
+Three things only the server can do:
+
+- **Hold several voices at once.** One process, one copy of torch, one GPU context, N
+  voices — which is what makes a second language cheap rather than a second server.
+- **Phonetics and emphasis.** `kokoro.emphasis_lengthen` and IPA pronunciations need the
+  phonemizer, and the phonemizer lives in the server. The subprocess wrapper silently
+  does without them.
+- **Keep the GPU context warm**, instead of rebuilding it per sentence.
+
+The cost is one background process holding RAM (and VRAM) — released on its own after five
+idle minutes, and restarted transparently on the next call.
+
+Either provider talks to a small server that loads the model once and serves requests over
+`localhost` — this tool never runs that server itself, it's a short script you write into
+the provider's own venv (the `local-tts-configure` skill has the exact script for both,
+self-contained, stdlib `http.server` only):
 
 ```bash
 tts config --set kokoro.server_url=http://127.0.0.1:8765
@@ -896,7 +947,7 @@ tts -p piper "<whisper>Very quiet now.</whisper> Back to normal."
 What a tag actually does depends on the backend, since not every one has a real hook for
 it — see each provider's own table above (`openai.tone`/`auto_tone`, `piper.auto_tone`,
 `kokoro.auto_tone`) and the `local-tts-configure` skill for the full breakdown. On a backend
-with no hook at all (the default `llamacpp`, `rvc`), a tag is a safe no-op: it's always
+with no hook at all (`llamacpp`, `rvc`), a tag is a safe no-op: it's always
 stripped before the text is spoken, never read out literally.
 
 ### `command` — anything else
@@ -968,12 +1019,12 @@ change:
 
 ```json
 {
-  "provider": "llamacpp",
+  "provider": "kokoro",
   "play": true,
   "providers": {
-    "llamacpp": {
-      "threads": 8,
-      "gpu_layers": 99
+    "kokoro": {
+      "voice": "ef_dora",
+      "server_url": "http://127.0.0.1:8765"
     }
   }
 }
@@ -983,7 +1034,7 @@ Write to it from the CLI:
 
 ```bash
 tts config --set provider=piper
-tts config --set llamacpp.threads=8
+tts config --set kokoro.voice=bm_george
 tts config --set play=false
 ```
 
@@ -1247,15 +1298,20 @@ src/localtts/
 ├── errors.py         TTSError -> a clean one-line message
 └── providers/
     ├── base.py       Provider contract + subprocess helpers
+    ├── kokoro.py     Kokoro-82M backend (the default)
     ├── llamacpp.py   llama.cpp backend
     ├── openai.py     OpenAI-compatible HTTP
     ├── piper.py      Piper ONNX voices
+    ├── rvc.py        voice conversion over another provider
     └── command.py    user-defined template
 ```
 
 Adding a provider: subclass `Provider`, implement `synthesize(text, out_path, voice)`
 and `check()`, register it in `providers/__init__.py`, and add its defaults to
 `config.DEFAULTS["providers"]`. A test asserts those two stay in sync.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request — in particular the
+no-runtime-dependencies rule, which is not negotiable.
 
 ## License
 
