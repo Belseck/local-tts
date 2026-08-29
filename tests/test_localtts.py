@@ -2959,3 +2959,57 @@ class PhonemizerBackendTest(unittest.TestCase):
              unittest.mock.patch.object(g2p.backend, "_backend",
                                         side_effect=RuntimeError("espeak exploded")):
             self.assertIsNone(g2p.backend.phonemes("hola", "es-419"))
+class TerminalTitleTest(unittest.TestCase):
+    """El icono va delante del nombre propio de la pestaña."""
+
+    def setUp(self):
+        audio._BASE_TITLE.clear()
+
+    def tearDown(self):
+        audio._BASE_TITLE.clear()
+
+    def test_prefija_el_titulo_de_la_pestana(self):
+        with unittest.mock.patch.object(audio, "read_terminal_title",
+                                        return_value="proyecto: local-tts"):
+            self.assertEqual(audio.title_for("/tmp/x.wav", 12.0),
+                             "%s proyecto: local-tts" % audio.TITLE_ICON)
+
+    def test_icono_primero(self):
+        """En una fila de pestañas solo se ven los primeros caracteres."""
+        with unittest.mock.patch.object(audio, "read_terminal_title", return_value="algo"):
+            self.assertTrue(audio.title_for("/tmp/x.wav").startswith(audio.TITLE_ICON))
+
+    def test_reserva_al_nombre_del_fichero(self):
+        """Una terminal que no contesta no es un error: se nombra el fichero."""
+        with unittest.mock.patch.object(audio, "read_terminal_title", return_value=""):
+            self.assertEqual(audio.title_for("/tmp/x.wav", 12.0),
+                             "%s 0:12 x.wav" % audio.TITLE_ICON)
+
+    def test_restaurar_devuelve_el_titulo_propio(self):
+        escrito = []
+        with unittest.mock.patch.object(audio, "read_terminal_title", return_value="mi pestaña"), \
+             unittest.mock.patch.object(audio, "write_terminal_title",
+                                        side_effect=lambda t, tty="": escrito.append(t)):
+            audio.restore_title()
+        self.assertEqual(escrito, ["mi pestaña"])
+
+    def test_restaurar_limpia_si_no_se_supo(self):
+        escrito = []
+        with unittest.mock.patch.object(audio, "read_terminal_title", return_value=""), \
+             unittest.mock.patch.object(audio, "write_terminal_title",
+                                        side_effect=lambda t, tty="": escrito.append(t)):
+            audio.restore_title()
+        self.assertEqual(escrito, [""])
+
+    def test_se_consulta_una_sola_vez_por_tty(self):
+        """La consulta cuesta un viaje de ida y vuelta y el nombre no cambia."""
+        with unittest.mock.patch.object(audio, "read_terminal_title",
+                                        return_value="x") as leer:
+            audio.base_title("/dev/pts/9")
+            audio.base_title("/dev/pts/9")
+            audio.base_title("/dev/pts/9")
+        self.assertEqual(leer.call_count, 1)
+
+    def test_leer_no_revienta_sin_terminal(self):
+        with unittest.mock.patch.object(audio, "terminal_path", return_value=""):
+            self.assertEqual(audio.read_terminal_title(), "")
