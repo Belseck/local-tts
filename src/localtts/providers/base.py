@@ -25,6 +25,14 @@ class Provider:
     #: synthesize_chunked() strips the tags before a provider that can't use them ever
     #: sees the literal brackets, rather than have it try to pronounce them.
     supports_tone_tags = False
+
+    #: Whether this backend can be handed IPA for individual words, which is what makes
+    #: the pronunciation dictionary's `/…/` entries reach the model. Only a backend with
+    #: a phonemizer in the loop can: local-tts has no runtime dependencies and cannot
+    #: transcribe anything itself, so it passes the table along rather than applying it.
+    #: A backend that says False here simply says the word its own way, and `tts check`
+    #: reports that rather than leaving the user guessing why an entry did nothing.
+    supports_phonetics = False
     #: Which dimensions of a tone profile this backend applies *itself*. Anything left
     #: False is realized after synthesis instead (audiofx.apply_profile), so an emotion
     #: still sounds different on a backend with no such flag. A provider that varies
@@ -92,39 +100,17 @@ class Provider:
         if sink:
             sink(path)
 
-    def known_languages(self):
-        """Language codes a `<xx>` tag may name: the ones the user has actually recorded
-        or given a voice to. Restricting it to these is what keeps a tone tag nobody
-        anticipated from silently becoming a language switch."""
-        cfg = self.cfg or {}
-        codes = set(cfg.get("languages") or {})
-        for provider in (cfg.get("providers") or {}).values():
-            if isinstance(provider, dict):
-                for key in ("language_voices", "language_models"):
-                    codes.update(provider.get(key) or {})
-        return codes
+    def speed_settings(self, speed):
+        """Settings that make this backend synthesize at `speed` times its normal rate,
+        or None if it has no rate control of its own.
 
-    def language_tags_enabled(self):
-        """Whether `<en>...</en>` inside this call's text should switch language.
-
-        On by default, and inert until a second language is configured: only languages
-        that have a voice of their own count as tags (see known_languages), so on a
-        single-language setup there is nothing to switch to and nothing changes.
+        Exists so a provider that *composes* another one (rvc) can have the base realize
+        a <tag>'s pacing at synthesis time -- a genuine prosody change -- instead of
+        time-stretching the rendered wav afterwards, which is a lossy DSP pass over every
+        sample. Returning None means "I have no such knob"; the caller then falls back to
+        audiofx.
         """
-        return bool(self.settings.get("language_tags", True))
-
-    def for_language_instance(self, lang):
-        """A copy of this provider bound to `lang`, so its own per-language resolution
-        (kokoro's voice, piper's model) applies to a borrowed span.
-
-        A copy rather than a mutation because the original is still mid-utterance, and
-        the copy must not publish stream fragments -- whoever owns the outer loop owns
-        the ordering, and so owns the sink.
-        """
-        clone = type(self)(dict(self.settings), verbose=self.verbose, cfg=self.cfg,
-                           lang=lang)
-        clone.on_part = None
-        return clone
+        return None
 
     def for_language(self, mapping, default=""):
         """This call's entry from a {language tag: value} map, or `default`.
@@ -140,19 +126,10 @@ class Provider:
         for candidate in (tag, tag.replace("_", "-"), tag.split("-")[0].split("_")[0]):
             if candidate in mapping:
                 return mapping[candidate]
+            for key, value in mapping.items():
+                if str(key).strip().lower() == candidate.lower():
+                    return value
         return default
-
-    def speed_settings(self, speed):
-        """Settings that make this backend synthesize at `speed` times its normal rate,
-        or None if it has no rate control of its own.
-
-        Exists so a provider that *composes* another one (rvc) can have the base realize
-        a <tag>'s pacing at synthesis time -- a genuine prosody change -- instead of
-        time-stretching the rendered wav afterwards, which is a lossy DSP pass over every
-        sample. Returning None means "I have no such knob"; the caller then falls back to
-        audiofx.
-        """
-        return None
 
     def with_settings(self, overrides):
         """A copy of this provider with `overrides` merged over its settings, leaving

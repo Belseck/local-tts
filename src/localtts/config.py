@@ -36,6 +36,10 @@ DEFAULTS = {
     # A bare key applies to every language; `<lang>:<word>` applies to that one only, so
     # a word said differently in two languages needs no nested structure. Applied before
     # synthesis, on every backend; <tag> markup is left untouched.
+    # Word -> how to say it. A plain value is a respelling ("kubectl": "kube control");
+    # a value between slashes is IPA ("pull request": "/pˈʊl ɹᵻkwˈɛst/"), which is how a
+    # borrowed word keeps its own sound without the sentence being cut in pieces. IPA
+    # needs a backend that accepts phonemes -- `tts check` says which do.
     "pronunciations": {},
     "player_args": {},
     # Environment applied to the player process only, e.g.
@@ -120,11 +124,6 @@ DEFAULTS = {
             # A piper voice *is* a language, so speaking two means having two files. An
             # exact tag beats its base language.
             "language_models": {},
-            # Honor <en>...</en> spans inside another language's text, so a borrowed word
-            # keeps its own phonetics. On by default, and inert until a second language
-            # is configured: only languages with a voice of their own count as tags, so
-            # with one voice installed there is nothing to switch to and nothing changes.
-            "language_tags": True,
             "speaker": None,       # speaker id for multi-speaker voices
             # Real piper flags (verified via `piper --help`) -- inverse-of-rate and
             # loudness. None => piper's own default (1.0 either way), flag omitted. A
@@ -150,9 +149,6 @@ DEFAULTS = {
             # language is then taken from the chosen voice rather than from `lang`, which
             # would otherwise stay stale and read one language with another's phonetics.
             "language_voices": {},
-            # Honor <en>...</en> spans inside another language's text (see
-            # piper.language_tags). On by default, inert with a single language.
-            "language_tags": True,
             "speed": 1.0,
             # Emphasis as a phonetician writes it: N IPA length marks on the vowel
             # carrying primary stress (kˈasa -> kˈaːsa). Kokoro has the length mark in
@@ -217,18 +213,12 @@ DEFAULTS = {
             #                  takes when the delivery shifts
             # Spanish runs faster with shorter gaps than English, which is why this is
             # per-language rather than one number.
-            #   language_tags  honor <en>...</en> inside this language's text, so a
-            #                  borrowed word keeps its own phonetics
             #   trim_ms        silence left at each fragment edge before the pause is
             #                  applied, so pause_ms actually controls the rhythm rather
             #                  than being added on top of each fragment's own dead air
-            #   foreign_voices which base voice speaks a borrowed language while this one
-            #                  is the host, e.g. {"en": "bm_lewis"} under "es"
             "delivery": {
-                "es": {"speed": 1.0, "pause_ms": 45, "pause_tone_ms": 130,
-                       "language_tags": True},
-                "en": {"speed": 1.0, "pause_ms": 60, "pause_tone_ms": 160,
-                       "language_tags": True},
+                "es": {"speed": 1.0, "pause_ms": 45, "pause_tone_ms": 130},
+                "en": {"speed": 1.0, "pause_ms": 60, "pause_tone_ms": 160},
             },
             "server_models": {},       # {"jarvis": {"model": "...pth", "index": "...index"}}
             # Which of those names to ask for. `language_models` wins when the call has

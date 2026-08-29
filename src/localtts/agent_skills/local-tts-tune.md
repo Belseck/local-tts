@@ -51,7 +51,7 @@ Work down this table. The first column is what the user actually says.
 | choppy, gappy, "stalls between words" | `pause_ms` / `trim_ms`, or fragments carrying their own dead air | the pacing section below |
 | flat, no emotion | tone tags not being used at all, or a backend that cannot realize them | `local-tts-speak` covers writing tags |
 | a borrowed English word said with the wrong phonetics | language tags off, or that language not configured | the borrowed-word section below |
-| like a different person mid-sentence | a borrowed span using the wrong voice or rvc model | `foreign_voices` / `foreign_models` |
+| a borrowed word said with the wrong phonetics | no IPA entry for it in the dictionary | `pronunciations.<word>=/…/` |
 
 ## Isolating a noisy player (2 plays, no guessing)
 
@@ -120,30 +120,23 @@ said correctly); **much** longer means dead air is accumulating, and `trim_ms` i
 ## Borrowed words in another language
 
 ```console
-$ tts --lang es "Terminé el <en>pull request</en> ya"
+$ tts --lang es "Terminé el pull request ya"
 ```
 
-If the tagged span still sounds Spanish, check in this order:
+If the borrowed words still sound Spanish, check in this order:
 
-1. **Is that language configured?** A tag for a language with no voice of its own is not a
-   tag — it stays literal text. `tts config --show` and look for the language in
-   `kokoro.language_voices` / `piper.language_models`.
-2. **Are language tags on for the host language?** On by default; `rvc` scopes it per host
-   language through `delivery.<lang>.language_tags`.
-3. **Does it sound like a different person?** That is the voice, not the language:
+1. **Is there an IPA entry?** `tts config --show | grep -A5 pronunciations`. A borrowed
+   word keeps its own sound because the dictionary holds its transcription:
+   `tts config --set 'pronunciations.pull request=/pˈʊl ɹᵻkwˈɛst/'`.
+2. **Can the backend use it?** `tts check` prints a `phonetics:` line naming which
+   backends accept IPA and which ignore it. Only a backend with a phonemizer can --
+   kokoro with `server_url`, and rvc over a kokoro base. If theirs cannot, the fix is
+   the persistent server (see `local-tts-configure`), not another entry.
+3. **Is the transcription right?** `espeak-ng --ipa -q -v en "pull request"` prints what
+   the word should be. Use the language the word comes *from*.
 
-```bash
-# which base voice reads a borrowed span while Spanish is the host
-tts config --set 'rvc.delivery.es={"language_tags": true, "foreign_voices": {"en": "bm_lewis"}}'
-# and, for rvc, which resident model converts it
-tts config --set 'rvc.delivery.es={"language_tags": true, "foreign_models": {"en": "cortana-en"}}'
-```
-
-Without `foreign_models` a borrowed span converts with the *host* language's model — still
-the same character, but a model trained on one language rendering another's phonemes,
-which is where an English word inside Spanish can lose its edges. If the user has a model
-for both languages, wiring this up is usually an immediate improvement; if they have only
-one, leave it, and say so rather than inventing a model name.
+A sound the model was never trained on comes out as the nearest one it has -- that is a
+limit of the voice, not of the entry, and no dictionary change fixes it.
 
 ## Emphasis
 

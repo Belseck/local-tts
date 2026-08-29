@@ -43,6 +43,12 @@ class KokoroProvider(Provider):
     realizes_speed = True    # -s is real; volume is applied to the rendered
     realizes_volume = False  # segment in synthesize(), since nothing else will
 
+    @property
+    def supports_phonetics(self):
+        """Only through the persistent server, which is where the phonemizer lives.
+        The per-call CLI wrapper takes text and has nowhere to put a transcription."""
+        return bool(self.settings.get("server_url"))
+
     def _model_dir(self):
         model_dir = os.path.expanduser(self.settings.get("model_dir") or "")
         if not model_dir:
@@ -54,8 +60,8 @@ class KokoroProvider(Provider):
         return model_dir
 
     def resolved_voice(self, voice=None):
-        """The voice for this call: an explicit --voice, else this language's entry from
-        `language_voices`, else the flat `voice` setting."""
+        """The voice for this call: an explicit --voice, else this call's language entry
+        from `language_voices`, else the flat `voice` setting."""
         if voice:
             return voice
         return (self.for_language(self.settings.get("language_voices") or {})
@@ -65,9 +71,9 @@ class KokoroProvider(Provider):
         """The phonemizer language for this call.
 
         Derived from the voice's own prefix when the voice came from `language_voices`,
-        because picking a per-language voice and then leaving a stale flat `lang` in place
-        is how a Spanish voice ends up reading English phonetics. A flat `lang` still
-        applies whenever no per-language voice was chosen.
+        because picking a per-language voice and then leaving a stale flat `lang` in
+        place is how a Spanish voice ends up reading English phonetics. A flat `lang`
+        still applies whenever no per-language voice was chosen.
         """
         per_language = self.for_language(self.settings.get("language_voices") or {})
         chosen = voice or per_language
@@ -110,10 +116,6 @@ class KokoroProvider(Provider):
 
     def synthesize(self, text, out_path, voice=None):
         from localtts import audiofx
-
-        rendered = textutil.synthesize_language_spans(self, text, out_path, voice)
-        if rendered is not None:
-            return rendered
         segments = textutil.resolve_tone_segments(text, auto_tone=bool(self.settings.get("auto_tone")))
         if len(segments) == 1 and segments[0][1] is None:
             self._run_one(segments[0][0], out_path, voice, None)
@@ -172,6 +174,13 @@ class KokoroProvider(Provider):
         # Server-only: the server has the phonemizer and kokoro's own pause arguments.
         # A server that predates these simply ignores unknown keys, so sending them is
         # always safe; the subprocess CLI wrapper has no equivalent flags.
+        phonetics = textutil.phonetic_entries(
+            (self.cfg or {}).get("pronunciations") or {}, self.lang)
+        if phonetics:
+            # The server holds the phonemizer, so it is the one that can transcribe the
+            # sentence and drop these in. Sending the table rather than a pre-built
+            # string keeps local-tts dependency-free.
+            payload["phonetics"] = phonetics
         marks = int(self.settings.get("emphasis_lengthen") or 0)
         if marks > 0:
             payload["emphasis_lengthen"] = marks

@@ -2304,34 +2304,10 @@ class ToneRealizationTest(unittest.TestCase):
         self.assertIs(config.DEFAULTS["providers"]["command"]["audio_fx"], False)
 
 
-class LanguageSpanTest(unittest.TestCase):
+class LanguageTagGuardTest(unittest.TestCase):
     """<en>...</en> inside another language's text (text.split_language_spans)."""
 
     KNOWN = ("es", "en")
-
-    def test_a_borrowed_span_becomes_its_own_language(self):
-        self.assertEqual(
-            textutil.split_language_spans("Sube el <en>pull request</en> ya", "es", self.KNOWN),
-            [("Sube el ", "es"), ("pull request", "en"), (" ya", "es")])
-
-    def test_tone_tags_are_rebalanced_across_the_cut(self):
-        """Each span is tone-parsed on its own afterwards, so a tag straddling the cut
-        has to be closed and reopened -- half a tag raises rather than guessing."""
-        spans = textutil.split_language_spans(
-            "<calm>Hola <en>hello</en> adios</calm>", "es", self.KNOWN)
-        self.assertEqual([lang for _, lang in spans], ["es", "en", "es"])
-        for chunk, _ in spans:
-            textutil.resolve_tone_segments(chunk)      # must not raise
-        self.assertTrue(all(c.startswith("<calm>") and c.endswith("</calm>")
-                            for c, _ in spans))
-
-    def test_an_unconfigured_language_is_removed_not_switched(self):
-        """It must not switch language -- there is no voice for it -- but the markup must
-        not survive either: left in place the tone layer would mistake it for a tone tag,
-        split the audio for nothing and invent instructions from the code."""
-        self.assertEqual(
-            textutil.split_language_spans("Un <it>ciao</it> aqui", "es", self.KNOWN),
-            [("Un ciao aqui", "es")])
 
     def test_an_unhandled_language_tag_never_becomes_a_tone(self):
         """The bug this guards: with language tags off, <en> was read as an unknown tone
@@ -2363,100 +2339,6 @@ class LanguageSpanTest(unittest.TestCase):
         self.assertEqual(len(segments), 1)
         self.assertEqual(segments[0][0], "a b c")
         self.assertEqual(segments[0][1]["speed"], textutil.tag_profile("calm")["speed"])
-
-    def test_escaped_brackets_stay_literal(self):
-        text = r"escaped \<en\> stays"
-        self.assertEqual(textutil.split_language_spans(text, "es", self.KNOWN),
-                         [(text, "es")])
-
-    def test_no_known_languages_is_the_untagged_path(self):
-        self.assertEqual(textutil.split_language_spans("<en>x</en>", "es", ()),
-                         [("<en>x</en>", "es")])
-
-    def test_explicit_lang_prefix_and_region_tags(self):
-        self.assertEqual(
-            textutil.split_language_spans("a <lang:en>b</lang:en> c", "es", self.KNOWN),
-            [("a ", "es"), ("b", "en"), (" c", "es")])
-        self.assertEqual(
-            [l for _, l in textutil.split_language_spans("a <es-MX>b</es-MX>", "en",
-                                                         ("en", "es-MX"))],
-            ["en", "es-MX"])
-
-
-class LanguageSpanRenderingTest(unittest.TestCase):
-    """Every backend that can speak more than one language on demand renders a borrowed
-    span in that language's own voice (text.synthesize_language_spans)."""
-
-    CFG = {"languages": {"es": {}, "en": {}}, "providers": {}}
-    TEXT = "Sube el <en>pull request</en> ya"
-
-    def test_kokoro_switches_voice_and_phonemizer_per_span(self):
-        seen = []
-        provider = KokoroProvider(
-            dict(config.DEFAULTS["providers"]["kokoro"], binary="kokoro-tts",
-                 language_voices={"es": "ef_dora", "en": "bm_george"}),
-            cfg=self.CFG, lang="es")
-
-        # Patched on the class, not the instance: a borrowed span is rendered by a fresh
-        # copy of the provider (Provider.for_language_instance), which would not see an
-        # instance attribute.
-        def run(self, cmd, **kwargs):
-            seen.append((cmd[cmd.index("-v") + 1], cmd[cmd.index("-l") + 1]))
-            with open(cmd[cmd.index("-o") + 1], "wb") as fh:
-                fh.write(_wav_bytes(1))
-
-        with unittest.mock.patch.object(KokoroProvider, "run", run):
-            with tempfile.TemporaryDirectory() as tmp:
-                provider.synthesize(self.TEXT, os.path.join(tmp, "out.wav"))
-        self.assertEqual(seen, [("ef_dora", "es"), ("bm_george", "en-gb"),
-                                ("ef_dora", "es")])
-
-    def test_piper_switches_voice_model_per_span(self):
-        seen = []
-        provider = PiperProvider(
-            dict(config.DEFAULTS["providers"]["piper"], binary="/bin/echo",
-                 language_models={"es": "/v/es.onnx", "en": "/v/en.onnx"}),
-            cfg=self.CFG, lang="es")
-
-        def run(self, cmd, stdin_text=None, **kwargs):
-            seen.append(cmd[cmd.index("--model") + 1])
-            with open(cmd[cmd.index("--output_file") + 1], "wb") as fh:
-                fh.write(_wav_bytes(1))
-
-        real_exists = os.path.exists
-        with unittest.mock.patch.object(PiperProvider, "run", run), \
-             unittest.mock.patch.object(
-                 os.path, "exists",
-                 side_effect=lambda p: True if str(p).endswith(".onnx") else real_exists(p)):
-            with tempfile.TemporaryDirectory() as tmp:
-                provider.synthesize(self.TEXT, os.path.join(tmp, "out.wav"))
-        self.assertEqual(seen, ["/v/es.onnx", "/v/en.onnx", "/v/es.onnx"])
-
-    def test_inert_when_only_one_language_is_configured(self):
-        """On by default is only safe because a tag for a language with no voice of its
-        own is not a tag at all -- it stays literal text and nothing switches."""
-        provider = KokoroProvider(
-            dict(config.DEFAULTS["providers"]["kokoro"], binary="kokoro-tts",
-                 language_voices={"es": "ef_dora"}),
-            cfg={"languages": {"es": {}}, "providers": {}}, lang="es")
-        self.assertTrue(provider.language_tags_enabled())
-        self.assertIsNone(
-            textutil.synthesize_language_spans(provider, self.TEXT, "/tmp/unused.wav"),
-            "nothing to switch to, so the caller's normal path must run")
-
-    def test_turning_it_off_skips_the_split(self):
-        provider = KokoroProvider(
-            dict(config.DEFAULTS["providers"]["kokoro"], binary="kokoro-tts",
-                 language_tags=False,
-                 language_voices={"es": "ef_dora", "en": "bm_george"}),
-            cfg=self.CFG, lang="es")
-        self.assertIsNone(
-            textutil.synthesize_language_spans(provider, self.TEXT, "/tmp/unused.wav"))
-
-    def test_language_tags_are_on_by_default(self):
-        for name in ("piper", "kokoro"):
-            self.assertIs(config.DEFAULTS["providers"][name]["language_tags"], True, name)
-
 
 class PronunciationTest(unittest.TestCase):
     """Word respellings applied before synthesis (text.apply_pronunciations)."""
@@ -2546,32 +2428,6 @@ class DeliveryTest(unittest.TestCase):
         self.assertEqual(delivery["pause_ms"], 10)
         self.assertEqual(delivery["pause_tone_ms"], DELIVERY_DEFAULTS["pause_tone_ms"])
 
-    def test_foreign_voices_override_per_host_language(self):
-        """Which voice speaks a borrowed span can depend on what language is hosting it:
-        the best voice for a quoted English phrase inside Spanish is not always the one
-        you would pick to narrate a whole English paragraph."""
-        cfg = {
-            "providers": {
-                "rvc": dict(config.DEFAULTS["providers"]["rvc"], base_provider="kokoro"),
-                "kokoro": dict(config.DEFAULTS["providers"]["kokoro"],
-                               language_voices={"es": "ef_dora", "en": "bm_george"}),
-            },
-            "languages": {"es": {}, "en": {}},
-        }
-        cfg["providers"]["rvc"]["delivery"] = {
-            "es": {"language_tags": True, "foreign_voices": {"en": "bm_lewis"}},
-            "en": {"language_tags": True},
-        }
-        spanish = RvcProvider(cfg["providers"]["rvc"], cfg=cfg, lang="es")
-        borrowed = spanish._base_for("en")
-        self.assertEqual(borrowed.resolved_voice(), "bm_lewis")
-        # The phonemizer language must follow the voice actually used, not the one the
-        # global map would have picked.
-        self.assertEqual(borrowed.resolved_lang(), "en-gb")
-        self.assertEqual(spanish._base_for("es").resolved_voice(), "ef_dora")
-
-        english = RvcProvider(cfg["providers"]["rvc"], cfg=cfg, lang="en")
-        self.assertEqual(english._base_for("en").resolved_voice(), "bm_george")
 
     def test_silence_is_padded_onto_the_fragment(self):
         """Padding the fragment rather than inserting silence while joining is what
@@ -2828,3 +2684,53 @@ class NestedConfigSetTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PhoneticDictionaryTest(unittest.TestCase):
+    """IPA entries in the pronunciation dictionary: how a borrowed word keeps its own
+    sound now that the sentence is no longer cut into language spans."""
+
+    ENTRIES = {
+        "kubectl": "kube control",
+        "pull request": "/p\u02c8\u028al \u0279\u1d3ckw\u02c8\u025bst/",
+        "es:croissant": "/\u02c8k\u0281was\u0251\u0303/",
+        "en:jarvis": "/d\u0292\u02c8\u0251\u02d0\u0279v\u026as/",
+    }
+
+    def test_slashes_mark_ipa_a_bare_value_is_a_respelling(self):
+        self.assertTrue(textutil.is_phonetic("/p\u02c8\u028al/"))
+        self.assertFalse(textutil.is_phonetic("kube control"))
+        self.assertFalse(textutil.is_phonetic("and/or"))     # slashes inside, not around
+
+    def test_the_two_kinds_are_kept_apart(self):
+        self.assertEqual(textutil.respelling_entries(self.ENTRIES), {"kubectl": "kube control"})
+        self.assertIn("pull request", textutil.phonetic_entries(self.ENTRIES))
+
+    def test_ipa_is_unwrapped_not_spliced_into_the_text(self):
+        """A transcription is phonemes for a backend, not something to paste into a
+        sentence: leaving it in the text would have the model spell out the slashes."""
+        said = textutil.apply_pronunciations("run kubectl on the pull request", self.ENTRIES)
+        self.assertEqual(said, "run kube control on the pull request")
+        self.assertEqual(textutil.phonetic_entries(self.ENTRIES)["pull request"],
+                         "p\u02c8\u028al \u0279\u1d3ckw\u02c8\u025bst")
+
+    def test_any_language_not_just_english(self):
+        """IPA is not tied to one language: a French word inside Spanish is the same
+        mechanism. What limits it is the backend's phoneme vocabulary, not this table."""
+        spanish = textutil.phonetic_entries(self.ENTRIES, "es")
+        self.assertIn("croissant", spanish)
+        self.assertNotIn("jarvis", spanish)          # scoped to en
+        self.assertIn("jarvis", textutil.phonetic_entries(self.ENTRIES, "en"))
+
+    def test_kokoro_declares_phonetics_only_with_a_server(self):
+        """The per-call CLI wrapper takes text and has nowhere to put a transcription;
+        the phonemizer lives in the persistent server."""
+        plain = KokoroProvider(dict(config.DEFAULTS["providers"]["kokoro"]))
+        self.assertFalse(plain.supports_phonetics)
+        served = KokoroProvider(dict(config.DEFAULTS["providers"]["kokoro"],
+                                     server_url="http://127.0.0.1:8765"))
+        self.assertTrue(served.supports_phonetics)
+
+    def test_a_backend_without_a_phonemizer_says_so(self):
+        self.assertFalse(PiperProvider(dict(config.DEFAULTS["providers"]["piper"])).supports_phonetics)
+        self.assertFalse(LlamaCppProvider(dict(config.DEFAULTS["providers"]["llamacpp"])).supports_phonetics)

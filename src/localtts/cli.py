@@ -496,10 +496,42 @@ def check(argv):
     if tuning:
         print("player tuning: %s" % "; ".join(tuning))
     print("tone shaping: %s" % _tone_shaping_status())
+    print("phonetics   : %s" % _phonetics_status(cfg))
     print("streaming   : %s" % ("on -- each fragment plays as it is synthesized"
                                 if cfg.get("stream", True) else
                                 "off (`%s config --set stream=true` to play as it renders)" % PROG))
     return 0 if ok_default else 1
+
+
+
+def _phonetics_status(cfg):
+    """Whether the dictionary's IPA entries can actually reach the model.
+
+    Reported rather than left to be discovered, because a `/…/` entry that silently
+    does nothing is the worst kind of setting: the word still gets said, just the wrong
+    way, and nothing anywhere says why. local-tts has no runtime dependencies and
+    cannot transcribe text itself, so it can only pass the table to a backend that has
+    a phonemizer of its own.
+    """
+    entries = cfg.get("pronunciations") or {}
+    phonetic = [key for key, value in entries.items() if textutil.is_phonetic(value)]
+    if not phonetic:
+        return "no /IPA/ entries in `pronunciations` (plain respellings work everywhere)"
+
+    able, unable = [], []
+    for name in providers.names():
+        try:
+            instance = providers.build(name, cfg)
+        except Exception:
+            continue
+        (able if getattr(instance, "supports_phonetics", False) else unable).append(name)
+    if not able:
+        return ("%d /IPA/ entries, but no configured backend accepts phonemes -- they "
+                "are ignored (kokoro with `server_url` set is the one that can)"
+                % len(phonetic))
+    return "%d /IPA/ entries -> %s%s" % (
+        len(phonetic), ", ".join(able),
+        "; ignored by %s" % ", ".join(unable) if unable else "")
 
 
 def _tone_shaping_status():
