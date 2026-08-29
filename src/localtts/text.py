@@ -353,13 +353,24 @@ def pronunciation_entries(entries, lang=""):
 
 
 def respelling_entries(entries, lang=""):
-    """Only the entries that are respellings, which every backend can use."""
+    """The respellings from `pronunciations` -- what this table has always held.
+
+    A filter over `pronunciation_entries()`, not a second table: no new configuration
+    key, and the `<lang>:<word>` scoping and exact-tag-beats-base-language rules are
+    that function's, unchanged. Every backend can use these, because they are rewritten
+    into the text before synthesis.
+    """
     return {k: v for k, v in pronunciation_entries(entries, lang).items()
             if not is_phonetic(v)}
 
 
 def phonetic_entries(entries, lang=""):
-    """Only the IPA entries, unwrapped from their slashes.
+    """The IPA entries from `pronunciations`, unwrapped from their slashes.
+
+    The same table the respellings live in, resolved by the same
+    `pronunciation_entries()` -- phonetics were added to the dictionary that already
+    existed rather than beside it, so one place answers "how is this word said" and a
+    user learns one set of scoping rules, not two.
 
     These are how a borrowed word keeps its own sound: "descarga el pull request" says
     *pull request* the English way because the dictionary holds its transcription, not

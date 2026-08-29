@@ -1085,7 +1085,9 @@ was never trained on comes out as the nearest thing it has.
 
 **Not every backend can use them.** local-tts has no runtime dependencies and cannot
 transcribe text itself, so it passes the table to backends that have a phonemizer of
-their own. Today that is `kokoro` with `server_url` set, and `rvc` when kokoro is its
+their own. No extra install is involved: `kokoro-onnx` already requires `phonemizer`
+and `espeakng-loader`, and the server uses kokoro's own tokenizer so a transcription
+matches what the model would have produced from the text itself. Today that is `kokoro` with `server_url` set, and `rvc` when kokoro is its
 base. `tts check` says so outright rather than leaving a silent no-op:
 
 ```

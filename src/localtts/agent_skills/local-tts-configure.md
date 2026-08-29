@@ -255,16 +255,27 @@ _BACKENDS = {}
 
 
 def phonemes(text, lang):
-    """IPA for `text`, with stress marks. The backend is built once per language: it
-    loads espeak's data, which is not something to redo per request."""
+    """IPA for `text`, with stress marks.
+
+    Uses kokoro-onnx's own Tokenizer rather than reaching around it to phonemizer.
+    Three reasons, in order of how much they bite:
+
+    - It is what the model itself uses, so a transcription made here tokenizes to
+      exactly what `create(text)` would have produced -- verified: same tokens, and the
+      audio differs only by the runtime's own float noise.
+    - It is not an extra dependency. kokoro-onnx already requires phonemizer and
+      espeakng-loader; importing them directly only looked free because they were
+      already installed for it.
+    - Raw EspeakBackend with preserve_punctuation keeps characters the model has no
+      token for -- Spanish "¿" among them -- which are then silently dropped.
+
+    Built once per language: it loads espeak's data, which is not something to redo per
+    request.
+    """
     if lang not in _BACKENDS:
-        import espeakng_loader
-        from phonemizer.backend import EspeakBackend
-        from phonemizer.backend.espeak.wrapper import EspeakWrapper
-        EspeakWrapper.set_library(espeakng_loader.get_library_path())
-        EspeakWrapper.set_data_path(espeakng_loader.get_data_path())
-        _BACKENDS[lang] = EspeakBackend(lang, preserve_punctuation=True, with_stress=True)
-    return _BACKENDS[lang].phonemize([text])[0].strip()
+        from kokoro_onnx.tokenizer import Tokenizer
+        _BACKENDS[lang] = Tokenizer()
+    return _BACKENDS[lang].phonemize(text.strip(), lang=lang).strip()
 
 
 def lengthen_stressed(ipa, marks):
