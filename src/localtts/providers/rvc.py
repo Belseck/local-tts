@@ -28,6 +28,12 @@ DELIVERY_DEFAULTS = {
     "pause_tone_ms": 130,       # when the tone changes -- the breath
     "emphasis_lengthen": 0,     # IPA length marks on the stressed vowel (kokoro only)
     "language_tags": False,     # honor <en>...</en> inside this language's text
+    # Which base voice speaks a *borrowed* language while this language is the host, e.g.
+    # {"en": "bm_lewis"} under "es". Separate from the global per-language voice because
+    # the best voice for a quoted English phrase inside Spanish is not always the one you
+    # would pick to narrate a whole English paragraph -- a closer timbre matters more
+    # when it sits mid-sentence.
+    "foreign_voices": {},
 }
 
 
@@ -96,11 +102,21 @@ class RvcProvider(Provider):
         return codes
 
     def _base_for(self, lang):
-        """The base provider as it would be built for `lang` -- same object for the call's
-        own language, a fresh one per borrowed language."""
+        """The base provider as it would be built for `lang` -- the call's own language
+        unchanged, or a borrowed one, optionally with this host language's own choice of
+        voice for it (delivery.foreign_voices)."""
         if not lang or lang == self.lang:
             return self.base_provider_instance()
-        return self.base_provider_instance(lang=lang)
+        base = self.base_provider_instance(lang=lang)
+        voice = (self.delivery()["foreign_voices"] or {}).get(lang)
+        if not voice:
+            return base
+        # Override the per-language map rather than the flat `voice`, so whatever the
+        # base derives from its voice (kokoro takes the phonemizer language from it)
+        # still lines up with the voice actually being used.
+        existing = dict(getattr(base, "settings", {}).get("language_voices") or {})
+        existing[lang] = voice
+        return base.with_settings({"language_voices": existing})
 
     def base_provider_instance(self, lang=None):
         base_name = self._base_name()

@@ -965,7 +965,19 @@ $ tts --lang es "Ya subí el <en>pull request</en> al repositorio."
 ```
 
 With `rvc` every span still converts to the same target voice, so it remains one
-character speaking — only the base pronunciation changes. Enabled per language:
+character speaking — only the base pronunciation changes.
+
+Which voice reads a borrowed span is configurable per **host** language via
+`foreign_voices`, falling back to the base provider's own per-language voice:
+
+```bash
+tts config --set 'rvc.delivery.es={"language_tags": true, "foreign_voices": {"en": "bm_lewis"}}'
+```
+
+Reach for it when a borrowed phrase sounds like a different person interrupting — a
+closer timbre matters more mid-sentence than it does for a whole paragraph.
+
+Enabled per language:
 
 ```bash
 tts config --set 'rvc.delivery.es={"pause_ms": 45, "language_tags": true}'

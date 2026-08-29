@@ -1027,7 +1027,17 @@ tts config --set 'rvc.delivery.es={"pause_ms": 45, "language_tags": true}'
 ```
 
 Enabled per language, so it can be on for Spanish and off elsewhere. Tagging a language
-requires that language to be configured, so add a voice for it first. `<lang:en>` works
+requires that language to be configured, so add a voice for it first.
+
+Which voice speaks the borrowed span is configurable per **host** language, because the
+best voice for a quoted English phrase inside Spanish is not always the one you would
+pick to narrate a whole English paragraph — a closer timbre matters more mid-sentence:
+
+```bash
+tts config --set 'rvc.delivery.es={"language_tags": true, "foreign_voices": {"en": "bm_lewis"}}'
+```
+
+Without an override it falls back to the base provider's own per-language voice. `<lang:en>` works
 too, as do region tags (`<es-MX>`). Only languages you have actually configured count as
 language tags — otherwise a tone tag nobody anticipated would silently become a language
 switch. Tone tags straddling a language boundary are re-balanced across the cut, so

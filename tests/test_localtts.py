@@ -2437,6 +2437,33 @@ class DeliveryTest(unittest.TestCase):
         self.assertEqual(delivery["pause_ms"], 10)
         self.assertEqual(delivery["pause_tone_ms"], DELIVERY_DEFAULTS["pause_tone_ms"])
 
+    def test_foreign_voices_override_per_host_language(self):
+        """Which voice speaks a borrowed span can depend on what language is hosting it:
+        the best voice for a quoted English phrase inside Spanish is not always the one
+        you would pick to narrate a whole English paragraph."""
+        cfg = {
+            "providers": {
+                "rvc": dict(config.DEFAULTS["providers"]["rvc"], base_provider="kokoro"),
+                "kokoro": dict(config.DEFAULTS["providers"]["kokoro"],
+                               language_voices={"es": "ef_dora", "en": "bm_george"}),
+            },
+            "languages": {"es": {}, "en": {}},
+        }
+        cfg["providers"]["rvc"]["delivery"] = {
+            "es": {"language_tags": True, "foreign_voices": {"en": "bm_lewis"}},
+            "en": {"language_tags": True},
+        }
+        spanish = RvcProvider(cfg["providers"]["rvc"], cfg=cfg, lang="es")
+        borrowed = spanish._base_for("en")
+        self.assertEqual(borrowed.resolved_voice(), "bm_lewis")
+        # The phonemizer language must follow the voice actually used, not the one the
+        # global map would have picked.
+        self.assertEqual(borrowed.resolved_lang(), "en-gb")
+        self.assertEqual(spanish._base_for("es").resolved_voice(), "ef_dora")
+
+        english = RvcProvider(cfg["providers"]["rvc"], cfg=cfg, lang="en")
+        self.assertEqual(english._base_for("en").resolved_voice(), "bm_george")
+
     def test_silence_is_padded_onto_the_fragment(self):
         """Padding the fragment rather than inserting silence while joining is what
         keeps streamed playback and the saved file identical."""

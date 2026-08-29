@@ -206,6 +206,8 @@ DEFAULTS = {
             # per-language rather than one number.
             #   language_tags  honor <en>...</en> inside this language's text, so a
             #                  borrowed word keeps its own phonetics
+            #   foreign_voices which base voice speaks a borrowed language while this one
+            #                  is the host, e.g. {"en": "bm_lewis"} under "es"
             "delivery": {
                 "es": {"speed": 1.0, "pause_ms": 45, "pause_tone_ms": 130,
                        "language_tags": True},
