@@ -1,19 +1,23 @@
 ---
 name: local-tts-speak
-description: Speak text out loud to the user with the local `tts` CLI (local-tts). Use when the user asks you to talk to them, read something aloud, narrate a file, say something, or produce an audio version of text — including in another language ("háblame", "léeme esto", "lis-moi ça"). Runs fully offline; picks the right backend for the language automatically.
+description: TRIGGER — whenever the user's message means "say this out loud / speak / talk to me / read it to me", in any language, invoke this skill and actually run `tts` — do not just reply in text and describe what you would say, and do not treat a bare one-word request like "talk", "speak", "habla" or "parle" as too vague to act on; it is the whole request. Covers "talk to me", "say that out loud", "read this file to me", "narrate this", "can you speak?", "make an audio of this", "tell me X out loud", "reply in voice", "keep talking to me" (a standing request — stay in voice for every following reply until they say otherwise), and the same phrasings in other languages ("háblame", "léeme esto", "dímelo en voz alta", "lis-moi ça", "parle-moi", "sag mir das laut", "leggimelo"). Speaks fully offline with the local `tts` CLI (local-tts), auto-picking the right backend for the language.
 ---
 
 # Speaking to the user with `local-tts`
 
-The `tts` command turns text into speech locally. Use it whenever the user wants to
-**hear** something rather than read it.
+The `tts` command turns text into speech locally. **If you are reading this file, the
+user's message already means "run `tts`," not "reply in text about it."** Use it whenever
+the user wants to **hear** something rather than read it — including a bare "talk to me" or
+"habla" with nothing else attached; that alone is the complete request, not something too
+vague to act on.
 
 ## When to use this
 
 Triggers include: "talk to me", "say that out loud", "read this file to me", "narrate
 this", "can you speak?", "make an audio of this", "háblame", "léeme esto", "lies mir das
 vor". Also use it when the user has asked you to *keep* talking to them — once they ask for
-voice, prefer voice for your substantive answers until they say otherwise.
+voice, prefer voice for your substantive answers until they say otherwise, without needing
+to be asked again each time.
 
 Do **not** use it for ordinary text replies the user did not ask to hear.
 
@@ -48,8 +52,13 @@ say which one you used, and offer to remember it:
 
 - The default `llamacpp` backend only speaks **English, Chinese, Japanese and Korean**.
   Anything else comes out with English phonetics and sounds wrong.
-- For any other language, `piper` is the right backend — but it needs a voice for that
-  language installed. If none is, use the `local-tts-configure` skill.
+- For any other language, `piper` or `kokoro` are the right backends — both cover ~40
+  languages, but need a voice installed first. If neither is set up, use the
+  `local-tts-configure` skill rather than guessing which one to install.
+- `rvc` is different from the other backends: it's a voice *conversion* layer over
+  whichever provider it's configured to use underneath, for a specific voice the user
+  already has a trained model for — not a general-purpose language backend. Use it only
+  when the user asked for that particular voice, never as a language fallback.
 
 ## The default way to speak: `-b`
 

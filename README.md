@@ -343,7 +343,9 @@ whichever agents it finds on your machine:
 - **`local-tts-update`** — update an already-installed CLI to the latest version. Locates
   the repo behind the running `tts` command, pulls it, reinstalls only if that's actually
   needed, and refreshes the skill/hook files that are copies rather than live links to the
-  repo. See [Updating](#updating).
+  repo — including its own file: since the update process can change between versions, it
+  refreshes and re-invokes itself right after pulling, rather than finishing the rest of
+  the update under instructions that might already be stale. See [Updating](#updating).
 
 ```bash
 tts skills                       # what was detected, and what is installed
@@ -351,7 +353,12 @@ tts skills --install             # install into every detected agent
 tts skills --install gemini      # or just one
 tts skills --install --dry-run   # show the paths without writing
 tts skills --uninstall           # remove them again
+tts skills --print local-tts-update   # print one skill's current content to stdout
 ```
+
+`--print` reads straight from this install, not the copy sitting in any agent's skill
+directory — useful for a host that won't reliably pick up a changed skill file mid-session
+(`local-tts-update` uses it on itself for exactly that reason, see [Updating](#updating)).
 
 Restart the agent (or open a new session) afterwards so it picks them up.
 
@@ -631,6 +638,118 @@ tts -p piper -f article.md -o article.wav
 | `speaker` | `null` | Speaker id for multi-speaker voices. |
 | `extra_args` | `[]` | Extra flags appended verbatim. |
 
+### `kokoro` — small, fast, offline, many languages
+
+An alternative to piper with similar footprint and language coverage (Kokoro-82M). There
+is no single official CLI, so the straightforward path is a minimal wrapper around the
+`kokoro`/`kokoro-onnx` Python package, in its own venv:
+
+```bash
+python -m venv ~/.local/share/kokoro-venv
+~/.local/share/kokoro-venv/bin/pip install kokoro-onnx soundfile
+
+mkdir -p ~/.local/share/kokoro-models && cd ~/.local/share/kokoro-models
+# fetch kokoro-v1.0.onnx and voices-v1.0.bin, e.g. from
+# https://github.com/nazdridoy/kokoro-tts/releases
+```
+
+Save this as `~/.local/share/kokoro-venv/kokoro_cli.py`:
+
+```python
+#!/usr/bin/env python3
+import argparse, os, sys, warnings
+warnings.filterwarnings("ignore")
+MODELS = os.path.expanduser("~/.local/share/kokoro-models")
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("-o", "--output", required=True)
+    p.add_argument("-v", "--voice", default="af_heart")
+    p.add_argument("-l", "--lang", default="en-us")
+    p.add_argument("-s", "--speed", type=float, default=1.0)
+    p.add_argument("text", nargs="*")
+    a = p.parse_args()
+    text = " ".join(a.text).strip() or sys.stdin.read().strip()
+    if not text:
+        sys.exit("kokoro-tts: no text")
+    import soundfile as sf
+    from kokoro_onnx import Kokoro
+    k = Kokoro(f"{MODELS}/kokoro-v1.0.onnx", f"{MODELS}/voices-v1.0.bin")
+    samples, rate = k.create(text, voice=a.voice, speed=a.speed, lang=a.lang)
+    sf.write(a.output, samples, rate)
+
+if __name__ == "__main__":
+    main()
+```
+
+And a shim on `PATH` so `kokoro.binary`'s default (`kokoro-tts`) finds it:
+
+```bash
+mkdir -p ~/.local/bin
+cat > ~/.local/bin/kokoro-tts <<'EOF'
+#!/usr/bin/env bash
+exec "$HOME/.local/share/kokoro-venv/bin/python" \
+     "$HOME/.local/share/kokoro-venv/kokoro_cli.py" "$@"
+EOF
+chmod +x ~/.local/bin/kokoro-tts
+```
+
+Then configure a voice — IDs are per-language, e.g. `af_heart` for US English, `ef_dora`
+for Spanish:
+
+```bash
+tts config --set kokoro.voice=ef_dora
+tts config --set kokoro.lang=es
+tts -p kokoro "Prueba de voz con Kokoro."
+```
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `binary` | `kokoro-tts` | Path to or name of the executable. |
+| `model_dir` | *(empty)* | Optional. Only for a kokoro CLI that resolves model files by working directory (e.g. `nazdridoy/kokoro-tts`) rather than managing them internally like the wrapper above. |
+| `voice` | *(empty)* | Voice id. Empty uses the binary's own default. |
+| `lang` | *(empty)* | Language code. Empty uses the binary's own default. |
+| `speed` | `1.0` | Playback speed multiplier. |
+| `extra_args` | `[]` | Extra flags appended verbatim. |
+
+### `rvc` — voice conversion (not installed automatically)
+
+[rvc-python](https://github.com/daswer123/rvc-python) does **audio-to-audio voice
+conversion only** — it has no text input. This provider chains it: synthesize with another
+provider first (`rvc.base_provider`, piper by default), then convert that result to a
+target voice with a trained model.
+
+**Never installed automatically** — it pulls in `torch` and is sizable. Set it up
+deliberately:
+
+```bash
+python -m venv ~/.local/share/rvc-venv
+~/.local/share/rvc-venv/bin/pip install rvc-python
+# GPU support needs a matching torch build; see the rvc-python README for the index URL.
+
+tts config --set rvc.python=~/.local/share/rvc-venv/bin/python
+tts config --set rvc.model=~/.local/share/rvc-models/<name>/<name>.pth
+tts config --set rvc.index=~/.local/share/rvc-models/<name>/<index-file>   # optional
+tts config --set rvc.base_provider=piper
+
+tts -p rvc --dry-run "test"    # shows both steps: base synthesis, then conversion
+tts -p rvc "Test of the converted voice."
+```
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `python` | *(empty)* | Path to the interpreter in the venv rvc-python is installed in. Required. |
+| `base_provider` | *(empty)* | Which provider synthesizes the base voice. Empty uses the overall default provider. |
+| `model` | *(empty)* | Path to a `.pth` voice model. Required. |
+| `index` | *(empty)* | Optional `.index` file; improves quality. |
+| `device` | `cpu` | `cpu` or `cuda:0`, matching the torch build installed. |
+| `pitch` | `0` | Semitone shift. |
+| `method` | *(empty)* | Pitch extraction algorithm: `harvest`, `crepe`, `rmvpe`, `pm`. Empty uses rvc-python's default. |
+| `index_rate`, `protect` | *(empty)* | Passed through to rvc-python when set. |
+| `extra_args` | `[]` | Extra flags appended verbatim. |
+
+There is no `rvc.voice` — the voice comes entirely from which `.pth` model is configured.
+
 ### `command` — anything else
 
 An escape hatch for any binary that can write a WAV file. `{text}` and `{output}`
@@ -642,6 +761,18 @@ tts -p command "Whatever tool you like."
 
 # macOS
 tts config --set 'command.template=say -o {output} --data-format=LEI16@22050 {text}'
+```
+
+If you wired up something through `command` that now has a real provider above (kokoro,
+rvc), `tts config --detect-migrations` finds it and prints the exact `--set` commands to
+switch — it never applies them, and never touches `command.template` itself:
+
+```bash
+$ tts config --detect-migrations
+command.template runs something tts now supports natively as `kokoro`:
+  command.template runs 'kokoro-tts', which local-tts now supports natively
+  tts config --set kokoro.voice=ef_dora
+  tts config --set kokoro.lang=es
 ```
 
 ---

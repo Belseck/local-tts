@@ -1,6 +1,10 @@
 """Turning documents into speakable text: markdown stripping and chunking."""
 
+import concurrent.futures
+import os
 import re
+import tempfile
+import threading
 
 MARKDOWN_SUFFIXES = (".md", ".markdown", ".mdown", ".mkd", ".mdx")
 
@@ -78,3 +82,56 @@ def chunks(text, limit):
         if batch:
             pieces.append(" ".join(batch))
     return pieces or [text]
+
+
+def synthesize_chunked(provider, text, out_path, voice=None, on_progress=None):
+    """One call for short text; chunk-and-join when the backend needs small prompts.
+
+    Chunks are synthesized concurrently, bounded by provider.max_workers -- each
+    subprocess-based call pays its own fixed startup cost (process spawn, model load)
+    on top of the actual synthesis time, so overlapping chunks is most of the win for a
+    backend that has to chunk. `on_progress(done, total)`, if given, is called after
+    each chunk finishes (from whichever worker thread finished it).
+
+    Lives here rather than in cli.py because a provider that composes another provider
+    (rvc, converting a base voice) needs the same chunk-and-join behavior for its own
+    inner synthesis call, and providers must not import cli.py (cli.py imports
+    providers -- that would be circular).
+    """
+    from localtts import audio   # local import: audio.py has no reason to import text.py,
+                                  # but keeping the edge one-directional here avoids ever
+                                  # having to worry about load order between the two.
+
+    pieces = chunks(text, provider.max_words)
+    if len(pieces) == 1:
+        return provider.synthesize(text, out_path, voice=voice)
+
+    work = tempfile.mkdtemp(prefix="local-tts-chunks-")
+    parts = [os.path.join(work, "%04d.%s" % (index, provider.default_format))
+             for index in range(1, len(pieces) + 1)]
+    done = 0
+    done_lock = threading.Lock()
+
+    def synth_one(index):
+        nonlocal done
+        provider.synthesize(pieces[index], parts[index], voice=voice)
+        with done_lock:
+            done += 1
+            if on_progress:
+                on_progress(done, len(pieces))
+
+    workers = max(1, min(provider.max_workers, len(pieces)))
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = [pool.submit(synth_one, index) for index in range(len(pieces))]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()  # re-raises the first chunk failure; others keep running
+        audio.concat_wavs(parts, out_path)
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+        for part in parts:
+            if os.path.exists(part):
+                os.unlink(part)
+        if os.path.isdir(work):
+            os.rmdir(work)
+    return out_path

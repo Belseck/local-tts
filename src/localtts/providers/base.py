@@ -29,9 +29,14 @@ class Provider:
         """
         return max(1, int(self.settings.get("max_workers") or 1))
 
-    def __init__(self, settings, verbose=False):
+    def __init__(self, settings, verbose=False, cfg=None):
         self.settings = settings
         self.verbose = verbose
+        #: The full loaded configuration, not just this provider's own settings sub-dict.
+        #: None unless the caller passed one via providers.build(). Only providers that
+        #: compose another provider (rvc, chaining a base TTS backend) need this; most
+        #: never touch it.
+        self.cfg = cfg
 
     def synthesize(self, text, out_path, voice=None):
         raise NotImplementedError
@@ -60,14 +65,15 @@ class Provider:
             )
         return found
 
-    def run(self, cmd, stdin_text=None):
+    def run(self, cmd, stdin_text=None, cwd=None):
         if self.verbose:
-            print("+ %s" % " ".join(cmd), file=sys.stderr)
+            print("+ %s%s" % ("cd %s && " % cwd if cwd else "", " ".join(cmd)), file=sys.stderr)
         try:
             proc = subprocess.run(
                 cmd,
                 input=stdin_text,
                 text=True,
+                cwd=cwd,
                 stdout=None if self.verbose else subprocess.PIPE,
                 stderr=None if self.verbose else subprocess.PIPE,
             )

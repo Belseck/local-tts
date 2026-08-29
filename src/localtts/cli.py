@@ -1,12 +1,10 @@
 """Command-line entry point."""
 
 import argparse
-import concurrent.futures
 import json
 import os
 import sys
 import tempfile
-import threading
 
 from localtts import __version__, audio, config, hooks, providers, skills, text as textutil
 from localtts.errors import TTSError
@@ -205,20 +203,40 @@ def speak(argv):
         if len(pieces) > 1:
             print("# %d words -> %d chunks of <=%d words, joined into one file"
                   % (len(text.split()), len(pieces), provider.max_words))
-        builder = getattr(provider, "build_command", None)
-        if builder is None:
-            print("# %s runs no external command; it POSTs to %s"
-                  % (provider.name, provider.settings.get("base_url")))
+        if provider.name == "rvc":
+            # rvc has no single command: it synthesizes with another provider first,
+            # then converts the result. build_command(wav_in, out_path) only covers the
+            # second half -- showing that alone against a positional text arg would
+            # silently pass the text itself as if it were an input wav path.
+            base = provider.base_provider_instance()
+            print("# step 1: synthesize the base voice with %s" % base.name)
+            base_builder = getattr(base, "build_command", None)
+            if base_builder is None:
+                print("# %s runs no external command; it POSTs to %s"
+                      % (base.name, base.settings.get("base_url")))
+            else:
+                try:
+                    base_cmd = base_builder(pieces[0], "<base-voice.wav>", args.voice)
+                except TypeError:
+                    base_cmd = base_builder(pieces[0], "<base-voice.wav>")
+                print(" ".join(base_cmd))
+            print("# step 2: convert to the target voice")
+            print(" ".join(provider.build_command("<base-voice.wav>", out_path)))
         else:
-            try:
-                cmd = builder(pieces[0], out_path, args.voice)
-            except TypeError:
-                cmd = builder(pieces[0], out_path)
-            print(" ".join(cmd))
-            if provider.name == "piper":
-                print("# (the text is piped to stdin, not passed as an argument)")
-            if len(pieces) > 1:
-                print("# ... and %d more like it" % (len(pieces) - 1))
+            builder = getattr(provider, "build_command", None)
+            if builder is None:
+                print("# %s runs no external command; it POSTs to %s"
+                      % (provider.name, provider.settings.get("base_url")))
+            else:
+                try:
+                    cmd = builder(pieces[0], out_path, args.voice)
+                except TypeError:
+                    cmd = builder(pieces[0], out_path)
+                print(" ".join(cmd))
+                if provider.name == "piper":
+                    print("# (the text is piped to stdin, not passed as an argument)")
+        if len(pieces) > 1:
+            print("# ... and %d more like it" % (len(pieces) - 1))
         if temporary:
             os.unlink(out_path)
         return 0
@@ -262,47 +280,18 @@ def speak(argv):
 
 
 def _synthesize(provider, text, out_path, args):
-    """One call for short text; chunk-and-join when the backend needs small prompts.
+    """Thin wrapper over text.synthesize_chunked() that prints chunk progress to stderr --
+    the chunking/concurrency logic itself is shared with providers that compose another
+    provider internally (rvc), so it lives in text.py, not here."""
+    def report(done, total):
+        print("  chunk %d/%d" % (done, total), end="\r", file=sys.stderr, flush=True)
 
-    Chunks are synthesized concurrently, bounded by provider.max_workers. Each
-    subprocess-based call pays its own fixed startup cost (process spawn, model
-    load) on top of the actual synthesis time, so running that overlapped instead
-    of serial is most of the win for a backend that has to chunk -- see
-    max_workers on the provider for the numbers behind the default.
-    """
     pieces = textutil.chunks(text, provider.max_words)
-    if len(pieces) == 1:
-        return provider.synthesize(text, out_path, voice=args.voice)
-
-    work = tempfile.mkdtemp(prefix="local-tts-chunks-")
-    parts = [os.path.join(work, "%04d.%s" % (index, provider.default_format))
-             for index in range(1, len(pieces) + 1)]
-    done = 0
-    done_lock = threading.Lock()
-
-    def synth_one(index):
-        nonlocal done
-        provider.synthesize(pieces[index], parts[index], voice=args.voice)
-        with done_lock:
-            done += 1
-            print("  chunk %d/%d" % (done, len(pieces)), end="\r", file=sys.stderr, flush=True)
-
-    workers = max(1, min(provider.max_workers, len(pieces)))
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
-    try:
-        futures = [pool.submit(synth_one, index) for index in range(len(pieces))]
-        for future in concurrent.futures.as_completed(futures):
-            future.result()  # re-raises the first chunk failure; others keep running
+    result = textutil.synthesize_chunked(provider, text, out_path, voice=args.voice,
+                                         on_progress=report if len(pieces) > 1 else None)
+    if len(pieces) > 1:
         print(" " * 24, end="\r", file=sys.stderr)
-        audio.concat_wavs(parts, out_path)
-    finally:
-        pool.shutdown(wait=True, cancel_futures=True)
-        for part in parts:
-            if os.path.exists(part):
-                os.unlink(part)
-        if os.path.isdir(work):
-            os.rmdir(work)
-    return out_path
+    return result
 
 
 def list_providers(argv):
@@ -562,7 +551,8 @@ def skills_command(argv):
                 "  %(prog)s --install            install into every detected agent\n"
                 "  %(prog)s --install claude-code gemini\n"
                 "  %(prog)s --install --all      install even where no agent was detected\n"
-                "  %(prog)s --uninstall\n") % {"prog": "%s skills" % PROG},
+                "  %(prog)s --uninstall\n"
+                "  %(prog)s --print local-tts-update\n") % {"prog": "%s skills" % PROG},
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("agents", nargs="*", metavar="AGENT",
@@ -573,7 +563,25 @@ def skills_command(argv):
     parser.add_argument("--all", action="store_true",
                         help="with --install, also target agents that were not detected")
     parser.add_argument("--dry-run", action="store_true", help="show what would be written")
+    parser.add_argument("--print", dest="print_skill", metavar="SKILL",
+                        help="print one bundled skill's current content to stdout, "
+                             "straight from this install -- not the copy in any agent's "
+                             "skill directory, which may be stale. For a host that won't "
+                             "reliably re-read a skill file mid-session: print it, follow "
+                             "the printed text as the instructions for the rest of this "
+                             "task, then tell the user to restart so a fresh session picks "
+                             "it up normally next time. One of: "
+                             + ", ".join(skills.SKILLS))
     args = parser.parse_args(argv)
+
+    if args.print_skill:
+        if args.install or args.uninstall:
+            raise TTSError("--print cannot be combined with --install or --uninstall")
+        if args.print_skill not in skills.SKILLS:
+            raise TTSError("unknown skill %r (one of: %s)"
+                           % (args.print_skill, ", ".join(skills.SKILLS)))
+        sys.stdout.write(skills.read_skill(args.print_skill))
+        return 0
 
     if args.install and args.uninstall:
         raise TTSError("choose either --install or --uninstall, not both")
@@ -625,16 +633,49 @@ def skills_command(argv):
 
 
 def config_command(argv):
-    parser = argparse.ArgumentParser(prog="%s config" % PROG, description="Inspect or change the configuration.")
+    parser = argparse.ArgumentParser(
+        prog="%s config" % PROG,
+        description="Inspect or change the configuration.",
+        epilog=("examples:\n"
+                "  %(prog)s --show\n"
+                "  %(prog)s --set provider=piper\n"
+                "  %(prog)s --detect-migrations\n") % {"prog": "%s config" % PROG},
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--show", action="store_true", help="print the effective configuration")
     parser.add_argument("--path", action="store_true", help="print the config file path")
     parser.add_argument("--init", action="store_true", help="write a config file containing the defaults")
     parser.add_argument("--set", dest="assignments", action="append", default=[], metavar="KEY=VALUE",
                         help="set provider, play, player, or <provider>.<key> (repeatable)")
+    parser.add_argument("--detect-migrations", action="store_true",
+                        help="check the command.template for a tool local-tts now "
+                             "supports as a real provider (e.g. it used to be the only "
+                             "way to drive kokoro-tts); prints the tts config --set "
+                             "commands that would switch to it. Never applies them.")
     args = parser.parse_args(argv)
 
     if args.path:
         print(config.config_path())
+        return 0
+
+    if args.detect_migrations:
+        found = config.detect_migrations(config.load())
+        if not found:
+            print("nothing to migrate: command.template doesn't match a natively "
+                  "supported provider.")
+            return 0
+        for migration in found:
+            print("command.template runs something %s now supports natively as `%s`:"
+                  % (PROG, migration["provider"]))
+            print("  %s" % migration["reason"])
+            for key, value in migration["sets"].items():
+                print("  %s config --set %s=%s" % (PROG, key, value))
+            if migration["was_default"]:
+                print("  %s config --set provider=%s   # command is your current default"
+                      % (PROG, migration["provider"]))
+            print("")
+        print("Nothing has been changed. Run the commands above to switch, or ask "
+              "your agent to do it after confirming.")
         return 0
 
     if args.init:

@@ -17,7 +17,9 @@ from localtts.cli import _resolve_session, _synthesize, main
 from localtts.errors import TTSError
 from localtts.providers.base import Provider
 from localtts.providers.command import CommandProvider
+from localtts.providers.kokoro import KokoroProvider
 from localtts.providers.llamacpp import LlamaCppProvider
+from localtts.providers.rvc import RvcProvider
 
 
 class ConfigTest(unittest.TestCase):
@@ -73,6 +75,56 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.DEFAULTS["providers"]["llamacpp"]["max_workers"], 2)
 
 
+class MigrationDetectionTest(unittest.TestCase):
+    def cfg(self, template, provider="llamacpp"):
+        merged = {"provider": provider, "providers": dict(config.DEFAULTS["providers"])}
+        merged["providers"] = {k: dict(v) for k, v in merged["providers"].items()}
+        merged["providers"]["command"] = {"template": template}
+        return merged
+
+    def test_no_command_template_means_nothing_to_migrate(self):
+        cfg = self.cfg("")
+        self.assertEqual(config.detect_migrations(cfg), [])
+
+    def test_unrelated_template_is_not_flagged(self):
+        cfg = self.cfg("espeak-ng -w {output} {text}")
+        self.assertEqual(config.detect_migrations(cfg), [])
+
+    def test_the_real_installed_kokoro_wrapper_is_detected(self):
+        # The exact template this project's own setup produces.
+        cfg = self.cfg("kokoro-tts -o {output} -v ef_dora -l es {text}")
+        found = config.detect_migrations(cfg)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["provider"], "kokoro")
+        self.assertEqual(found[0]["sets"], {"kokoro.voice": "ef_dora", "kokoro.lang": "es"})
+
+    def test_placeholder_tokens_are_never_captured_as_flag_values(self):
+        # A template like `kokoro-tts -v {text} -o {output}` (voice accidentally left as
+        # the placeholder) must not migrate kokoro.voice to the literal string "{text}".
+        cfg = self.cfg("kokoro-tts -o {output} -v {text}")
+        found = config.detect_migrations(cfg)
+        self.assertNotIn("kokoro.voice", found[0]["sets"])
+
+    def test_rvc_template_is_detected(self):
+        cfg = self.cfg("/venv/bin/python -m rvc_python cli -i {text} -o {output} "
+                       "-mp /models/jarvis.pth -de cuda:0")
+        found = config.detect_migrations(cfg)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["provider"], "rvc")
+        self.assertEqual(found[0]["sets"]["rvc.model"], "/models/jarvis.pth")
+        self.assertEqual(found[0]["sets"]["rvc.device"], "cuda:0")
+
+    def test_was_default_flags_only_when_command_is_the_active_provider(self):
+        active = self.cfg("kokoro-tts -o {output} -v x {text}", provider="command")
+        inactive = self.cfg("kokoro-tts -o {output} -v x {text}", provider="llamacpp")
+        self.assertTrue(config.detect_migrations(active)[0]["was_default"])
+        self.assertFalse(config.detect_migrations(inactive)[0]["was_default"])
+
+    def test_malformed_template_does_not_raise(self):
+        cfg = self.cfg("kokoro-tts 'unterminated")
+        self.assertEqual(config.detect_migrations(cfg), [])
+
+
 class LlamaCppTest(unittest.TestCase):
     def build(self, **settings):
         merged = dict(config.DEFAULTS["providers"]["llamacpp"])
@@ -107,6 +159,185 @@ class LlamaCppTest(unittest.TestCase):
         self.assertEqual(self.build().max_workers, 2)
         self.assertEqual(self.build(max_workers=5).max_workers, 5)
         self.assertEqual(self.build(max_workers=0).max_workers, 1)  # clamped to at least 1
+
+
+class KokoroProviderTest(unittest.TestCase):
+    """Targets the real interface: -o/-v/-l/-s flags, text as a trailing positional arg
+    (not stdin) -- confirmed against an actual installed `kokoro-tts` wrapper."""
+
+    def build(self, **settings):
+        merged = dict(config.DEFAULTS["providers"]["kokoro"])
+        merged.update(settings)
+        provider = KokoroProvider(merged)
+        provider.resolve_binary = lambda *a, **k: "/usr/bin/kokoro-tts"
+        return provider
+
+    def test_model_dir_is_optional_by_default(self):
+        # Most kokoro CLIs manage their own model location internally; only some
+        # (e.g. nazdridoy/kokoro-tts) resolve model files via a working directory.
+        cmd = self.build().build_command("hi", "/tmp/a.wav")
+        self.assertNotIn("model_dir", " ".join(cmd))
+
+    def test_missing_model_files_are_reported_by_name_when_model_dir_is_set(self):
+        with tempfile.TemporaryDirectory() as empty:
+            with self.assertRaises(TTSError) as caught:
+                self.build(model_dir=empty).synthesize("hi", "/tmp/a.wav")
+        self.assertIn("kokoro-v1.0.onnx", str(caught.exception))
+        self.assertIn("voices-v1.0.bin", str(caught.exception))
+
+    def test_text_is_the_trailing_positional_argument(self):
+        cmd = self.build().build_command("hello there", "/tmp/a.wav")
+        self.assertEqual(cmd[0], "/usr/bin/kokoro-tts")
+        self.assertEqual(cmd[-1], "hello there")
+
+    def test_output_flag(self):
+        cmd = self.build().build_command("hi", "/tmp/a.wav")
+        self.assertIn("-o", cmd)
+        self.assertEqual(cmd[cmd.index("-o") + 1], "/tmp/a.wav")
+
+    def test_voice_and_language_flags(self):
+        cmd = self.build(voice="ef_dora", lang="es").build_command("hi", "/tmp/a.wav")
+        self.assertIn("-v", cmd)
+        self.assertIn("ef_dora", cmd)
+        self.assertIn("-l", cmd)
+        self.assertIn("es", cmd)
+
+    def test_no_voice_or_lang_flags_when_unconfigured(self):
+        cmd = self.build().build_command("hi", "/tmp/a.wav")
+        self.assertNotIn("-v", cmd)
+        self.assertNotIn("-l", cmd)
+
+    def test_explicit_voice_argument_overrides_the_configured_one(self):
+        cmd = self.build(voice="ef_dora").build_command("hi", "/tmp/a.wav", voice="am_adam")
+        self.assertIn("am_adam", cmd)
+        self.assertNotIn("ef_dora", cmd)
+
+    def test_default_speed_is_omitted_non_default_is_passed(self):
+        default_cmd = self.build().build_command("hi", "/tmp/a.wav")
+        self.assertNotIn("-s", default_cmd)
+        fast_cmd = self.build(speed=1.3).build_command("hi", "/tmp/a.wav")
+        self.assertIn("-s", fast_cmd)
+        self.assertIn("1.3", fast_cmd)
+
+    def test_check_ok_without_a_model_dir_configured(self):
+        ok, message = self.build().check()
+        self.assertTrue(ok)
+
+    def test_check_reports_a_bad_model_dir_when_one_is_configured(self):
+        ok, message = self.build(model_dir="/definitely/not/here").check()
+        self.assertFalse(ok)
+        self.assertIn("model_dir", message)
+
+    def test_real_installed_kokoro_wrapper_matches_this_shape(self):
+        # The exact command this project's own `local-tts-configure` sets up, and what
+        # was previously wired through the generic `command` provider before this
+        # provider existed -- see MigrationTest for the detection side of that.
+        cmd = self.build(voice="ef_dora", lang="es").build_command("hola", "/tmp/a.wav")
+        self.assertEqual(cmd, ["/usr/bin/kokoro-tts", "-o", "/tmp/a.wav",
+                              "-v", "ef_dora", "-l", "es", "hola"])
+
+
+class RvcProviderTest(unittest.TestCase):
+    def build(self, cfg=None, **settings):
+        merged = dict(config.DEFAULTS["providers"]["rvc"])
+        merged.update(settings)
+        cfg = cfg if cfg is not None else {"provider": "piper", "providers": config.DEFAULTS["providers"]}
+        provider = RvcProvider(merged, cfg=cfg)
+        provider._python = lambda: "/usr/bin/python3"
+        return provider
+
+    def test_python_interpreter_is_required(self):
+        provider = RvcProvider(dict(config.DEFAULTS["providers"]["rvc"]), cfg={})
+        with self.assertRaises(TTSError) as caught:
+            provider.build_command("in.wav", "out.wav")
+        self.assertIn("rvc.python", str(caught.exception))
+
+    def test_model_is_required(self):
+        with self.assertRaises(TTSError) as caught:
+            self.build().build_command("in.wav", "out.wav")
+        self.assertIn("rvc.model", str(caught.exception))
+
+    def test_missing_model_file_is_reported(self):
+        with self.assertRaises(TTSError):
+            self.build(model="/definitely/not/here.pth").build_command("in.wav", "out.wav")
+
+    def test_full_command_shape(self):
+        with tempfile.NamedTemporaryFile(suffix=".pth") as model, \
+                tempfile.NamedTemporaryFile(suffix=".index") as index:
+            cmd = self.build(model=model.name, index=index.name, device="cuda:0",
+                             pitch=2).build_command("in.wav", "out.wav")
+        self.assertEqual(cmd[:4], ["/usr/bin/python3", "-m", "rvc_python", "cli"])
+        self.assertIn("-i", cmd)
+        self.assertIn("in.wav", cmd)
+        self.assertIn("-o", cmd)
+        self.assertIn("out.wav", cmd)
+        self.assertIn("-mp", cmd)
+        self.assertIn(model.name, cmd)
+        self.assertIn("-ip", cmd)
+        self.assertIn(index.name, cmd)
+        self.assertIn("-de", cmd)
+        self.assertIn("cuda:0", cmd)
+        self.assertIn("-pi", cmd)
+        self.assertIn("2", cmd)
+
+    def test_default_base_provider_is_the_cfgs_own_default(self):
+        cfg = {"provider": "openai", "providers": config.DEFAULTS["providers"]}
+        provider = RvcProvider(dict(config.DEFAULTS["providers"]["rvc"]), cfg=cfg)
+        self.assertEqual(provider._base_name(), "openai")
+
+    def test_explicit_base_provider_overrides_the_default(self):
+        cfg = {"provider": "openai", "providers": config.DEFAULTS["providers"]}
+        settings = dict(config.DEFAULTS["providers"]["rvc"])
+        settings["base_provider"] = "llamacpp"
+        provider = RvcProvider(settings, cfg=cfg)
+        self.assertEqual(provider._base_name(), "llamacpp")
+
+    def test_base_provider_cannot_be_rvc_itself(self):
+        provider = self.build(base_provider="rvc")
+        with self.assertRaises(TTSError) as caught:
+            provider.base_provider_instance()
+        self.assertIn("itself", str(caught.exception))
+
+    def test_synthesize_chains_the_base_provider_then_converts(self):
+        calls = []
+
+        class FakeBase:
+            name = "fake"
+            default_format = "wav"
+            max_words = 0
+            max_workers = 1
+
+            def synthesize(self, text, out_path, voice=None):
+                calls.append(("base", text, out_path))
+                with open(out_path, "wb") as fh:
+                    fh.write(b"RIFF....WAVEfake")
+                return out_path
+
+        with tempfile.NamedTemporaryFile(suffix=".pth") as model:
+            provider = self.build(model=model.name)
+            provider.base_provider_instance = lambda: FakeBase()
+
+            def fake_run(cmd, stdin_text=None, cwd=None):
+                calls.append(("convert", cmd))
+                with open(cmd[cmd.index("-o") + 1], "wb") as fh:
+                    fh.write(b"converted")
+                return None
+            provider.run = fake_run
+
+            provider.synthesize("hello", "/tmp/rvc-out.wav")
+        os.unlink("/tmp/rvc-out.wav")
+
+        self.assertEqual(calls[0][0], "base")
+        self.assertEqual(calls[1][0], "convert")
+        # the temp base wav must not survive the call
+        base_wav_path = calls[0][2]
+        self.assertFalse(os.path.exists(base_wav_path))
+
+    def test_check_reports_missing_python(self):
+        provider = RvcProvider(dict(config.DEFAULTS["providers"]["rvc"]), cfg={})
+        ok, message = provider.check()
+        self.assertFalse(ok)
+        self.assertIn("rvc.python", message)
 
 
 class CommandProviderTest(unittest.TestCase):
@@ -1099,6 +1330,20 @@ class CliTest(unittest.TestCase):
 
     def test_skills_subcommand_reports_status(self):
         self.assertEqual(main(["skills"]), 0)
+
+    def test_skills_print_outputs_the_bundled_skill_verbatim(self):
+        import io
+        from unittest import mock
+        captured = io.StringIO()
+        with mock.patch.object(sys, "stdout", captured):
+            self.assertEqual(main(["skills", "--print", "local-tts-update"]), 0)
+        self.assertEqual(captured.getvalue(), skills.read_skill("local-tts-update"))
+
+    def test_skills_print_rejects_an_unknown_name(self):
+        self.assertEqual(main(["skills", "--print", "not-a-real-skill"]), 1)
+
+    def test_skills_print_cannot_combine_with_install(self):
+        self.assertEqual(main(["skills", "--print", "local-tts-update", "--install"]), 1)
 
     def test_languages_subcommand(self):
         self.assertEqual(main(["languages"]), 0)

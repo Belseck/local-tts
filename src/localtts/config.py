@@ -70,6 +70,34 @@ DEFAULTS = {
             "speaker": None,       # speaker id for multi-speaker voices
             "extra_args": [],
         },
+        "kokoro": {
+            "binary": "kokoro-tts",
+            # Optional. Only some kokoro CLIs need this (see providers/kokoro.py);
+            # leave empty unless yours resolves its model files by working directory.
+            "model_dir": "",
+            "voice": "",    # empty => the binary's own default
+            "lang": "",     # empty => the binary's own default
+            "speed": 1.0,
+            "extra_args": [],
+        },
+        "rvc": {
+            # rvc-python (https://github.com/daswer123/rvc-python) does audio-to-audio
+            # voice conversion only, no text-to-speech -- it is never installed
+            # automatically by this tool. Point at the interpreter from whatever venv
+            # it was installed into once a human has chosen to install it.
+            "python": "",
+            # Which provider synthesizes the base voice before conversion. Empty means
+            # "whatever the overall default provider is" at the time this runs.
+            "base_provider": "",
+            "model": "",            # path to a .pth voice model
+            "index": "",            # optional .index file, improves quality
+            "device": "cpu",
+            "pitch": 0,             # semitone shift
+            "method": "",           # pitch extraction: harvest, crepe, rmvpe, pm; "" => rvc-python's default
+            "index_rate": None,     # None => let rvc-python use its own default
+            "protect": None,
+            "extra_args": [],
+        },
         "command": {
             # Escape hatch: any CLI that writes a wav file.
             # {text} and {output} are substituted as single argv items.
@@ -269,3 +297,64 @@ def set_values(assignments):
 
 
 coerce = _coerce  # public alias for the CLI
+
+
+#: Providers that started life as `command` templates before local-tts supported them
+#: natively. Detected by a substring in the template's binary name or arguments; flags
+#: are mapped to the equivalent native provider's own setting keys. Extend this when a
+#: new provider is added that people would plausibly have wired through `command` first.
+MIGRATIONS = {
+    "kokoro": {
+        "match": ("kokoro-tts", "kokoro_cli"),
+        "flags": {"-v": "voice", "--voice": "voice", "-l": "lang", "--lang": "lang",
+                  "-s": "speed", "--speed": "speed"},
+    },
+    "rvc": {
+        "match": ("rvc_python", "rvc-python"),
+        "flags": {"-mp": "model", "--model": "model", "-ip": "index", "--index": "index",
+                  "-de": "device", "--device": "device", "-pi": "pitch", "--pitch": "pitch",
+                  "-me": "method", "--method": "method"},
+    },
+}
+
+
+def detect_migrations(cfg):
+    """Look at the configured `command.template` for a tool local-tts now supports as a
+    real provider. Returns a list of {"provider", "reason", "sets"} -- informational
+    only, nothing here writes anything; the caller decides whether to apply `sets` via
+    set_values() after asking. `sets` maps "<provider>.<key>" to the value found in the
+    template, and always includes "provider" only when the migrated provider is the one
+    currently active (so a suggestion never implies switching the default unprompted).
+    """
+    import shlex
+
+    template = ((cfg.get("providers") or {}).get("command") or {}).get("template") or ""
+    if not template:
+        return []
+    try:
+        tokens = shlex.split(template)
+    except ValueError:
+        return []
+    if not tokens:
+        return []
+
+    haystack = " ".join(tokens).lower()
+    found = []
+    for provider_name, spec in MIGRATIONS.items():
+        if not any(marker in haystack for marker in spec["match"]):
+            continue
+        sets = {}
+        for index, token in enumerate(tokens):
+            key = spec["flags"].get(token)
+            if key and index + 1 < len(tokens):
+                value = tokens[index + 1]
+                if value not in ("{text}", "{output}"):
+                    sets["%s.%s" % (provider_name, key)] = value
+        found.append({
+            "provider": provider_name,
+            "reason": "command.template runs %r, which local-tts now supports natively"
+                      % os.path.basename(tokens[0]),
+            "sets": sets,
+            "was_default": cfg.get("provider") == "command",
+        })
+    return found

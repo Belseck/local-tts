@@ -29,17 +29,23 @@ anything** — it usually names the exact problem.
 - If `tts` itself is missing, that is a full install: follow `AGENT_INSTALL.md` in the
   local-tts repository, not this skill.
 
-## The four backends
+## The six backends
 
 | Backend | Offline | Languages | Needs |
 | --- | --- | --- | --- |
 | `llamacpp` (default) | yes | **English, Chinese, Japanese, Korean only** | `llama-tts` binary |
 | `piper` | yes | ~40 languages, fast | `piper` binary + a `.onnx` voice |
+| `kokoro` | yes | ~40 languages, small model | a `kokoro-tts` wrapper (set up below) |
 | `openai` | no | whatever the endpoint offers | a URL, and a key only for api.openai.com |
+| `rvc` | yes | inherits its base provider's | **not installed automatically** — see below |
 | `command` | yes | whatever the tool offers | any binary that writes a WAV |
 
 **The single most common problem:** the user's text is not in one of llamacpp's four
 languages, so it is pronounced with English phonetics. The fix is piper, not a setting.
+
+**If the user has an existing `command.template`** wired to something that now has a real
+provider above (kokoro, rvc), run `tts config --detect-migrations` and offer to switch —
+full workflow in the `local-tts-update` skill, since that's checked on every update too.
 
 ## Adding a language with piper
 
@@ -115,6 +121,119 @@ tts --lang es "Prueba de voz."
 
 Recording the language is not optional bookkeeping — it is how every agent knows what to
 use next time.
+
+## Adding Kokoro (small, fast, offline, many languages)
+
+Kokoro-82M is a comparable alternative to piper — similar footprint, similar language
+coverage. Reach for it when the user specifically wants Kokoro, or when piper's available
+voices don't cover what they need.
+
+There is no single official CLI to install; the simplest reliable path is a minimal
+wrapper around the `kokoro`/`kokoro-onnx` Python package, kept in its own venv the same
+way piper is:
+
+```bash
+python3 -m venv ~/.local/share/kokoro-venv
+~/.local/share/kokoro-venv/bin/pip install kokoro-onnx soundfile
+
+mkdir -p ~/.local/share/kokoro-models && cd ~/.local/share/kokoro-models
+# fetch kokoro-v1.0.onnx and voices-v1.0.bin -- ask the user before downloading;
+# they're published at https://github.com/nazdridoy/kokoro-tts/releases
+```
+
+Write the wrapper script (`~/.local/share/kokoro-venv/kokoro_cli.py`):
+
+```python
+#!/usr/bin/env python3
+import argparse, os, sys, warnings
+warnings.filterwarnings("ignore")
+MODELS = os.path.expanduser("~/.local/share/kokoro-models")
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("-o", "--output", required=True)
+    p.add_argument("-v", "--voice", default="af_heart")
+    p.add_argument("-l", "--lang", default="en-us")
+    p.add_argument("-s", "--speed", type=float, default=1.0)
+    p.add_argument("text", nargs="*")
+    a = p.parse_args()
+    text = " ".join(a.text).strip() or sys.stdin.read().strip()
+    if not text:
+        sys.exit("kokoro-tts: no text")
+    import soundfile as sf
+    from kokoro_onnx import Kokoro
+    k = Kokoro(f"{MODELS}/kokoro-v1.0.onnx", f"{MODELS}/voices-v1.0.bin")
+    samples, rate = k.create(text, voice=a.voice, speed=a.speed, lang=a.lang)
+    sf.write(a.output, samples, rate)
+
+if __name__ == "__main__":
+    main()
+```
+
+And a thin shell shim on PATH so `kokoro.binary`'s default (`kokoro-tts`) finds it:
+
+```bash
+mkdir -p ~/.local/bin
+cat > ~/.local/bin/kokoro-tts <<'EOF'
+#!/usr/bin/env bash
+exec "$HOME/.local/share/kokoro-venv/bin/python" \
+     "$HOME/.local/share/kokoro-venv/kokoro_cli.py" "$@"
+EOF
+chmod +x ~/.local/bin/kokoro-tts
+```
+
+Ask which voice and language the user wants — voice IDs are per-language (e.g. `af_heart`
+for US English, `ef_dora` for Spanish; the underlying model card lists the full set) —
+then register and record it the same way as piper:
+
+```bash
+tts config --set kokoro.voice=ef_dora
+tts config --set kokoro.lang=es
+tts languages --set es=kokoro
+tts --lang es "Prueba de voz con Kokoro."
+```
+
+`kokoro.model_dir` is a separate, optional setting for a *different* kind of kokoro CLI
+(one that resolves its model files from its own working directory rather than managing
+them internally, like this wrapper does) — leave it unset for the setup above.
+
+## Adding RVC (voice conversion — not installed automatically)
+
+RVC (retrieval-based voice conversion) does **not** do text-to-speech. `rvc-python`
+converts an existing audio file to a target voice; it has no text input at all. The `rvc`
+provider handles this by chaining: it synthesizes with another provider first (piper by
+default, or whatever `rvc.base_provider` names), then converts that result to the target
+voice. This is for a specific, deliberate ask — "make it sound like this voice" with a
+trained `.pth` model in hand — not a general voice-quality upgrade; point most requests at
+piper or kokoro instead.
+
+**Always ask before installing.** rvc-python pulls in torch and is sizable — never install
+it as a side effect of a routine request.
+
+```bash
+python3 -m venv ~/.local/share/rvc-venv
+~/.local/share/rvc-venv/bin/pip install rvc-python
+# GPU support needs a matching torch build -- see https://github.com/daswer123/rvc-python
+# for the exact index URL; ask the user whether they have a GPU before adding it.
+```
+
+The user needs an actual trained voice model — a `.pth` file, plus an optional `.index`
+file that improves quality — from wherever they trained or downloaded one (out of scope
+here; this skill only wires up whatever they already have).
+
+```bash
+tts config --set rvc.python=~/.local/share/rvc-venv/bin/python
+tts config --set rvc.model=~/.local/share/rvc-models/<name>/<name>.pth
+tts config --set rvc.index=~/.local/share/rvc-models/<name>/<index-file>     # optional
+tts config --set rvc.base_provider=piper     # or kokoro/llamacpp -- whichever gives the
+                                              # best base voice to convert from
+tts -p rvc --dry-run "test"    # shows both steps: base synthesis, then conversion
+tts -p rvc "Test of the converted voice."
+```
+
+`rvc.device` defaults to `cpu`; set it to `cuda:0` only if the venv above actually has a
+CUDA-enabled torch installed. There is no `rvc.voice` — voice comes entirely from which
+`.pth` model is configured, not a per-call flag.
 
 ## The language memory
 
