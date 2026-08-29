@@ -323,7 +323,14 @@ tts resume
 tts stop
 ```
 
-Starting a new background playback stops the previous one, so voices never stack.
+Starting a new background playback stops the previous one *in the same session*, so
+voices never stack there. Separately, playback is also serialized machine-wide: if
+another session (a second agent, a second terminal) already has audio playing, a new
+`-b` call queues behind it instead of overlapping — only one file ever plays at a time,
+no matter which provider or session started it. The CLI call itself still returns
+immediately either way; only the actual audio start is deferred. `tts playback` shows
+`0:00` and holds there while queued, then starts advancing once its turn begins.
+
 `pause`/`resume` use `SIGSTOP`/`SIGCONT` and therefore work on Linux, macOS and WSL; on
 native Windows they report that they are unsupported and `stop` is the control.
 
@@ -481,7 +488,11 @@ tts stop --session "$CLAUDE_CODE_SESSION_ID"
 ```
 
 Playback state is stored per session; starting playback only stops a *previous* playback
-from the *same* session. `--session` is auto-detected when omitted — currently from
+from the *same* session, and `stop`/`pause`/`resume`/`playback` only ever act on your own
+session's audio. What two sessions *can't* do is talk over each other: actual audio output
+is serialized machine-wide (see [Background playback](#background-playback)) — a second
+session's `-b` call queues rather than overlapping, it just doesn't stop or otherwise touch
+the first session's state while it waits. `--session` is auto-detected when omitted — currently from
 `$CLAUDE_CODE_SESSION_ID`, verified by capturing a live status-line payload from Claude Code
 and confirming it carries the exact same value in its `session_id` field, which is also how
 the status-bar hook knows which session's progress to show. Omit `--session` entirely and
@@ -711,6 +722,8 @@ tts -p kokoro "Prueba de voz con Kokoro."
 | `lang` | *(empty)* | Language code. Empty uses the binary's own default. |
 | `speed` | `1.0` | Playback speed multiplier. |
 | `extra_args` | `[]` | Extra flags appended verbatim. |
+| `server_url` | *(empty)* | Optional. See [Optional: a persistent server](#optional-a-persistent-server-kokoro--rvc) below. |
+| `server_start`, `server_timeout` | *(empty)*, `30` | Command to auto-start the server, and how long to wait for it. |
 
 ### `rvc` — voice conversion (not installed automatically)
 
@@ -747,8 +760,36 @@ tts -p rvc "Test of the converted voice."
 | `method` | *(empty)* | Pitch extraction algorithm: `harvest`, `crepe`, `rmvpe`, `pm`. Empty uses rvc-python's default. |
 | `index_rate`, `protect` | *(empty)* | Passed through to rvc-python when set. |
 | `extra_args` | `[]` | Extra flags appended verbatim. |
+| `server_url` | *(empty)* | Optional. See [Optional: a persistent server](#optional-a-persistent-server-kokoro--rvc) below. |
+| `server_start`, `server_timeout` | *(empty)*, `60` | Command to auto-start the server, and how long to wait for it (a torch load is slower than kokoro's). |
 
 There is no `rvc.voice` — the voice comes entirely from which `.pth` model is configured.
+
+### Optional: a persistent server (kokoro / rvc)
+
+Both providers above reload their model from disk on every call by default. If that's slow
+enough to matter, either can instead talk to a small persistent server that loads the model
+once and serves requests over `localhost` — this tool never runs that server itself, it's a
+short script you write into the provider's own venv (the `local-tts-configure` skill has
+the exact script for both, self-contained, stdlib `http.server` only):
+
+```bash
+tts config --set kokoro.server_url=http://127.0.0.1:8765
+tts config --set 'kokoro.server_start=~/.local/share/kokoro-venv/bin/python ~/.local/share/kokoro-venv/kokoro_server.py --port 8765'
+tts -p kokoro "test"     # auto-starts it on first use (a few seconds), fast after that
+```
+
+Auto-start polls `server_url`'s `/health` until it answers or `server_timeout` elapses,
+then the request goes through as an HTTP POST instead of a subprocess call — voice,
+language and speed still travel per request, not fixed to whatever the server started
+with. `tts check` reports whether it's running or will auto-start, without starting it
+itself. **It exits on its own after 5 minutes idle** to release the model (a real cost for
+rvc's torch model in particular) — configurable via `--idle-timeout SECONDS` in
+`server_start` (`0` disables it); the next call after it exits just starts a fresh one.
+
+For `rvc`, the model is fixed at server startup (`--model`/`--index` in `server_start`),
+not per request — that's inherent to keeping one loaded; switching voices means changing
+those and restarting the server.
 
 ### `command` — anything else
 

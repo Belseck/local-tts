@@ -13,6 +13,7 @@ import tempfile
 import time
 import wave
 
+from localtts import lock as filelock
 from localtts.errors import TTSError
 
 # (executable, argv builder) in preference order.
@@ -91,20 +92,38 @@ def _first_player(path):
     return None
 
 
+def playback_lock_path():
+    """Where the machine-wide "only one audio at a time" lock lives -- derived from
+    STATE_FILE's own directory (like state_path()) so tests that redirect STATE_FILE
+    into a temp dir for sandboxing redirect this too, instead of every test process
+    fighting over the one real lock file."""
+    return os.path.join(os.path.dirname(STATE_FILE), "local-tts-playback.lock")
+
+
 def play(path, preferred="", verbose=False):
-    """Play a file. Returns True if something played, False if no player exists."""
+    """Play a file. Returns True if something played, False if no player exists.
+
+    Blocks (holding a machine-wide lock) until any other local-tts playback --
+    any session, any provider -- currently in progress finishes, so audio never
+    overlaps.
+    """
     cmd = find_player(path, preferred)
     if not cmd:
         return False
     if verbose:
         print("+ %s" % " ".join(cmd), file=sys.stderr)
     stream = None if verbose else subprocess.DEVNULL
-    try:
-        subprocess.run(cmd, check=True, stdout=stream, stderr=stream)
-    except subprocess.CalledProcessError as exc:
-        raise TTSError("playback failed (%s exited with %d)" % (cmd[0], exc.returncode))
-    except KeyboardInterrupt:
-        return True
+    with open(playback_lock_path(), "a+") as handle:
+        filelock.acquire(handle)
+        try:
+            try:
+                subprocess.run(cmd, check=True, stdout=stream, stderr=stream)
+            except subprocess.CalledProcessError as exc:
+                raise TTSError("playback failed (%s exited with %d)" % (cmd[0], exc.returncode))
+            except KeyboardInterrupt:
+                return True
+        finally:
+            filelock.release(handle)
     return True
 
 
@@ -225,7 +244,17 @@ def is_running(pid):
 
 
 def play_detached(path, preferred="", verbose=False, session=None):
-    """Start playback in the background. Returns (pid, duration_seconds), or (None, 0)."""
+    """Start playback in the background. Returns (pid, duration_seconds), or (None, 0).
+
+    Does not itself block, but the audio may: it's queued behind a small runner
+    process (see _playback_runner.py) that waits its turn on the machine-wide
+    playback lock -- shared with play() and every other session -- before
+    actually starting the player, so at most one stream plays at a time no
+    matter which provider or session queued it. The returned pid is the
+    runner's, which stays alive for the whole wait-then-play span and is what
+    stop/pause/resume act on (signaled as a process group, since the runner's
+    child player shares it).
+    """
     cmd = find_player(path, preferred)
     if not cmd:
         return None, 0.0
@@ -233,21 +262,25 @@ def play_detached(path, preferred="", verbose=False, session=None):
         print("+ %s &" % " ".join(cmd), file=sys.stderr)
 
     stop_previous(session=session)   # one playback at a time PER SESSION, not machine-wide
-    stream = None if verbose else subprocess.DEVNULL
-    kwargs = {"stdout": stream, "stderr": stream, "stdin": subprocess.DEVNULL}
+    try:
+        length = duration(path)
+    except (wave.Error, EOFError, OSError):
+        length = 0.0
+
+    runner_cmd = [sys.executable, "-m", "localtts._playback_runner",
+                 playback_lock_path(), session or ""] + cmd
+    kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "stdin": subprocess.DEVNULL}
     if sys.platform == "win32":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     else:
         kwargs["start_new_session"] = True
     try:
-        process = subprocess.Popen(cmd, **kwargs)
+        process = subprocess.Popen(runner_cmd, **kwargs)
     except OSError as exc:
         raise TTSError("could not start %s: %s" % (cmd[0], exc))
-    try:
-        length = duration(path)
-    except (wave.Error, EOFError, OSError):
-        length = 0.0
-    _write_state(process.pid, path, duration_seconds=length, segment_start=time.time(), session=session)
+    # segment_start=None until the runner actually gets its turn (see main() there) --
+    # otherwise elapsed-time display would tick while the audio is still silently queued.
+    _write_state(process.pid, path, duration_seconds=length, segment_start=None, session=session)
     return process.pid, length
 
 
@@ -271,7 +304,7 @@ def _signal_playback(sig, name, paused, session=None):
     if sig is None:
         return False, ("%s is not supported on this platform; use `stop` instead" % name)
     try:
-        os.kill(pid, sig)
+        os.killpg(pid, sig)   # reaches the runner and its player child together (same group)
     except OSError as exc:
         return False, "could not %s pid %d: %s" % (name, pid, exc)
 
@@ -303,15 +336,17 @@ def stop_playback(session=None):
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
                        capture_output=True, check=False)
     else:
-        # Resume first: a paused process never sees SIGTERM.
+        # Resume first: a paused process never sees SIGTERM. killpg reaches the runner
+        # and its player child together (same process group) whichever phase it's in --
+        # still waiting its turn on the playback lock, or already playing.
         cont = getattr(signal, "SIGCONT", None)
         if cont is not None:
             try:
-                os.kill(pid, cont)
+                os.killpg(pid, cont)
             except OSError:
                 pass
         try:
-            os.kill(pid, signal.SIGTERM)
+            os.killpg(pid, signal.SIGTERM)
         except OSError as exc:
             return False, "could not stop pid %d: %s" % (pid, exc)
     path = state.get("path")

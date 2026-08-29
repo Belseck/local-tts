@@ -96,8 +96,12 @@ class RvcProvider(Provider):
         os.close(handle)
         try:
             textutil.synthesize_chunked(base, text, base_wav, voice=voice)
-            cmd = self.build_command(base_wav, out_path)
-            self.run(cmd)
+            server_url = self.settings.get("server_url")
+            if server_url:
+                self._convert_via_server(server_url, base_wav, out_path)
+            else:
+                cmd = self.build_command(base_wav, out_path)
+                self.run(cmd)
         finally:
             if os.path.exists(base_wav):
                 os.unlink(base_wav)
@@ -106,7 +110,38 @@ class RvcProvider(Provider):
             raise TTSError("rvc-python wrote no audio to %s" % out_path)
         return out_path
 
+    def _convert_via_server(self, server_url, wav_in, out_path):
+        """Talk to a persistent server that already has the model (and torch) loaded,
+        instead of paying that cost on every call. The model/index is fixed at server
+        startup -- rvc.model/rvc.index configure the CLI fallback above, not a running
+        server; restart the server with different startup args to change its voice."""
+        self.ensure_server(server_url, self.settings.get("server_start"),
+                           float(self.settings.get("server_timeout") or 60))
+        payload = {"input_path": os.path.abspath(wav_in)}
+        pitch = self.settings.get("pitch")
+        if pitch:
+            payload["pitch"] = pitch
+        device = self.settings.get("device")
+        if device:
+            payload["device"] = str(device)
+        audio = self.post_for_audio(server_url, "/convert", payload)
+        with open(out_path, "wb") as fh:
+            fh.write(audio)
+
     def check(self):
+        server_url = self.settings.get("server_url")
+        if server_url:
+            # A quick probe only -- tts check must not have the side effect of starting
+            # a server (a torch model load is exactly the cost this mode exists to avoid
+            # paying casually).
+            if self.server_alive(server_url):
+                detail = "server at %s (already running)" % server_url
+            elif self.settings.get("server_start"):
+                detail = "server at %s (not running yet -- starts automatically on first use)" % server_url
+            else:
+                return False, "server at %s is not running, and no server_start is configured" % server_url
+            return True, "%s, base voice from %s" % (detail, self._base_name())
+
         try:
             python = self._python()
         except TTSError as exc:

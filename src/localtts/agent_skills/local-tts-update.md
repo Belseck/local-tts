@@ -128,6 +128,14 @@ wrapper script `tts hooks --install` writes is also generated once, not linked l
 tts hooks --install     # only if `tts hooks --status` shows one is active
 ```
 
+**A kokoro or rvc persistent server**, if either is configured (`kokoro.server_url` /
+`rvc.server_url` set — `tts check` shows whether one is currently running). Its script is
+also a copy, written into the provider's own venv, never touched by `git pull`. This only
+matters if step 3's commit list mentions the server protocol (the `/synthesize` or
+`/convert` request shape) changing — if so, kill the running process; the next call starts
+a fresh one from whatever script is on disk. Otherwise leave it running, there's nothing to
+do here.
+
 ## 7. Check for a `command` provider that a new update now supports natively
 
 Before local-tts had a real `kokoro` or `rvc` provider, the only way to drive either was

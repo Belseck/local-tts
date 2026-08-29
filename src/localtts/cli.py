@@ -203,6 +203,7 @@ def speak(argv):
         if len(pieces) > 1:
             print("# %d words -> %d chunks of <=%d words, joined into one file"
                   % (len(text.split()), len(pieces), provider.max_words))
+        server_url = provider.settings.get("server_url")
         if provider.name == "rvc":
             # rvc has no single command: it synthesizes with another provider first,
             # then converts the result. build_command(wav_in, out_path) only covers the
@@ -221,7 +222,14 @@ def speak(argv):
                     base_cmd = base_builder(pieces[0], "<base-voice.wav>")
                 print(" ".join(base_cmd))
             print("# step 2: convert to the target voice")
-            print(" ".join(provider.build_command("<base-voice.wav>", out_path)))
+            if server_url:
+                print("# POST %s/convert (auto-starts via rvc.server_start if not "
+                      "already running)" % server_url)
+            else:
+                print(" ".join(provider.build_command("<base-voice.wav>", out_path)))
+        elif server_url:
+            print("# %s: POST %s/synthesize (auto-starts via %s.server_start if not "
+                  "already running)" % (provider.name, server_url, provider.name))
         else:
             builder = getattr(provider, "build_command", None)
             if builder is None:

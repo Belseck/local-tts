@@ -1,5 +1,6 @@
 """Stdlib-only tests: python -m unittest discover -s tests"""
 
+import http.server
 import json
 import os
 import signal
@@ -161,6 +162,196 @@ class LlamaCppTest(unittest.TestCase):
         self.assertEqual(self.build(max_workers=0).max_workers, 1)  # clamped to at least 1
 
 
+class _FakeAudioServer:
+    """A minimal real HTTP server (stdlib http.server, its own thread) for testing the
+    server-mode client path: GET /health, and one POST route that records the JSON body
+    it received and returns canned bytes. Used instead of mocking urllib so the actual
+    request/response wire format is exercised, not just the call site."""
+
+    def __init__(self, route, audio_bytes=b"RIFF....WAVEfake", status=200, healthy=True):
+        self.route = route
+        self.audio_bytes = audio_bytes
+        self.status = status
+        self.healthy = healthy
+        self.requests = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if self.path == "/health" and outer.healthy:
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+                else:
+                    self.send_response(503)
+                    self.end_headers()
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                outer.requests.append(json.loads(body) if body else {})
+                if self.path == outer.route:
+                    self.send_response(outer.status)
+                    self.send_header("Content-Type", "audio/wav")
+                    self.end_headers()
+                    if outer.status < 300:
+                        self.wfile.write(outer.audio_bytes)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        self.httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d" % self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=5)
+
+
+class ServerModeTest(unittest.TestCase):
+    """Provider.ensure_server()/server_alive()/post_for_audio() -- the shared client-side
+    plumbing kokoro and rvc both use for their optional persistent-server mode."""
+
+    def build(self):
+        return Provider({}, verbose=False)
+
+    def test_server_alive_true_for_a_real_reachable_server(self):
+        server = _FakeAudioServer("/x")
+        self.addCleanup(server.stop)
+        self.assertTrue(self.build().server_alive(server.url))
+
+    def test_server_alive_false_when_nothing_is_listening(self):
+        self.assertFalse(self.build().server_alive("http://127.0.0.1:1"))
+
+    def test_server_alive_false_when_health_reports_unhealthy(self):
+        server = _FakeAudioServer("/x", healthy=False)
+        self.addCleanup(server.stop)
+        self.assertFalse(self.build().server_alive(server.url))
+
+    def test_ensure_server_is_a_noop_when_already_alive(self):
+        server = _FakeAudioServer("/x")
+        self.addCleanup(server.stop)
+        self.build().ensure_server(server.url, start_command="", timeout=5)   # must not raise
+
+    def test_ensure_server_raises_when_unreachable_and_no_start_command(self):
+        with self.assertRaises(TTSError) as caught:
+            self.build().ensure_server("http://127.0.0.1:1", start_command="", timeout=1)
+        self.assertIn("server_start", str(caught.exception))
+
+    def test_ensure_server_auto_starts_a_real_subprocess_and_waits_for_it(self):
+        # A genuine end-to-end exercise of the auto-start path: a real subprocess that
+        # starts listening only after a short delay, proving ensure_server() actually
+        # polls rather than checking once and giving up. The handler must return 2xx --
+        # a bare BaseHTTPRequestHandler 501s on GET, which server_alive() correctly
+        # treats as down, so this builds one that answers /health properly.
+        import socket
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        script = (
+            "import time, http.server; time.sleep(0.4); "
+            "H = type('H', (http.server.BaseHTTPRequestHandler,), "
+            "{'do_GET': lambda self: (self.send_response(200), self.end_headers())}); "
+            "h = http.server.HTTPServer(('127.0.0.1', %d), H); "
+            "h.timeout = 5; h.handle_request()" % port
+        )
+        start_command = "%s -c \"%s\"" % (sys.executable, script)
+        provider = self.build()
+        provider.ensure_server("http://127.0.0.1:%d" % port, start_command, timeout=10)
+
+    def test_ensure_server_raises_if_the_start_command_never_comes_up(self):
+        with self.assertRaises(TTSError) as caught:
+            self.build().ensure_server("http://127.0.0.1:%d" % 1,
+                                       start_command="%s -c \"pass\"" % sys.executable,
+                                       timeout=1)
+        self.assertIn("nothing answered", str(caught.exception))
+
+    def test_ensure_server_rejects_unparseable_start_command(self):
+        with self.assertRaises(TTSError):
+            self.build().ensure_server("http://127.0.0.1:1", start_command="unterminated '",
+                                       timeout=1)
+
+    def test_concurrent_ensure_server_only_spawns_it_once(self):
+        # The real scenario this guards against: several separate local-tts processes
+        # (different agent sessions) all find the server down at once and each try to
+        # start it, racing for the same port. Genuinely separate OS processes here, not
+        # threads, since the lock is a cross-process file lock (flock/msvcrt.locking) --
+        # a threads-only test wouldn't exercise that code path meaningfully.
+        import socket
+        import subprocess
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        url = "http://127.0.0.1:%d" % port
+
+        with tempfile.TemporaryDirectory() as tmp:
+            start_log = os.path.join(tmp, "starts.log")
+            # Deliberately slow to start (0.5s) so several racing processes are very
+            # likely to all observe "down" before the winner's server comes up --
+            # otherwise the test could pass by accident (each one serialized late
+            # enough to see the previous one already alive) rather than by the lock.
+            start_script = (
+                "import http.server, time; "
+                "open(%r, 'a').write('x\\n'); "
+                "time.sleep(0.5); "
+                "H = type('H', (http.server.BaseHTTPRequestHandler,), "
+                "{'do_GET': lambda self: (self.send_response(200), self.end_headers())}); "
+                "h = http.server.HTTPServer(('127.0.0.1', %d), H); "
+                "h.serve_forever()" % (start_log, port)
+            )
+            start_command = "%s -c \"%s\"" % (sys.executable, start_script)
+
+            worker_script = (
+                "import sys; sys.path.insert(0, %r); "
+                "from localtts.providers.base import Provider; "
+                "Provider({}, verbose=False).ensure_server(%r, %r, 15)"
+                % (os.path.join(os.path.dirname(__file__), "..", "src"), url, start_command)
+            )
+            workers = [
+                subprocess.Popen([sys.executable, "-c", worker_script],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                for _ in range(5)
+            ]
+            try:
+                results = [w.wait(timeout=25) for w in workers]
+                self.assertEqual(results, [0] * 5, "every concurrent caller must succeed")
+                with open(start_log) as fh:
+                    spawns = fh.read().count("x")
+                self.assertEqual(spawns, 1, "exactly one process must have actually spawned the server")
+            finally:
+                # ensure_server() starts the fake server detached (start_new_session=True)
+                # so it outlives every worker process; it would otherwise leak past the test.
+                subprocess.run(["pkill", "-f", start_log], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def test_post_for_audio_returns_the_response_body(self):
+        server = _FakeAudioServer("/synthesize", audio_bytes=b"the-audio-bytes")
+        self.addCleanup(server.stop)
+        audio = self.build().post_for_audio(server.url, "/synthesize", {"text": "hi"})
+        self.assertEqual(audio, b"the-audio-bytes")
+        self.assertEqual(server.requests, [{"text": "hi"}])
+
+    def test_post_for_audio_raises_on_empty_response(self):
+        server = _FakeAudioServer("/synthesize", audio_bytes=b"")
+        self.addCleanup(server.stop)
+        with self.assertRaises(TTSError):
+            self.build().post_for_audio(server.url, "/synthesize", {})
+
+    def test_post_for_audio_raises_with_server_body_on_http_error(self):
+        server = _FakeAudioServer("/synthesize", status=500)
+        self.addCleanup(server.stop)
+        with self.assertRaises(TTSError) as caught:
+            self.build().post_for_audio(server.url, "/synthesize", {})
+        self.assertIn("500", str(caught.exception))
+
+
 class KokoroProviderTest(unittest.TestCase):
     """Targets the real interface: -o/-v/-l/-s flags, text as a trailing positional arg
     (not stdin) -- confirmed against an actual installed `kokoro-tts` wrapper."""
@@ -235,6 +426,50 @@ class KokoroProviderTest(unittest.TestCase):
         cmd = self.build(voice="ef_dora", lang="es").build_command("hola", "/tmp/a.wav")
         self.assertEqual(cmd, ["/usr/bin/kokoro-tts", "-o", "/tmp/a.wav",
                               "-v", "ef_dora", "-l", "es", "hola"])
+
+    def test_server_mode_posts_text_voice_lang_speed_and_writes_the_response(self):
+        server = _FakeAudioServer("/synthesize", audio_bytes=b"kokoro-server-audio")
+        self.addCleanup(server.stop)
+        provider = self.build(voice="ef_dora", lang="es", speed=1.3, server_url=server.url)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.wav")
+            provider.synthesize("hola", out)
+            self.assertEqual(open(out, "rb").read(), b"kokoro-server-audio")
+        self.assertEqual(server.requests, [{"text": "hola", "voice": "ef_dora",
+                                            "lang": "es", "speed": 1.3}])
+
+    def test_server_mode_never_spawns_the_subprocess_binary(self):
+        # build()'s resolve_binary stub points at a path that doesn't exist on disk, so
+        # if synthesize() mistakenly took the subprocess route despite server_url being
+        # set, self.run() would raise "command not found" here.
+        server = _FakeAudioServer("/synthesize")
+        self.addCleanup(server.stop)
+        provider = self.build(server_url=server.url)
+        with tempfile.TemporaryDirectory() as tmp:
+            provider.synthesize("hola", os.path.join(tmp, "out.wav"))   # must not raise
+
+    def test_server_mode_auto_starts_when_configured_and_unreachable(self):
+        provider = self.build(server_url="http://127.0.0.1:1", server_start="")
+        with self.assertRaises(TTSError) as caught:
+            provider.synthesize("hola", "/tmp/x.wav")
+        self.assertIn("server_start", str(caught.exception))
+
+    def test_check_reports_server_reachable(self):
+        server = _FakeAudioServer("/synthesize")
+        self.addCleanup(server.stop)
+        ok, message = self.build(server_url=server.url).check()
+        self.assertTrue(ok)
+        self.assertIn("already running", message)
+
+    def test_check_reports_server_will_autostart(self):
+        ok, message = self.build(server_url="http://127.0.0.1:1",
+                                 server_start="echo hi").check()
+        self.assertTrue(ok)
+        self.assertIn("starts automatically", message)
+
+    def test_check_reports_server_down_with_no_start_command(self):
+        ok, message = self.build(server_url="http://127.0.0.1:1").check()
+        self.assertFalse(ok)
 
 
 class RvcProviderTest(unittest.TestCase):
@@ -338,6 +573,64 @@ class RvcProviderTest(unittest.TestCase):
         ok, message = provider.check()
         self.assertFalse(ok)
         self.assertIn("rvc.python", message)
+
+    def test_server_mode_converts_the_base_wav_via_the_server(self):
+        server = _FakeAudioServer("/convert", audio_bytes=b"rvc-server-audio")
+        self.addCleanup(server.stop)
+
+        class FakeBase:
+            name = "fake"
+            default_format = "wav"
+            max_words = 0
+            max_workers = 1
+
+            def synthesize(self, text, out_path, voice=None):
+                with open(out_path, "wb") as fh:
+                    fh.write(b"RIFF....WAVEfake")
+                return out_path
+
+        provider = self.build(server_url=server.url, pitch=3, device="cuda:0")
+        provider.base_provider_instance = lambda: FakeBase()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.wav")
+            provider.synthesize("hello", out)
+            self.assertEqual(open(out, "rb").read(), b"rvc-server-audio")
+        self.assertEqual(len(server.requests), 1)
+        self.assertEqual(server.requests[0]["pitch"], 3)
+        self.assertEqual(server.requests[0]["device"], "cuda:0")
+        self.assertTrue(server.requests[0]["input_path"].endswith(".wav"))
+
+    def test_server_mode_does_not_require_python_or_model_configured(self):
+        # Server mode is a fully separate path from the subprocess CLI fallback -- the
+        # model is fixed by whatever the server was started with, not rvc.model/rvc.python.
+        server = _FakeAudioServer("/convert")
+        self.addCleanup(server.stop)
+
+        class FakeBase:
+            name = "fake"
+            default_format = "wav"
+            max_words = 0
+            max_workers = 1
+
+            def synthesize(self, text, out_path, voice=None):
+                open(out_path, "wb").write(b"fake")
+                return out_path
+
+        settings = {k: v for k, v in config.DEFAULTS["providers"]["rvc"].items()}
+        settings["server_url"] = server.url
+        cfg = {"provider": "piper", "providers": config.DEFAULTS["providers"]}
+        provider = RvcProvider(settings, cfg=cfg)
+        provider.base_provider_instance = lambda: FakeBase()
+        with tempfile.TemporaryDirectory() as tmp:
+            provider.synthesize("hello", os.path.join(tmp, "out.wav"))   # must not raise
+
+    def test_check_reports_server_reachable(self):
+        server = _FakeAudioServer("/convert")
+        self.addCleanup(server.stop)
+        ok, message = self.build(server_url=server.url).check()
+        self.assertTrue(ok)
+        self.assertIn("already running", message)
+        self.assertIn("base voice from", message)
 
 
 class CommandProviderTest(unittest.TestCase):
@@ -570,8 +863,12 @@ class PlaybackControlTest(unittest.TestCase):
 
     def test_control_a_real_background_process(self):
         import subprocess as sp
+        # start_new_session=True mirrors play_detached()'s own spawn: it's what makes the
+        # pid a process-group leader, which pause/resume/stop now rely on (they signal the
+        # whole group so a runner's player child is reached too, see audio.play_detached()).
         proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
-                        stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+                        stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+                        start_new_session=(sys.platform != "win32"))
         self.addCleanup(proc.kill)
         audio._write_state(proc.pid, "/tmp/x.wav")
 
@@ -594,7 +891,8 @@ class PlaybackControlTest(unittest.TestCase):
     def test_starting_playback_stops_the_previous_one(self):
         import subprocess as sp
         proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
-                        stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+                        stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+                        start_new_session=(sys.platform != "win32"))
         self.addCleanup(proc.kill)
         audio._write_state(proc.pid, "/tmp/old.wav")
         audio.stop_previous()
@@ -607,6 +905,49 @@ class PlaybackControlTest(unittest.TestCase):
         ok, message = audio.playback_status()
         self.assertTrue(ok)
         self.assertIn("0:04 / 0:12", message)
+
+    def test_two_sessions_never_play_at_the_same_time(self):
+        # The real scenario this guards against: two agent sessions both call `tts -b`
+        # around the same moment. Without a machine-wide lock, both players would run
+        # concurrently and their audio would overlap. Uses a real fake "player"
+        # executable (not a mock) so play_detached()'s actual runner subprocess and
+        # locking path are exercised end to end.
+        script_path = os.path.join(self.tmp.name, "fake_player.py")
+        log_path = os.path.join(self.tmp.name, "plays.log")
+        with open(script_path, "w") as fh:
+            fh.write(
+                "#!/usr/bin/env python3\n"
+                "import os, time\n"
+                "with open(os.environ['PLAYBACK_TEST_LOG'], 'a') as fh:\n"
+                "    fh.write('start %r\\n' % time.time())\n"
+                "time.sleep(0.6)\n"
+                "with open(os.environ['PLAYBACK_TEST_LOG'], 'a') as fh:\n"
+                "    fh.write('end %r\\n' % time.time())\n"
+            )
+        os.chmod(script_path, 0o755)
+        os.environ["PLAYBACK_TEST_LOG"] = log_path
+        self.addCleanup(os.environ.pop, "PLAYBACK_TEST_LOG", None)
+
+        wav_path = os.path.join(self.tmp.name, "does-not-need-to-be-real.wav")
+        pid_a, _ = audio.play_detached(wav_path, preferred=script_path, session="session-a")
+        pid_b, _ = audio.play_detached(wav_path, preferred=script_path, session="session-b")
+        self.assertIsNotNone(pid_a)
+        self.assertIsNotNone(pid_b)
+
+        # Not polling is_running(): this test process is the runners' parent and never
+        # reaps them, so a finished-but-unreaped (zombie) child still answers kill(pid, 0)
+        # -- a test-only artifact, since real `tts -b` usage has the CLI process exit
+        # right after play_detached() returns, letting the OS reap orphans normally.
+        # Both fake players together take ~1.2s serialized; wait comfortably past that.
+        time.sleep(3)
+
+        with open(log_path) as fh:
+            lines = [line.split() for line in fh if line.strip()]
+        self.assertEqual(len(lines), 4, "both fake players must have started and finished: %r" % lines)
+        events = sorted((float(value), kind) for kind, value in lines)
+        # Strictly alternating start/end/start/end proves no overlap -- two starts in a
+        # row (or a start before the previous end) would mean simultaneous playback.
+        self.assertEqual([kind for _, kind in events], ["start", "end", "start", "end"])
 
     def test_elapsed_advances_while_running(self):
         import time as _time
@@ -799,7 +1140,8 @@ class SessionScopingTest(unittest.TestCase):
     def test_stop_only_affects_its_own_session(self):
         import subprocess as sp
         proc_a = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
-                          stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+                          stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+                          start_new_session=(sys.platform != "win32"))
         self.addCleanup(proc_a.kill)
         audio._write_state(proc_a.pid, "/tmp/a.wav", session="session-a")
 
@@ -911,7 +1253,8 @@ class BackgroundSessionCliTest(unittest.TestCase):
     def test_explicit_session_flag_on_stop(self):
         import subprocess as sp
         proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
-                        stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+                        stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+                        start_new_session=(sys.platform != "win32"))
         self.addCleanup(proc.kill)
         audio._write_state(proc.pid, "/tmp/x.wav", session="explicit-session")
         self.assertEqual(main(["stop", "--session", "explicit-session"]), 0)

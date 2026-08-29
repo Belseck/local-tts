@@ -51,6 +51,10 @@ class KokoroProvider(Provider):
         return cmd
 
     def synthesize(self, text, out_path, voice=None):
+        server_url = self.settings.get("server_url")
+        if server_url:
+            return self._synthesize_via_server(server_url, text, out_path, voice)
+
         model_dir = self._model_dir()
         cmd = self.build_command(text, out_path, voice)
         self.run(cmd, cwd=model_dir)
@@ -58,7 +62,39 @@ class KokoroProvider(Provider):
             raise TTSError("kokoro-tts wrote no audio to %s" % out_path)
         return out_path
 
+    def _synthesize_via_server(self, server_url, text, out_path, voice):
+        """Talk to a persistent server that already has the model loaded, instead of
+        spawning kokoro-tts fresh (and reloading its model) for this one call. voice/lang
+        travel per request, same as the subprocess path -- the server holding the model
+        resident doesn't fix them to whatever it started with."""
+        self.ensure_server(server_url, self.settings.get("server_start"),
+                           float(self.settings.get("server_timeout") or 30))
+        payload = {"text": text}
+        chosen_voice = voice or self.settings.get("voice")
+        if chosen_voice:
+            payload["voice"] = chosen_voice
+        lang = self.settings.get("lang")
+        if lang:
+            payload["lang"] = lang
+        speed = self.settings.get("speed")
+        if speed and float(speed) != 1.0:
+            payload["speed"] = float(speed)
+        audio = self.post_for_audio(server_url, "/synthesize", payload)
+        with open(out_path, "wb") as fh:
+            fh.write(audio)
+        return out_path
+
     def check(self):
+        server_url = self.settings.get("server_url")
+        if server_url:
+            # A quick probe only -- tts check must not have the side effect of starting
+            # a server, that's what actually speaking (or a deliberate warmup) does.
+            if self.server_alive(server_url):
+                return True, "server at %s (already running)" % server_url
+            if self.settings.get("server_start"):
+                return True, "server at %s (not running yet -- starts automatically on first use)" % server_url
+            return False, "server at %s is not running, and no server_start is configured" % server_url
+
         try:
             exe = self.resolve_binary("binary", "kokoro-tts")
         except TTSError as exc:

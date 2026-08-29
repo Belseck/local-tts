@@ -197,6 +197,94 @@ tts --lang es "Prueba de voz con Kokoro."
 (one that resolves its model files from its own working directory rather than managing
 them internally, like this wrapper does) — leave it unset for the setup above.
 
+### Optional: keep the model loaded (a persistent server)
+
+The CLI wrapper above reloads the whole model from disk on every single call. For someone
+speaking frequently, that per-call cost adds up. If they ask for that to be faster, offer
+this — **ask before setting it up**, it's an extra background process, not a routine step:
+
+```bash
+cat > ~/.local/share/kokoro-venv/kokoro_server.py <<'EOF'
+#!/usr/bin/env python3
+import argparse, io, json, os, sys, threading, time, warnings
+from http.server import BaseHTTPRequestHandler, HTTPServer
+warnings.filterwarnings("ignore")
+MODELS = os.path.expanduser("~/.local/share/kokoro-models")
+
+def make_handler(kokoro, last_activity):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            # not "activity" -- must not keep the process alive just because polled
+            if self.path == "/health":
+                self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+            else:
+                self.send_response(404); self.end_headers()
+        def do_POST(self):
+            if self.path != "/synthesize":
+                self.send_response(404); self.end_headers(); return
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            text = (body.get("text") or "").strip()
+            if not text:
+                self.send_response(400); self.end_headers(); return
+            import soundfile as sf
+            samples, rate = kokoro.create(text, voice=body.get("voice") or "af_heart",
+                                          speed=float(body.get("speed") or 1.0),
+                                          lang=body.get("lang") or "en-us")
+            buf = io.BytesIO(); sf.write(buf, samples, rate, format="WAV")
+            last_activity[0] = time.time()
+            self.send_response(200); self.send_header("Content-Type", "audio/wav")
+            self.end_headers(); self.wfile.write(buf.getvalue())
+    return Handler
+
+def watch_idle(last_activity, idle_timeout):
+    if idle_timeout <= 0:
+        return
+    while True:
+        time.sleep(10)
+        if time.time() - last_activity[0] > idle_timeout:
+            print("idle for %ds, exiting to release the model" % idle_timeout, file=sys.stderr)
+            os._exit(0)
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--idle-timeout", type=int, default=300,
+                   help="exit after this many idle seconds; 0 disables")
+    args = p.parse_args()
+    from kokoro_onnx import Kokoro
+    print("loading model...", file=sys.stderr)
+    kokoro = Kokoro(f"{MODELS}/kokoro-v1.0.onnx", f"{MODELS}/voices-v1.0.bin")
+    last_activity = [time.time()]
+    threading.Thread(target=watch_idle, args=(last_activity, args.idle_timeout), daemon=True).start()
+    print("ready on port %d (idle timeout %ds)" % (args.port, args.idle_timeout), file=sys.stderr)
+    HTTPServer(("127.0.0.1", args.port), make_handler(kokoro, last_activity)).serve_forever()
+
+if __name__ == "__main__":
+    main()
+EOF
+
+tts config --set kokoro.server_url=http://127.0.0.1:8765
+tts config --set 'kokoro.server_start=~/.local/share/kokoro-venv/bin/python ~/.local/share/kokoro-venv/kokoro_server.py --port 8765'
+tts -p kokoro "Prueba con el servidor."   # auto-starts it (a few seconds, model load),
+                                          # every call after that is fast
+```
+
+Voice, language and speed still travel **per call** — the server holding the model
+resident doesn't fix them to whatever it started with. **It exits on its own after 5
+minutes idle** (`--idle-timeout`, seconds — append e.g. `--idle-timeout 600` to
+`kokoro.server_start` for a different value, or `--idle-timeout 0` to disable it and keep
+it running indefinitely); the next call after it exits just auto-starts a fresh one, paying
+the model-load cost again. Checked in ~10s increments, so actual shutdown can lag the
+configured timeout by up to that much — irrelevant at the 5-minute default. A health check
+(what auto-start's own readiness poll does) does not count as activity and never keeps it
+alive on its own. `tts check` reports whether it's already running, or will auto-start on
+first use, without starting it itself (a check
+should never have the side effect of spinning up a background process). Nothing here is
+run or managed by this tool beyond talking to it and auto-starting it — killing the
+process is how you stop it; the next call starts a fresh one.
+
 ## Adding RVC (voice conversion — not installed automatically)
 
 RVC (retrieval-based voice conversion) does **not** do text-to-speech. `rvc-python`
@@ -235,6 +323,96 @@ tts -p rvc "Test of the converted voice."
 CUDA-enabled torch installed. There is no `rvc.voice` — voice comes entirely from which
 `.pth` model is configured, not a per-call flag.
 
+### Optional: keep the model loaded (a persistent server)
+
+RVC's model load (torch, plus the checkpoint itself) is the slow part of every call — a
+persistent server pays that cost once instead of per call. **Ask before setting this up**,
+same as always for anything that adds a background process:
+
+```bash
+cat > ~/.local/share/rvc-venv/rvc_server.py <<'EOF'
+#!/usr/bin/env python3
+import argparse, json, os, sys, threading, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+def make_handler(rvc, last_activity):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            # not "activity" -- must not keep the process alive just because polled
+            if self.path == "/health":
+                self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+            else:
+                self.send_response(404); self.end_headers()
+        def do_POST(self):
+            if self.path != "/convert":
+                self.send_response(404); self.end_headers(); return
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            input_path = body.get("input_path") or ""
+            if not input_path or not os.path.exists(input_path):
+                self.send_response(400); self.end_headers(); return
+            if "pitch" in body:
+                rvc.set_params(f0up_key=int(body["pitch"]))
+            out_path = input_path + ".converted.wav"
+            rvc.infer_file(input_path, out_path)
+            data = open(out_path, "rb").read()
+            os.unlink(out_path)
+            last_activity[0] = time.time()
+            self.send_response(200); self.send_header("Content-Type", "audio/wav")
+            self.end_headers(); self.wfile.write(data)
+    return Handler
+
+def watch_idle(last_activity, idle_timeout):
+    if idle_timeout <= 0:
+        return
+    while True:
+        time.sleep(10)
+        if time.time() - last_activity[0] > idle_timeout:
+            print("idle for %ds, exiting to release the model" % idle_timeout, file=sys.stderr)
+            os._exit(0)
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--port", type=int, default=8766)
+    p.add_argument("--model", required=True)
+    p.add_argument("--index", default="")
+    p.add_argument("--device", default="cpu")
+    p.add_argument("--idle-timeout", type=int, default=300,
+                   help="exit after this many idle seconds; 0 disables")
+    args = p.parse_args()
+    from rvc_python.infer import RVCInference
+    print("loading model...")
+    rvc = RVCInference(device=args.device)
+    rvc.load_model(args.model, index_path=args.index)
+    last_activity = [time.time()]
+    threading.Thread(target=watch_idle, args=(last_activity, args.idle_timeout), daemon=True).start()
+    print("ready on port %d (idle timeout %ds)" % (args.port, args.idle_timeout))
+    HTTPServer(("127.0.0.1", args.port), make_handler(rvc, last_activity)).serve_forever()
+
+if __name__ == "__main__":
+    main()
+EOF
+
+tts config --set rvc.server_url=http://127.0.0.1:8766
+tts config --set 'rvc.server_start=~/.local/share/rvc-venv/bin/python ~/.local/share/rvc-venv/rvc_server.py --port 8766 --model ~/.local/share/rvc-models/<name>/<name>.pth --index ~/.local/share/rvc-models/<name>/<index-file>'
+tts -p rvc "Test with the server."   # auto-starts it (torch load, several seconds);
+                                     # every call after that is faster
+```
+
+**The model is fixed at server startup**, not per request — that's inherent to keeping one
+loaded. `rvc.model`/`rvc.index` still configure the CLI fallback path, but the running
+server keeps whichever model it was launched with; to switch voices, change
+`rvc.server_start`'s `--model`/`--index` and restart the server (kill the process — the
+next call auto-starts a fresh one with the new arguments). `tts check` reports whether it's
+already running or will auto-start, without starting it itself.
+
+Same idle behavior as kokoro's server: **exits after 5 minutes with no conversion
+request** (`--idle-timeout`, seconds — append e.g. `--idle-timeout 600` to
+`rvc.server_start` for a different value, `0` to disable). Worth knowing here specifically
+because a torch model held resident uses real memory (and VRAM on `cuda:0`) the whole time
+it's up — the default releases that automatically rather than leaving it loaded forever.
+
 ## The language memory
 
 ```bash
@@ -261,6 +439,14 @@ tts resume
 If the user reports that audio "will not stop", run `tts playback` first — if it reports
 nothing, the sound is coming from something else, not this CLI. A stale state file is
 harmless: the next `stop` clears it.
+
+Playback is also serialized machine-wide — at most one file plays at a time, regardless of
+provider or session, via a lock file `play_detached()` holds for the duration of playback
+(see `audio.playback_lock_path()`, `localtts/_playback_runner.py`). If the user reports
+"nothing plays" or "it's stuck at 0:00", check whether *another session* already has audio
+running (`tts playback --session <other-id>` if known, or just ask) — a queued session
+correctly shows frozen `0:00 / <total>` until its turn comes, that is not a bug. It starts
+advancing once the earlier one finishes.
 
 ## Status-bar hook (progress in the host's own UI, not chat)
 

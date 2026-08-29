@@ -95,9 +95,18 @@ variable yet, or when you want to be certain rather than rely on the fallback. O
 entirely is still safe for the common case (one session at a time) — it just shares the one
 original global slot, exactly like before this existed.
 
+Session isolation is about *control* (whose `stop`/`pause`/status this is), not about
+letting two sessions' audio overlap: actual playback is serialized machine-wide, so if
+another session already has something playing, yours queues silently behind it rather than
+talking over it. You don't need to do anything about this — `-b` still returns immediately
+either way — just don't assume the audio is audibly playing the instant the command
+returns; on a quiet machine it will be, but if another session is mid-sentence, yours
+starts once that one finishes.
+
 **Run the command itself in the background too**, using whatever mechanism you have for
-non-blocking shell commands. `-b` returns as soon as playback starts, but *synthesis* still
-happens first, and that takes a moment (a second or two for a sentence, ~12s for a
+non-blocking shell commands. `-b` returns as soon as playback is queued (see above — it may
+briefly wait its turn behind another session before audibly starting), but *synthesis*
+still happens first, and that takes a moment (a second or two for a sentence, ~12s for a
 1000-word document). Never sit blocked on it.
 
 ### Always play the whole thing

@@ -79,6 +79,14 @@ DEFAULTS = {
             "lang": "",     # empty => the binary's own default
             "speed": 1.0,
             "extra_args": [],
+            # Optional: talk to a persistent server that keeps the model loaded, instead
+            # of paying model-load cost on every call. Not installed or run by this tool
+            # -- see the local-tts-configure skill for the (small, self-written) server
+            # script this expects. Empty server_url means "spawn kokoro-tts per call",
+            # exactly today's behavior.
+            "server_url": "",          # e.g. http://127.0.0.1:8765
+            "server_start": "",        # command to launch it if not already reachable
+            "server_timeout": 30,      # seconds to wait for it to come up
         },
         "rvc": {
             # rvc-python (https://github.com/daswer123/rvc-python) does audio-to-audio
@@ -97,6 +105,15 @@ DEFAULTS = {
             "index_rate": None,     # None => let rvc-python use its own default
             "protect": None,
             "extra_args": [],
+            # Optional: talk to a persistent server that keeps the model (and torch
+            # itself) loaded, instead of paying that load cost -- seconds, not
+            # milliseconds -- on every call. The model/index the server holds is fixed
+            # at server startup, not per request: that's the nature of keeping one
+            # loaded. Not installed or run by this tool -- see the local-tts-configure
+            # skill. Empty server_url means "spawn rvc-python per call", today's default.
+            "server_url": "",          # e.g. http://127.0.0.1:8766
+            "server_start": "",        # command to launch it if not already reachable
+            "server_timeout": 60,      # seconds to wait -- a cold torch+model load is slow
         },
         "command": {
             # Escape hatch: any CLI that writes a wav file.
