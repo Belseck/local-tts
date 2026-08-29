@@ -111,6 +111,9 @@ class KokoroProvider(Provider):
     def synthesize(self, text, out_path, voice=None):
         from localtts import audiofx
 
+        rendered = textutil.synthesize_language_spans(self, text, out_path, voice)
+        if rendered is not None:
+            return rendered
         segments = textutil.resolve_tone_segments(text, auto_tone=bool(self.settings.get("auto_tone")))
         if len(segments) == 1 and segments[0][1] is None:
             self._run_one(segments[0][0], out_path, voice, None)

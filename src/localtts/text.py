@@ -433,6 +433,50 @@ def _own_the_stream(provider):
         provider.on_part = sink
 
 
+def synthesize_language_spans(provider, text, out_path, voice=None):
+    """Render `text` with each `<en>`-tagged span spoken in that language's own voice.
+
+    Returns the output path, or None when there is nothing to do -- no language tags, or
+    the feature is off -- so the caller falls through to its normal path unchanged.
+
+    Every provider that can speak more than one language on demand wants this identically:
+    split, render each span with a copy of itself bound to that language, join. Only *how*
+    a language selects a voice differs, and each provider already answers that through its
+    own per-language resolution, so this stays one implementation rather than one per
+    backend.
+    """
+    from localtts import audio
+
+    if not provider.language_tags_enabled():
+        return None
+    spans = split_language_spans(text, provider.lang, provider.known_languages())
+    if len(spans) <= 1:
+        return None
+
+    work = tempfile.mkdtemp(prefix="local-tts-lang-")
+    parts = [os.path.join(work, "%04d.%s" % (index, provider.default_format))
+             for index in range(len(spans))]
+    try:
+        with _own_the_stream(provider) as emit:
+            for (chunk, lang), part in zip(spans, parts):
+                if lang == provider.lang:
+                    # An explicit --voice is about the language actually being spoken;
+                    # forcing it onto a borrowed span is the opposite of the point.
+                    provider.synthesize(chunk, part, voice=voice)
+                else:
+                    provider.for_language_instance(lang).synthesize(chunk, part)
+                if emit:
+                    emit(part)
+        audio.concat_wavs(parts, out_path, gap_seconds=0)
+    finally:
+        for part in parts:
+            if os.path.exists(part):
+                os.unlink(part)
+        if os.path.isdir(work):
+            os.rmdir(work)
+    return out_path
+
+
 def _synthesize_with_audiofx(provider, text, out_path, voice, on_progress):
     """Render `text` segment by segment, applying each segment's speed/volume to its own
     wav, and join the result. Returns the output path, or None when this is not worth

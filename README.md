@@ -1026,8 +1026,30 @@ speaking, just with the right phonetics for each word.
 tts config --set 'rvc.delivery.es={"pause_ms": 45, "language_tags": true}'
 ```
 
-Enabled per language, so it can be on for Spanish and off elsewhere. Tagging a language
-requires that language to be configured, so add a voice for it first.
+**On by default, and inert until you configure a second language** — only a language that
+has a voice of its own counts as a tag, so with one voice installed there is nothing to
+switch to and nothing changes.
+
+It works on every backend that can speak more than one language on demand:
+
+| Backend | How a language selects a voice |
+| --- | --- |
+| `kokoro` | `kokoro.language_voices` — one model, a voice per language |
+| `piper` | `piper.language_models` — a piper voice *is* a language, so one `.onnx` each |
+| `rvc` | its base provider's map, per host language (below) |
+
+```bash
+tts config --set piper.language_models.es=~/.local/share/piper-voices/es_MX-claude-high.onnx
+tts config --set piper.language_models.en=~/.local/share/piper-voices/en_US-lessac-high.onnx
+tts config --set piper.language_tags=false     # to turn it off
+```
+
+For `rvc` it is scoped per host language instead of one flag, since whether a borrowed
+word should switch voice depends on which language is doing the borrowing:
+
+```bash
+tts config --set 'rvc.delivery.es={"language_tags": true}'
+```
 
 Which voice speaks the borrowed span is configurable per **host** language, because the
 best voice for a quoted English phrase inside Spanish is not always the one you would

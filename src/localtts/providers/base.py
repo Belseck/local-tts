@@ -92,6 +92,40 @@ class Provider:
         if sink:
             sink(path)
 
+    def known_languages(self):
+        """Language codes a `<xx>` tag may name: the ones the user has actually recorded
+        or given a voice to. Restricting it to these is what keeps a tone tag nobody
+        anticipated from silently becoming a language switch."""
+        cfg = self.cfg or {}
+        codes = set(cfg.get("languages") or {})
+        for provider in (cfg.get("providers") or {}).values():
+            if isinstance(provider, dict):
+                for key in ("language_voices", "language_models"):
+                    codes.update(provider.get(key) or {})
+        return codes
+
+    def language_tags_enabled(self):
+        """Whether `<en>...</en>` inside this call's text should switch language.
+
+        On by default, and inert until a second language is configured: only languages
+        that have a voice of their own count as tags (see known_languages), so on a
+        single-language setup there is nothing to switch to and nothing changes.
+        """
+        return bool(self.settings.get("language_tags", True))
+
+    def for_language_instance(self, lang):
+        """A copy of this provider bound to `lang`, so its own per-language resolution
+        (kokoro's voice, piper's model) applies to a borrowed span.
+
+        A copy rather than a mutation because the original is still mid-utterance, and
+        the copy must not publish stream fragments -- whoever owns the outer loop owns
+        the ordering, and so owns the sink.
+        """
+        clone = type(self)(dict(self.settings), verbose=self.verbose, cfg=self.cfg,
+                           lang=lang)
+        clone.on_part = None
+        return clone
+
     def for_language(self, mapping, default=""):
         """This call's entry from a {language tag: value} map, or `default`.
 

@@ -22,6 +22,7 @@ from localtts.providers.command import CommandProvider
 from localtts.providers.kokoro import KokoroProvider
 from localtts.providers.llamacpp import LlamaCppProvider
 from localtts.providers.openai import OpenAIProvider
+from localtts.providers.piper import PiperProvider
 from localtts.providers.rvc import RvcProvider
 
 
@@ -2347,6 +2348,81 @@ class LanguageSpanTest(unittest.TestCase):
             [l for _, l in textutil.split_language_spans("a <es-MX>b</es-MX>", "en",
                                                          ("en", "es-MX"))],
             ["en", "es-MX"])
+
+
+class LanguageSpanRenderingTest(unittest.TestCase):
+    """Every backend that can speak more than one language on demand renders a borrowed
+    span in that language's own voice (text.synthesize_language_spans)."""
+
+    CFG = {"languages": {"es": {}, "en": {}}, "providers": {}}
+    TEXT = "Sube el <en>pull request</en> ya"
+
+    def test_kokoro_switches_voice_and_phonemizer_per_span(self):
+        seen = []
+        provider = KokoroProvider(
+            dict(config.DEFAULTS["providers"]["kokoro"], binary="kokoro-tts",
+                 language_voices={"es": "ef_dora", "en": "bm_george"}),
+            cfg=self.CFG, lang="es")
+
+        # Patched on the class, not the instance: a borrowed span is rendered by a fresh
+        # copy of the provider (Provider.for_language_instance), which would not see an
+        # instance attribute.
+        def run(self, cmd, **kwargs):
+            seen.append((cmd[cmd.index("-v") + 1], cmd[cmd.index("-l") + 1]))
+            with open(cmd[cmd.index("-o") + 1], "wb") as fh:
+                fh.write(_wav_bytes(1))
+
+        with unittest.mock.patch.object(KokoroProvider, "run", run):
+            with tempfile.TemporaryDirectory() as tmp:
+                provider.synthesize(self.TEXT, os.path.join(tmp, "out.wav"))
+        self.assertEqual(seen, [("ef_dora", "es"), ("bm_george", "en-gb"),
+                                ("ef_dora", "es")])
+
+    def test_piper_switches_voice_model_per_span(self):
+        seen = []
+        provider = PiperProvider(
+            dict(config.DEFAULTS["providers"]["piper"], binary="/bin/echo",
+                 language_models={"es": "/v/es.onnx", "en": "/v/en.onnx"}),
+            cfg=self.CFG, lang="es")
+
+        def run(self, cmd, stdin_text=None, **kwargs):
+            seen.append(cmd[cmd.index("--model") + 1])
+            with open(cmd[cmd.index("--output_file") + 1], "wb") as fh:
+                fh.write(_wav_bytes(1))
+
+        real_exists = os.path.exists
+        with unittest.mock.patch.object(PiperProvider, "run", run), \
+             unittest.mock.patch.object(
+                 os.path, "exists",
+                 side_effect=lambda p: True if str(p).endswith(".onnx") else real_exists(p)):
+            with tempfile.TemporaryDirectory() as tmp:
+                provider.synthesize(self.TEXT, os.path.join(tmp, "out.wav"))
+        self.assertEqual(seen, ["/v/es.onnx", "/v/en.onnx", "/v/es.onnx"])
+
+    def test_inert_when_only_one_language_is_configured(self):
+        """On by default is only safe because a tag for a language with no voice of its
+        own is not a tag at all -- it stays literal text and nothing switches."""
+        provider = KokoroProvider(
+            dict(config.DEFAULTS["providers"]["kokoro"], binary="kokoro-tts",
+                 language_voices={"es": "ef_dora"}),
+            cfg={"languages": {"es": {}}, "providers": {}}, lang="es")
+        self.assertTrue(provider.language_tags_enabled())
+        self.assertIsNone(
+            textutil.synthesize_language_spans(provider, self.TEXT, "/tmp/unused.wav"),
+            "nothing to switch to, so the caller's normal path must run")
+
+    def test_turning_it_off_skips_the_split(self):
+        provider = KokoroProvider(
+            dict(config.DEFAULTS["providers"]["kokoro"], binary="kokoro-tts",
+                 language_tags=False,
+                 language_voices={"es": "ef_dora", "en": "bm_george"}),
+            cfg=self.CFG, lang="es")
+        self.assertIsNone(
+            textutil.synthesize_language_spans(provider, self.TEXT, "/tmp/unused.wav"))
+
+    def test_language_tags_are_on_by_default(self):
+        for name in ("piper", "kokoro"):
+            self.assertIs(config.DEFAULTS["providers"][name]["language_tags"], True, name)
 
 
 class PronunciationTest(unittest.TestCase):

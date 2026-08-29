@@ -27,7 +27,7 @@ DELIVERY_DEFAULTS = {
     "pause_ms": 45,             # between fragments delivered the same way
     "pause_tone_ms": 130,       # when the tone changes -- the breath
     "emphasis_lengthen": 0,     # IPA length marks on the stressed vowel (kokoro only)
-    "language_tags": False,     # honor <en>...</en> inside this language's text
+    "language_tags": True,      # honor <en>...</en> inside this language's text
     # Which base voice speaks a *borrowed* language while this language is the host, e.g.
     # {"en": "bm_lewis"} under "es". Separate from the global per-language voice because
     # the best voice for a quoted English phrase inside Spanish is not always the one you
@@ -89,17 +89,11 @@ class RvcProvider(Provider):
     def _base_name(self):
         return self.settings.get("base_provider") or (self.cfg or {}).get("provider") or "piper"
 
-    def known_languages(self):
-        """Language codes a `<xx>` tag may name: the ones the user has actually recorded
-        or given a voice to. Restricting it to these is what keeps a tone tag nobody
-        anticipated from silently becoming a language switch."""
-        cfg = self.cfg or {}
-        codes = set(cfg.get("languages") or {})
-        for provider in (cfg.get("providers") or {}).values():
-            if isinstance(provider, dict):
-                codes.update(provider.get("language_voices") or {})
-        codes.update(self.settings.get("language_models") or {})
-        return codes
+    def language_tags_enabled(self):
+        """rvc scopes this per language, through delivery, rather than one flag for the
+        whole provider: whether a borrowed word should switch voice depends on which
+        language is doing the borrowing."""
+        return bool(self.delivery()["language_tags"])
 
     def _base_for(self, lang):
         """The base provider as it would be built for `lang` -- the call's own language
@@ -168,7 +162,7 @@ class RvcProvider(Provider):
 
         # Language first, tone within it: a borrowed word keeps its own phonetics, and
         # the tone markup around it survives the cut (see split_language_spans).
-        if self.delivery()["language_tags"]:
+        if self.language_tags_enabled():
             language_spans = textutil.split_language_spans(
                 text, self.lang, self.known_languages())
         else:

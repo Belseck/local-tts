@@ -26,7 +26,7 @@ class PiperProvider(Provider):
         plain, unadjusted case (also what --dry-run calls with)."""
         settings = dict(self.settings, **(overrides or {})) if overrides else self.settings
         exe = self.resolve_binary("binary", "piper")
-        model = os.path.expanduser(voice or settings.get("model") or "")
+        model = os.path.expanduser(self.resolved_model(voice) or "")
         if not model:
             raise TTSError(
                 "piper needs a voice model: `tts config --set piper.model=/path/to/voice.onnx` "
@@ -46,6 +46,15 @@ class PiperProvider(Provider):
         if volume:
             cmd += ["--volume", str(volume)]
         return cmd + list(settings.get("extra_args") or [])
+
+    def resolved_model(self, voice=None):
+        """The .onnx for this call: an explicit --voice, else this language's entry from
+        `language_models`, else the flat `model` setting. A piper voice *is* a language,
+        so speaking two means having two files."""
+        if voice:
+            return voice
+        return (self.for_language(self.settings.get("language_models") or {})
+                or self.settings.get("model") or "")
 
     def speed_settings(self, speed):
         """length_scale is the inverse of rate (piper convention), so a >1 speed
@@ -73,6 +82,9 @@ class PiperProvider(Provider):
             raise TTSError("piper wrote no audio to %s" % out_path)
 
     def synthesize(self, text, out_path, voice=None):
+        rendered = textutil.synthesize_language_spans(self, text, out_path, voice)
+        if rendered is not None:
+            return rendered
         segments = textutil.resolve_tone_segments(text, auto_tone=bool(self.settings.get("auto_tone")))
         if len(segments) == 1 and segments[0][1] is None:
             # segments[0][0], not `text`: a tag that resolves to a neutral profile (e.g.

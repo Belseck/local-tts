@@ -977,11 +977,24 @@ tts config --set 'rvc.delivery.es={"language_tags": true, "foreign_voices": {"en
 Reach for it when a borrowed phrase sounds like a different person interrupting — a
 closer timbre matters more mid-sentence than it does for a whole paragraph.
 
-Enabled per language:
+**On by default, and inert until a second language is configured** — only a language with
+a voice of its own counts as a tag, so nothing changes on a single-language setup. Works
+on any backend that can speak more than one language on demand:
+
+| Backend | How a language selects a voice |
+| --- | --- |
+| `kokoro` | `kokoro.language_voices` — one model, a voice per language |
+| `piper` | `piper.language_models` — a piper voice *is* a language, so one `.onnx` each |
+| `rvc` | its base provider's map, scoped per host language |
 
 ```bash
+tts config --set piper.language_models.en=~/.local/share/piper-voices/en_US-lessac-high.onnx
+tts config --set kokoro.language_tags=false      # to turn it off for a backend
 tts config --set 'rvc.delivery.es={"pause_ms": 45, "language_tags": true}'
 ```
+
+rvc scopes it per host language rather than one flag, because whether a borrowed word
+should switch voice depends on which language is doing the borrowing.
 
 Only languages the user has actually configured count as language tags — an unconfigured
 one is left as literal text. So when you finish installing a base model, **ask whether

@@ -115,6 +115,16 @@ DEFAULTS = {
         "piper": {
             "binary": "piper",
             "model": "",           # path to a .onnx voice
+            # Which voice model speaks which language, e.g.
+            #   {"es": "~/voices/es_MX-claude-high.onnx", "en": "~/voices/en_US-lessac-high.onnx"}
+            # A piper voice *is* a language, so speaking two means having two files. An
+            # exact tag beats its base language.
+            "language_models": {},
+            # Honor <en>...</en> spans inside another language's text, so a borrowed word
+            # keeps its own phonetics. On by default, and inert until a second language
+            # is configured: only languages with a voice of their own count as tags, so
+            # with one voice installed there is nothing to switch to and nothing changes.
+            "language_tags": True,
             "speaker": None,       # speaker id for multi-speaker voices
             # Real piper flags (verified via `piper --help`) -- inverse-of-rate and
             # loudness. None => piper's own default (1.0 either way), flag omitted. A
@@ -140,6 +150,9 @@ DEFAULTS = {
             # language is then taken from the chosen voice rather than from `lang`, which
             # would otherwise stay stale and read one language with another's phonetics.
             "language_voices": {},
+            # Honor <en>...</en> spans inside another language's text (see
+            # piper.language_tags). On by default, inert with a single language.
+            "language_tags": True,
             "speed": 1.0,
             # Emphasis as a phonetician writes it: N IPA length marks on the vowel
             # carrying primary stress (kˈasa -> kˈaːsa). Kokoro has the length mark in
