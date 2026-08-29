@@ -129,9 +129,11 @@ Any reasonable word works as a tag name — `<anger>`, `<happy>`, `<sad>`, `<exc
 `<question>`, `<exclamation>` all have a built-in preset; anything else still does *something*
 reasonable, it just isn't hand-tuned. **How much a tag actually changes the audio depends on
 the backend** — openai's `gpt-4o-mini-tts` model genuinely performs the emotion; piper and
-kokoro approximate it with pacing (and, for piper, volume); other backends (the default
-`llamacpp`, `rvc`) have no such hook at all, so a tag there is a safe no-op — the markup is
-always stripped before the words reach them, never spoken literally. This means tags are
+kokoro approximate it with pacing (and, for piper, volume). On backends with no hook of
+their own (`llamacpp`, `rvc`) the tag's speed and volume are applied to the rendered audio
+afterwards instead, so a tag is still audible there rather than being a no-op. `rvc`
+converts each tagged span separately for exactly this reason. The markup itself is never
+spoken literally on any backend. This means tags are
 always safe to use regardless of which backend is currently configured; you don't need to
 check first.
 
@@ -169,6 +171,23 @@ stops the previous one automatically, so you never stack two voices.
 `pause` and `resume` are POSIX-only (Linux, macOS, WSL). On native **Windows** they report
 that they are unsupported — there, `stop` is the control, and you should say so rather than
 suggesting pause.
+
+### The terminal title shows a speaker icon on its own
+
+While something is playing, the terminal's tab/window title becomes `🔊 0:12 <file>`, and
+goes back to normal the moment it stops. **You do not have to do anything for this** — the
+background runner that owns the playback sets it and clears it, including when the user
+runs `tts stop` or the audio simply ends. Do not print escape sequences yourself, and do
+not try to "restore" the title afterwards; you would be fighting the process that already
+handles it.
+
+It is skipped when there is no terminal to write to (your command output piped into
+another tool, a status-line hook, CI). A user who keeps their own tab titles can turn it
+off with `tts config --set terminal_title=false` — if they ask for that, it is a config
+change, not something to work around per call.
+
+Worth mentioning once to a user who says they lose track of whether audio is still
+playing: the tab title is the answer, and unlike a chat message it updates itself.
 
 ### Check for a status-bar hook first
 

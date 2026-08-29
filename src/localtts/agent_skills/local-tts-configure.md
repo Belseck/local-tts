@@ -1,6 +1,6 @@
 ---
 name: local-tts-configure
-description: Install, diagnose, and configure the local `tts` CLI (local-tts) — backends (llama.cpp, piper, OpenAI-compatible), voices for a given language, playback, and the per-language provider memory. Use when text-to-speech is missing or broken, when the user wants a different or better voice, when they need a new language, or when they ask to change any speech setting.
+description: Install, diagnose, and configure the local `tts` CLI (local-tts) — backends (llama.cpp, piper, kokoro, RVC, OpenAI-compatible), voices for a given language, persistent model servers, playback, and the per-language provider memory. TRIGGER whenever the user asks to install, add, set up, enable or switch to ANY provider or backend by name ("install piper", "add kokoro", "set up rvc", "use OpenAI for speech") — that request means follow this skill's install steps, not improvise your own. Also use when text-to-speech is missing or broken, when the user wants a different or better voice, when they need a new language, when speech is slow and could use a persistent server, or when they ask to change any speech setting.
 ---
 
 # Configuring `local-tts`
@@ -24,6 +24,14 @@ anything** — it usually names the exact problem.
 ## Rules
 
 - **Ask before installing anything, downloading a voice (~60 MB each), or running `sudo`.**
+- **A request to install a provider is a request to follow this skill.** "Install kokoro",
+  "add rvc", "set up piper" — go to that backend's section below and use those steps
+  verbatim (its own venv, the exact config keys, the verification command). They exist
+  because each backend has a specific trap: piper needs a separate venv or it drags
+  onnxruntime into local-tts, kokoro needs a wrapper script, rvc needs a trained model
+  the user must already have. Improvising an install is how those get missed.
+- **After installing any of kokoro or rvc, offer server mode** — see "Offer the server,
+  don't assume it". It is the difference between ~1s and several seconds per call.
 - Show `tts check` output to the user rather than paraphrasing it.
 - Never edit the config JSON by hand; use `tts config --set` so validation applies.
 - If `tts` itself is missing, that is a full install: follow `AGENT_INSTALL.md` in the
@@ -323,44 +331,88 @@ tts -p rvc "Test of the converted voice."
 CUDA-enabled torch installed. There is no `rvc.voice` — voice comes entirely from which
 `.pth` model is configured, not a per-call flag.
 
-### Optional: keep the model loaded (a persistent server)
+### Optional: keep the models loaded (a persistent server)
 
 RVC's model load (torch, plus the checkpoint itself) is the slow part of every call — a
-persistent server pays that cost once instead of per call. **Ask before setting this up**,
-same as always for anything that adds a background process:
+persistent server pays that cost once instead of per call, and it can hold **several
+voices resident at the same time**, picking one per request. That is what makes a second
+language cheap: one server, one copy of torch, one GPU context, N voices.
+
+**Ask before setting this up** — see "Offer the server, don't assume it" below for how to
+put the choice to the user.
 
 ```bash
 cat > ~/.local/share/rvc-venv/rvc_server.py <<'EOF'
 #!/usr/bin/env python3
-import argparse, json, os, sys, threading, time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+"""Multi-voice RVC conversion server.
 
-def make_handler(rvc, last_activity):
+Holds one RVCInference per --model NAME=PATH pair, all resident, and picks one per
+request from the JSON body's "model" key. Requests that name nothing get the first
+model, so a single-model setup behaves exactly as it always did.
+"""
+import argparse, json, os, sys, threading, time
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+
+def make_handler(models, default_name, last_activity, lock):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a): pass
+
+        def _json(self, code, payload):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
-            # not "activity" -- must not keep the process alive just because polled
+            # Neither of these counts as activity: polling must not keep a GPU
+            # model resident forever.
             if self.path == "/health":
                 self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+            elif self.path == "/models":
+                self._json(200, {"models": sorted(models), "default": default_name})
             else:
                 self.send_response(404); self.end_headers()
+
         def do_POST(self):
             if self.path != "/convert":
                 self.send_response(404); self.end_headers(); return
             length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length) or b"{}")
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                self.send_response(400); self.end_headers(); return
+
+            name = body.get("model") or default_name
+            if name not in models:
+                self._json(404, {"error": "no such model %r" % name,
+                                 "available": sorted(models)})
+                return
             input_path = body.get("input_path") or ""
             if not input_path or not os.path.exists(input_path):
-                self.send_response(400); self.end_headers(); return
-            if "pitch" in body:
-                rvc.set_params(f0up_key=int(body["pitch"]))
+                self.send_response(400); self.end_headers()
+                self.wfile.write(b"input_path missing or does not exist"); return
+
+            rvc = models[name]
             out_path = input_path + ".converted.wav"
-            rvc.infer_file(input_path, out_path)
-            data = open(out_path, "rb").read()
+            # One GPU, one torch model at a time: serialize inference even though the
+            # HTTP server is threaded, so two languages arriving together queue instead
+            # of corrupting each other's state via set_params().
+            with lock:
+                if "pitch" in body:
+                    rvc.set_params(f0up_key=int(body["pitch"]))
+                rvc.infer_file(input_path, out_path)
+            with open(out_path, "rb") as fh:
+                data = fh.read()
             os.unlink(out_path)
             last_activity[0] = time.time()
-            self.send_response(200); self.send_header("Content-Type", "audio/wav")
-            self.end_headers(); self.wfile.write(data)
+
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
     return Handler
 
 def watch_idle(last_activity, idle_timeout):
@@ -369,49 +421,125 @@ def watch_idle(last_activity, idle_timeout):
     while True:
         time.sleep(10)
         if time.time() - last_activity[0] > idle_timeout:
-            print("idle for %ds, exiting to release the model" % idle_timeout, file=sys.stderr)
+            print("idle for %ds, exiting to release the models" % idle_timeout, file=sys.stderr)
             os._exit(0)
+
+def split_pair(raw, flag):
+    """NAME=PATH -> (name, path). A bare PATH (no '=') becomes the 'default' voice, so
+    the old single-model command line keeps working unchanged."""
+    if "=" in raw:
+        name, path = raw.split("=", 1)
+        name = name.strip()
+        if not name:
+            sys.exit("%s: empty name in %r" % (flag, raw))
+        return name, os.path.expanduser(path.strip())
+    return "default", os.path.expanduser(raw.strip())
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=8766)
-    p.add_argument("--model", required=True)
-    p.add_argument("--index", default="")
+    p.add_argument("--model", action="append", required=True, metavar="NAME=PATH",
+                   help="repeatable; a bare path is registered as 'default'")
+    p.add_argument("--index", action="append", default=[], metavar="NAME=PATH",
+                   help="repeatable; NAME must match a --model name")
     p.add_argument("--device", default="cpu")
+    p.add_argument("--index-rate", type=float, default=None)
+    p.add_argument("--protect", type=float, default=None)
+    p.add_argument("--f0method", default=None)
+    p.add_argument("--pitch", type=int, default=None)
     p.add_argument("--idle-timeout", type=int, default=300,
                    help="exit after this many idle seconds; 0 disables")
     args = p.parse_args()
+
+    model_paths = dict(split_pair(m, "--model") for m in args.model)
+    index_paths = dict(split_pair(i, "--index") for i in args.index)
+    unknown = set(index_paths) - set(model_paths)
+    if unknown:
+        sys.exit("--index names with no matching --model: %s" % ", ".join(sorted(unknown)))
+
     from rvc_python.infer import RVCInference
-    print("loading model...")
-    rvc = RVCInference(device=args.device)
-    rvc.load_model(args.model, index_path=args.index)
-    last_activity = [time.time()]
-    threading.Thread(target=watch_idle, args=(last_activity, args.idle_timeout), daemon=True).start()
-    print("ready on port %d (idle timeout %ds)" % (args.port, args.idle_timeout))
-    HTTPServer(("127.0.0.1", args.port), make_handler(rvc, last_activity)).serve_forever()
+    models, order = {}, list(model_paths)
+    for name in order:
+        print("loading %s..." % name, flush=True)
+        rvc = RVCInference(device=args.device)
+        rvc.load_model(model_paths[name], index_path=index_paths.get(name, ""))
+        startup = {k: v for k, v in (
+            ("index_rate", args.index_rate), ("protect", args.protect),
+            ("f0method", args.f0method), ("f0up_key", args.pitch),
+        ) if v is not None}
+        if startup:
+            rvc.set_params(**startup)
+        models[name] = rvc
+
+    default_name = order[0]
+    last_activity, lock = [time.time()], threading.Lock()
+    threading.Thread(target=watch_idle, args=(last_activity, args.idle_timeout),
+                     daemon=True).start()
+    print("ready on port %d | voices: %s | default: %s | idle timeout %ds"
+          % (args.port, ", ".join(order), default_name, args.idle_timeout), flush=True)
+    ThreadingHTTPServer(("127.0.0.1", args.port),
+                        make_handler(models, default_name, last_activity, lock)).serve_forever()
 
 if __name__ == "__main__":
     main()
 EOF
-
-tts config --set rvc.server_url=http://127.0.0.1:8766
-tts config --set 'rvc.server_start=~/.local/share/rvc-venv/bin/python ~/.local/share/rvc-venv/rvc_server.py --port 8766 --model ~/.local/share/rvc-models/<name>/<name>.pth --index ~/.local/share/rvc-models/<name>/<index-file>'
-tts -p rvc "Test with the server."   # auto-starts it (torch load, several seconds);
-                                     # every call after that is faster
 ```
 
-**The model is fixed at server startup**, not per request — that's inherent to keeping one
-loaded. `rvc.model`/`rvc.index` still configure the CLI fallback path, but the running
-server keeps whichever model it was launched with; to switch voices, change
-`rvc.server_start`'s `--model`/`--index` and restart the server (kill the process — the
-next call auto-starts a fresh one with the new arguments). `tts check` reports whether it's
-already running or will auto-start, without starting it itself.
+Register the server and tell local-tts which voice belongs to which language:
+
+```bash
+M=~/.local/share/rvc-models
+tts config --set rvc.server_url=http://127.0.0.1:8766
+tts config --set "rvc.server_start=~/.local/share/rvc-venv/bin/python ~/.local/share/rvc-venv/rvc_server.py --port 8766 --device cuda:0 --idle-timeout 300 --index-rate 0.88 --protect 0.20 --f0method rmvpe --model jarvis=$M/jarvis/jarvis.pth --index jarvis=$M/jarvis/jarvis.index --model cortana-es=$M/cortana-es/model.pth --index cortana-es=$M/cortana-es/model.index"
+
+# which resident voice each language uses
+tts config --set rvc.language_models.es=cortana-es
+tts config --set rvc.language_models.en=jarvis
+tts config --set rvc.server_model=jarvis          # fallback when the call has no --lang
+
+tts --lang es "Prueba de voz."   # auto-starts the server, asks it for cortana-es
+tts --lang en "Voice test."      # same server, same torch, jarvis this time
+```
+
+**Conversion settings only reach the server through these startup flags.** This is the
+single most common reason a converted voice sounds weak: `rvc.method`, `rvc.index_rate`
+and `rvc.protect` configure the *CLI fallback*, and the request body carries only
+`input_path`, `model` and `pitch`. A server started without `--index-rate/--protect/
+--f0method` silently runs rvc-python's own defaults (`index_rate=0.5`, `protect=0.33`,
+`f0method="harvest"`) no matter what the config file says. Put them on the command line.
+
+**Which voices exist is still fixed at startup** — adding one means restarting the server
+with another `--model name=path` pair. What is *not* fixed any more is which of them a
+given call uses. `tts check` lists the resident voices and the language mapping without
+starting anything.
+
+**RVC transfers timbre, not pitch.** The base provider's pitch contour survives conversion
+unchanged, so a voice can come out recognisably "wrong" even with the right model loaded.
+Use `--pitch -2` (semitones) on the server, and pick a base voice already close to the
+target, before concluding the model is bad.
 
 Same idle behavior as kokoro's server: **exits after 5 minutes with no conversion
-request** (`--idle-timeout`, seconds — append e.g. `--idle-timeout 600` to
-`rvc.server_start` for a different value, `0` to disable). Worth knowing here specifically
-because a torch model held resident uses real memory (and VRAM on `cuda:0`) the whole time
-it's up — the default releases that automatically rather than leaving it loaded forever.
+request** (`--idle-timeout`, seconds — `0` disables). Worth knowing here specifically
+because torch models held resident use real memory (and VRAM on `cuda:0`) the whole time,
+and with several voices loaded that is now N models, not one.
+
+### Offer the server, don't assume it
+
+Whenever you set up or repair `kokoro` or `rvc`, **ask the user whether to run it in
+server mode** rather than deciding for them. Lead with the concrete win and the concrete
+cost:
+
+- **Faster:** the model and torch load once, not per call. On a warm server a sentence
+  comes back in about a second; cold, the same call pays several seconds of load every
+  single time.
+- **One server, many voices:** several languages share one process and one GPU context.
+- **The cost:** a background process holding RAM (and VRAM) while it lives, released
+  automatically after the idle timeout.
+
+If they say yes, write the script, put the conversion flags on the command line, set
+`language_models`, and verify with `tts check`. If they say no, leave `server_url` empty —
+the per-call CLI path keeps working, just slower. Never start a background process on a
+machine without asking first.
 
 ## The language memory
 
@@ -424,6 +552,19 @@ tts languages --forget de                        # drop one
 
 Lookups match the specific tag before the base one, so `es-MX` wins over `es` when both
 exist. Update this whenever the user expresses a preference, and confirm what you recorded.
+
+## The speaker icon in the terminal title
+
+While audio plays, local-tts sets the terminal's tab/window title to `🔊 0:12 <file>`, and
+restores it the moment playback ends, is stopped, or the process dies. It is handled by
+the same background runner that owns the playback, so it clears itself without the agent
+having to remember — including when the user runs `tts stop`.
+
+Nothing needs configuring. It is skipped automatically when there is no terminal to write
+to (output piped into another tool, a status-line hook, CI), and `terminal_title=false`
+turns it off for a user who keeps their own title. If a user reports a stuck 🔊 in a tab,
+`tts stop` clears it; a title left over from a killed terminal cannot outlive that
+terminal.
 
 ## Playback control
 
@@ -536,6 +677,7 @@ tts config --path                       # where it lives
 tts config --set provider=piper         # default backend
 tts config --set play=false             # never auto-play
 tts config --set player=ffplay          # force a playback command
+tts config --set terminal_title=false   # stop showing 🔊 in the terminal tab title
 
 # llama.cpp performance
 tts config --set llamacpp.threads=8
@@ -568,12 +710,37 @@ assumed):
 | `openai` | The real thing — sends the tag's phrase as the `instructions` field. **Only `model=gpt-4o-mini-tts`** (or its dated alias) accepts this; `tts-1`/`tts-1-hd` reject it, and local-tts raises a clear error rather than silently dropping it if a tag is used with the wrong model. |
 | `piper` | Approximated with `--length-scale` (rate) and `--volume` (real piper flags) — not true emotional synthesis, just faster/slower and louder/quieter. |
 | `kokoro` | Approximated with speed (`-s`) only — kokoro/kokoro_onnx has no volume or pitch knob at all, verified against `Kokoro.create()`'s own signature. |
-| `llamacpp`, `rvc` | No real hook exists (verified: no style/emotion flag in `llama-tts --help`; rvc-python is voice *conversion*, it has no text/emotion input). Tags are always stripped before the text reaches them — never spoken literally, and never an error. Safe to use regardless of the configured provider. |
+| `llamacpp` | No synthesis-time hook exists (verified: no style/emotion flag in `llama-tts --help`), so the tag's **speed and volume are applied to the rendered audio instead** (see below). The free-text half of a tag has nowhere to go and is dropped. |
+| `rvc` | Voice conversion has no text or emotion input at all. rvc splits on the tags itself, converts **each span separately**, and shapes each converted span's speed/volume afterwards. Converting one merged wav would give every span one flat delivery, which is exactly what tags exist to prevent. |
 | `command` | Depends on `command.tone_tags` (below) — local-tts can't know what an arbitrary script understands. |
 
 More than one segment (a tag partway through the text) means more than one synthesis call,
 joined afterward — the same chunk-and-join machinery already used for long text, so nothing
 extra to install or configure for that.
+
+**What a backend cannot do at synthesis time is done to the audio afterwards.** A tone
+profile is two measurable numbers (a speed multiplier and a volume multiplier) plus a
+free-text instruction. Each backend declares which of the two it realizes itself —
+`piper` both, `kokoro` speed only (it genuinely has no volume knob), `openai` both,
+`llamacpp` and `rvc` neither — and anything left over is applied to that segment's
+rendered wav by `localtts/audiofx.py`. So `<whisper>` is quieter on kokoro even though
+kokoro has no volume control, and an emotion is audible on llamacpp even though it has no
+style flag at all.
+
+This is deliberately per *segment*, not over the finished file: the profile changes from
+span to span, and a transform applied to the join could no longer tell them apart. It
+costs nothing when no tag asks for a change — untagged text still takes the plain
+single-call path, byte for byte as before.
+
+Speed uses ffmpeg's `atempo` when ffmpeg is on PATH (pitch-preserving), and falls back to
+a pure-Python overlap-add stretch otherwise, so the feature never silently does nothing on
+a machine without ffmpeg — it is just cleaner with it. Volume is exact integer scaling,
+clamped rather than wrapped. **Installing ffmpeg is the one thing that improves this**;
+mention it if a user says tagged speech sounds warbly, and ask before installing.
+
+Only 16-bit PCM wav can be shaped this way, which covers every offline backend. A provider
+whose `default_format` is compressed (openai's mp3) opts out rather than be decoded and
+re-encoded — it realizes tone itself anyway.
 
 **Two settings, each per-provider** (`openai`, `piper`, `kokoro`):
 

@@ -279,6 +279,55 @@ def strip_tone_tags(text):
     return re.sub(r"[ \t]+", " ", "".join(chunks)).strip()
 
 
+
+def _synthesize_with_audiofx(provider, text, out_path, voice, on_progress):
+    """Render `text` segment by segment, applying each segment's speed/volume to its own
+    wav, and join the result. Returns the output path, or None when this is not worth
+    doing -- no tags, or nothing left for audiofx to apply -- so the caller falls back to
+    its normal single/chunked path unchanged.
+
+    Only PCM wav can be shaped this way, which is every offline backend that lands here
+    (llamacpp, command, and rvc's own composed output); a provider whose default_format
+    is compressed opts out rather than being decoded and re-encoded.
+    """
+    from localtts import audio, audiofx
+
+    if provider.default_format != "wav":
+        return None
+    settings = getattr(provider, "settings", None) or {}
+    segments = resolve_tone_segments(text, auto_tone=bool(settings.get("auto_tone")))
+    if len(segments) == 1 and segments[0][1] is None:
+        return None
+
+    does_speed = getattr(provider, "realizes_speed", False)
+    does_volume = getattr(provider, "realizes_volume", False)
+    pending = [
+        (chunk, 1.0 if does_speed or not profile else profile["speed"],
+                1.0 if does_volume or not profile else profile["volume"])
+        for chunk, profile in segments
+    ]
+    if all(abs(sp - 1.0) < audiofx.EPSILON and abs(vol - 1.0) < audiofx.EPSILON
+           for _, sp, vol in pending):
+        return None                      # tags present, but nothing for us to realize
+
+    work = tempfile.mkdtemp(prefix="local-tts-tone-")
+    parts = [os.path.join(work, "%04d.wav" % index) for index in range(len(pending))]
+    try:
+        for index, ((chunk, speed, volume), part) in enumerate(zip(pending, parts)):
+            provider.synthesize(strip_tone_tags(chunk), part, voice=voice)
+            audiofx.apply_profile(part, speed=speed, volume=volume)
+            if on_progress:
+                on_progress(index + 1, len(pending))
+        audio.concat_wavs(parts, out_path)
+    finally:
+        for part in parts:
+            if os.path.exists(part):
+                os.unlink(part)
+        if os.path.isdir(work):
+            os.rmdir(work)
+    return out_path
+
+
 def synthesize_chunked(provider, text, out_path, voice=None, on_progress=None):
     """One call for short text; chunk-and-join when the backend needs small prompts.
 
@@ -302,6 +351,14 @@ def synthesize_chunked(provider, text, out_path, voice=None, on_progress=None):
                                   # having to worry about load order between the two.
 
     if not getattr(provider, "supports_tone_tags", False):
+        # The backend cannot vary tone itself -- but speed and volume are measurable, so
+        # render each tagged span separately and shape it afterwards rather than throwing
+        # the emotion away with the markup. Only worth the extra calls when a tag actually
+        # asks for a change; plain text still takes the single-call path below.
+        if not getattr(provider, "handles_tone_segments", False):
+            rendered = _synthesize_with_audiofx(provider, text, out_path, voice, on_progress)
+            if rendered is not None:
+                return rendered
         text = strip_tone_tags(text)
 
     pieces = chunks(text, provider.max_words)

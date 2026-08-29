@@ -8,7 +8,14 @@ first, marks the state file as actually playing once it gets its turn, then
 runs the real player to completion before releasing the lock. The caller sees
 none of that waiting.
 
-Invoked as: python -m localtts._playback_runner <lock_path> <session-or-empty> <player argv...>
+It is also what paints (and, crucially, un-paints) the terminal title: this
+process is the only one that lives for exactly as long as the audio does. The
+tty path is passed in rather than discovered here, because start_new_session()
+in play_detached() leaves this process without a controlling terminal.
+
+Invoked as:
+    python -m localtts._playback_runner <lock_path> <session-or-empty>
+        <tty-or-empty> <title-or-empty> <player argv...>
 """
 
 import os
@@ -21,7 +28,8 @@ from localtts import audio, lock
 
 def main(argv):
     lock_path, session = argv[0], (argv[1] or None)
-    player_cmd = argv[2:]
+    tty, title = argv[2], argv[3]
+    player_cmd = argv[4:]
     with open(lock_path, "a+") as handle:
         lock.acquire(handle)
         try:
@@ -32,8 +40,16 @@ def main(argv):
                     duration_seconds=float(state.get("duration") or 0.0),
                     paused=False, elapsed=0.0, segment_start=time.time(), session=session,
                 )
-            subprocess.run(player_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           stdin=subprocess.DEVNULL)
+            # Only once we hold the lock: while queued behind another session the
+            # audio is silent, and a speaker icon then would be a lie.
+            if title:
+                audio.write_terminal_title(title, tty)
+            try:
+                subprocess.run(player_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               stdin=subprocess.DEVNULL)
+            finally:
+                if title:
+                    audio.write_terminal_title("", tty)
         finally:
             lock.release(handle)
 

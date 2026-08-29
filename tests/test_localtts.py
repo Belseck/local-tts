@@ -10,10 +10,11 @@ import threading
 import time
 import types
 import unittest
+import unittest.mock
 import wave
 from pathlib import Path
 
-from localtts import audio, config, hooks, providers, skills, text as textutil
+from localtts import audio, audiofx, config, hooks, providers, skills, text as textutil
 from localtts.cli import _resolve_session, _synthesize, main
 from localtts.errors import TTSError
 from localtts.providers.base import Provider
@@ -474,13 +475,42 @@ class KokoroProviderTest(unittest.TestCase):
 
 
 class RvcProviderTest(unittest.TestCase):
-    def build(self, cfg=None, **settings):
+    def build(self, cfg=None, lang="", **settings):
         merged = dict(config.DEFAULTS["providers"]["rvc"])
         merged.update(settings)
         cfg = cfg if cfg is not None else {"provider": "piper", "providers": config.DEFAULTS["providers"]}
-        provider = RvcProvider(merged, cfg=cfg)
+        provider = RvcProvider(merged, cfg=cfg, lang=lang)
         provider._python = lambda: "/usr/bin/python3"
         return provider
+
+    # -- multi-model servers ------------------------------------------------
+    # One server can hold several voices resident and pick one per request, so a
+    # second language costs a dict entry rather than a second copy of torch.
+
+    def test_no_model_name_when_nothing_is_configured(self):
+        # Back-compat: a single-model server must keep receiving no "model" key.
+        self.assertEqual(self.build().server_model_name(), "")
+
+    def test_language_models_pick_the_voice_for_this_call(self):
+        provider = self.build(lang="es", language_models={"es": "cortana-es", "en": "jarvis"})
+        self.assertEqual(provider.server_model_name(), "cortana-es")
+
+    def test_exact_language_tag_beats_the_base_language(self):
+        provider = self.build(lang="es-MX", language_models={"es": "cortana-es", "es-MX": "mex"})
+        self.assertEqual(provider.server_model_name(), "mex")
+
+    def test_base_language_is_used_when_the_exact_tag_is_unknown(self):
+        provider = self.build(lang="es-AR", language_models={"es": "cortana-es"})
+        self.assertEqual(provider.server_model_name(), "cortana-es")
+
+    def test_server_model_is_the_fallback_without_a_lang(self):
+        provider = self.build(server_model="jarvis", language_models={"es": "cortana-es"})
+        self.assertEqual(provider.server_model_name(), "jarvis")
+
+    def test_language_models_win_over_the_flat_default(self):
+        provider = self.build(lang="es", server_model="jarvis",
+                              language_models={"es": "cortana-es"})
+        self.assertEqual(provider.server_model_name(), "cortana-es")
 
     def test_python_interpreter_is_required(self):
         provider = RvcProvider(dict(config.DEFAULTS["providers"]["rvc"]), cfg={})
@@ -598,8 +628,62 @@ class RvcProviderTest(unittest.TestCase):
             self.assertEqual(open(out, "rb").read(), b"rvc-server-audio")
         self.assertEqual(len(server.requests), 1)
         self.assertEqual(server.requests[0]["pitch"], 3)
+        # nothing configured -> no "model" key at all, so an older single-model
+        # server sees byte-for-byte the request it always did
+        self.assertNotIn("model", server.requests[0])
         self.assertEqual(server.requests[0]["device"], "cuda:0")
         self.assertTrue(server.requests[0]["input_path"].endswith(".wav"))
+
+    def test_server_mode_names_the_voice_for_this_language(self):
+        server = _FakeAudioServer("/convert", audio_bytes=b"es-audio")
+        self.addCleanup(server.stop)
+
+        class FakeBase:
+            name = "fake"
+            default_format = "wav"
+            max_words = 0
+            max_workers = 1
+
+            def synthesize(self, text, out_path, voice=None):
+                with open(out_path, "wb") as fh:
+                    fh.write(b"RIFF....WAVEfake")
+                return out_path
+
+        provider = self.build(server_url=server.url, lang="es",
+                              language_models={"es": "cortana-es", "en": "jarvis"})
+        provider.base_provider_instance = lambda: FakeBase()
+        with tempfile.TemporaryDirectory() as tmp:
+            provider.synthesize("hola", os.path.join(tmp, "out.wav"))
+        self.assertEqual(server.requests[0]["model"], "cortana-es")
+
+    def test_each_tone_segment_is_converted_separately(self):
+        # rvc never sees text, so if the whole utterance were converted as one wav every
+        # segment would come out with one flat tone. Each tagged span must make its own
+        # trip through the converter, and the pieces are joined into a single file.
+        server = _FakeAudioServer("/convert", audio_bytes=_wav_bytes(1))
+        self.addCleanup(server.stop)
+
+        class FakeBase:
+            name = "fake"
+            default_format = "wav"
+            max_words = 0
+            max_workers = 1
+            supports_tone_tags = False
+            settings = {}
+
+            def synthesize(self, text, out_path, voice=None):
+                with open(out_path, "wb") as fh:
+                    fh.write(_wav_bytes(1))
+                return out_path
+
+        provider = self.build(server_url=server.url)
+        provider.base_provider_instance = lambda: FakeBase()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.wav")
+            textutil.synthesize_chunked(
+                provider, "<happy>Great news!</happy> <sad>But also this.</sad>", out)
+            self.assertTrue(os.path.getsize(out) > 0)
+        self.assertEqual(len(server.requests), 2, "one conversion per tone segment")
 
     def test_server_mode_does_not_require_python_or_model_configured(self):
         # Server mode is a fully separate path from the subprocess CLI fallback -- the
@@ -774,7 +858,7 @@ class SupportsToneTagsTest(unittest.TestCase):
             "openai": True,      # instructions field [+ speed], gpt-4o-mini-tts only
             "piper": True,       # --length-scale / --volume are real flags
             "kokoro": True,      # -s/speed is real; no volume/pitch knob exists
-            "rvc": False,        # never touches text itself, delegates to base_provider
+            "rvc": True,         # splits on tags itself, shapes each converted span (audiofx)
             "command": False,    # user's call via command.tone_tags, default "strip"
         }
         self.assertEqual(set(expected), set(providers.names()), "update this test too")
@@ -1992,6 +2076,149 @@ class CliTest(unittest.TestCase):
 
     def test_languages_subcommand(self):
         self.assertEqual(main(["languages"]), 0)
+
+
+
+class AudioFxTest(unittest.TestCase):
+    """Speed/volume applied to rendered audio, for backends with no such flag of their
+    own. Dependency-free by design, so these must pass without ffmpeg installed."""
+
+    def tone(self, seconds=1.0, rate=22050, amplitude=8000):
+        import array, math
+        path = os.path.join(tempfile.mkdtemp(), "t.wav")
+        samples = array.array("h", [int(amplitude * math.sin(2 * math.pi * 220 * i / rate))
+                                    for i in range(int(rate * seconds))])
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+            w.writeframes(samples.tobytes())
+        return path
+
+    def peak(self, path):
+        import array
+        with wave.open(path, "rb") as w:
+            data = array.array("h"); data.frombytes(w.readframes(w.getnframes()))
+        return max(abs(x) for x in data)
+
+    def seconds(self, path):
+        with wave.open(path, "rb") as w:
+            return w.getnframes() / float(w.getframerate())
+
+    def test_volume_scales_amplitude(self):
+        path = self.tone()
+        self.assertTrue(audiofx.apply_volume(path, 1.5))
+        self.assertAlmostEqual(self.peak(path), 12000, delta=60)
+
+    def test_volume_clamps_instead_of_wrapping(self):
+        # int16 overflow is the difference between "louder" and a burst of noise.
+        path = self.tone()
+        audiofx.apply_volume(path, 20.0)
+        self.assertLessEqual(self.peak(path), 32768)
+
+    def test_volume_of_one_is_a_noop(self):
+        self.assertFalse(audiofx.apply_volume(self.tone(), 1.0))
+
+    def test_speed_shortens_without_ffmpeg(self):
+        path = self.tone(seconds=1.0)
+        self.assertTrue(audiofx.apply_speed(path, 1.5))
+        self.assertAlmostEqual(self.seconds(path), 1 / 1.5, delta=0.06)
+
+    def test_speed_below_one_lengthens(self):
+        path = self.tone(seconds=1.0)
+        self.assertTrue(audiofx.apply_speed(path, 0.75))
+        self.assertAlmostEqual(self.seconds(path), 1 / 0.75, delta=0.08)
+
+    def test_speed_of_one_is_a_noop(self):
+        self.assertFalse(audiofx.apply_speed(self.tone(), 1.0))
+
+    def test_apply_profile_never_raises_on_a_bad_file(self):
+        broken = os.path.join(tempfile.mkdtemp(), "x.wav")
+        with open(broken, "wb") as fh:
+            fh.write(b"not a wav")
+        self.assertFalse(audiofx.apply_profile(broken, speed=1.5, volume=2.0))
+
+
+class ToneFallbackTest(unittest.TestCase):
+    """A backend with no tone hook still sounds different per segment, because the
+    speed/volume half of a profile is applied to its rendered audio afterwards."""
+
+    class Recorder:
+        name = "rec"
+        default_format = "wav"
+        max_words = 0
+        max_workers = 1
+        supports_tone_tags = False
+        realizes_speed = False
+        realizes_volume = False
+        settings = {}
+
+        def __init__(self):
+            self.seen = []
+
+        def synthesize(self, text, out_path, voice=None):
+            self.seen.append(text)
+            with open(out_path, "wb") as fh:
+                fh.write(_wav_bytes(1))
+            return out_path
+
+    def test_each_tagged_span_is_rendered_separately(self):
+        provider = self.Recorder()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.wav")
+            textutil.synthesize_chunked(
+                provider, "<happy>Yes!</happy> <sad>No.</sad>", out)
+        self.assertEqual(provider.seen, ["Yes!", "No."])
+
+    def test_no_tags_still_takes_the_single_call_path(self):
+        provider = self.Recorder()
+        with tempfile.TemporaryDirectory() as tmp:
+            textutil.synthesize_chunked(provider, "just plain text", os.path.join(tmp, "o.wav"))
+        self.assertEqual(provider.seen, ["just plain text"])
+
+    def test_a_provider_that_realizes_everything_is_left_alone(self):
+        provider = self.Recorder()
+        provider.realizes_speed = True
+        provider.realizes_volume = True
+        with tempfile.TemporaryDirectory() as tmp:
+            textutil.synthesize_chunked(provider, "<happy>Yes!</happy> <sad>No.</sad>",
+                                        os.path.join(tmp, "o.wav"))
+        # nothing left for audiofx -> the old strip-and-render-once path
+        self.assertEqual(len(provider.seen), 1)
+
+
+
+class NestedConfigSetTest(unittest.TestCase):
+    """`rvc.language_models.es=cortana-es` -- one entry of a dict-valued setting, so a
+    per-language voice map doesn't have to be written as raw JSON."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        patcher = unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.home})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_sets_one_entry(self):
+        config.set_values(["rvc.language_models.es=cortana-es"])
+        cfg = config.load()
+        self.assertEqual(cfg["providers"]["rvc"]["language_models"], {"es": "cortana-es"})
+
+    def test_keeps_existing_entries(self):
+        config.set_values(["rvc.language_models.es=cortana-es"])
+        config.set_values(["rvc.language_models.en=jarvis"])
+        self.assertEqual(config.load()["providers"]["rvc"]["language_models"],
+                         {"es": "cortana-es", "en": "jarvis"})
+
+    def test_empty_value_removes_the_entry(self):
+        config.set_values(["rvc.language_models.es=cortana-es"])
+        config.set_values(["rvc.language_models.es="])
+        self.assertEqual(config.load()["providers"]["rvc"]["language_models"], {})
+
+    def test_unknown_key_still_errors(self):
+        with self.assertRaises(TTSError):
+            config.set_values(["rvc.nope.x=1"])
+
+    def test_nesting_under_a_non_dict_setting_errors(self):
+        with self.assertRaises(TTSError):
+            config.set_values(["rvc.device.extra=cuda"])
 
 
 if __name__ == "__main__":

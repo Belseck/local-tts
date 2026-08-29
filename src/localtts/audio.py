@@ -100,7 +100,15 @@ def playback_lock_path():
     return os.path.join(os.path.dirname(STATE_FILE), "local-tts-playback.lock")
 
 
-def play(path, preferred="", verbose=False):
+def _safe_duration(path):
+    """Length in seconds, or 0.0 for anything we cannot parse (never fatal)."""
+    try:
+        return duration(path)
+    except (wave.Error, EOFError, OSError):
+        return 0.0
+
+
+def play(path, preferred="", verbose=False, title=True):
     """Play a file. Returns True if something played, False if no player exists.
 
     Blocks (holding a machine-wide lock) until any other local-tts playback --
@@ -115,7 +123,13 @@ def play(path, preferred="", verbose=False):
     stream = None if verbose else subprocess.DEVNULL
     with open(playback_lock_path(), "a+") as handle:
         filelock.acquire(handle)
+        painted = False
         try:
+            if title:
+                # This process owns the terminal for the whole blocking play, so
+                # unlike play_detached() it can write straight to stderr.
+                write_terminal_title(title_for(path, _safe_duration(path)))
+                painted = True
             try:
                 subprocess.run(cmd, check=True, stdout=stream, stderr=stream)
             except subprocess.CalledProcessError as exc:
@@ -123,6 +137,8 @@ def play(path, preferred="", verbose=False):
             except KeyboardInterrupt:
                 return True
         finally:
+            if painted:
+                write_terminal_title("")
             filelock.release(handle)
     return True
 
@@ -243,7 +259,66 @@ def is_running(pid):
     return True
 
 
-def play_detached(path, preferred="", verbose=False, session=None):
+# -- terminal title -------------------------------------------------------
+#
+# A speaker icon in the tab/window title is the one progress indicator that
+# survives the agent's own chat output scrolling away. Playback is detached, so
+# the process that *starts* it exits long before the audio ends -- it cannot
+# clear the title afterwards. The runner (_playback_runner.py) outlives the
+# audio and does both, but start_new_session() leaves it with no controlling
+# terminal, so it cannot find the tty by itself. We therefore resolve the tty
+# path here, while we still have one, and hand it over.
+
+TITLE_ICON = "\U0001f50a"          # speaker
+_OSC_TITLE = "\033]0;%s\007"      # sets icon name and window title together
+
+
+def terminal_path():
+    """Path of the terminal attached to this process, or "" if there isn't one.
+
+    Checked across all three standard fds because any one of them may be
+    redirected (a pipe into `boost`, `-o` capture, a hook harness) while the
+    others are still the real terminal.
+    """
+    for fd in (2, 1, 0):
+        try:
+            if os.isatty(fd):
+                return os.ttyname(fd)
+        except (OSError, AttributeError):     # AttributeError: no ttyname on Windows
+            continue
+    return ""
+
+
+def write_terminal_title(text, tty=""):
+    """Set the terminal title, or clear it when `text` is empty. Never raises:
+    a title is cosmetic and must not take playback down with it."""
+    try:
+        payload = (_OSC_TITLE % text).encode("utf-8", "replace")
+        if tty:
+            # O_NOCTTY: opening a tty from a session with no controlling terminal
+            # would otherwise claim it as ours, which would put the runner in the
+            # user's foreground process group.
+            fd = os.open(tty, os.O_WRONLY | getattr(os, "O_NOCTTY", 0))
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
+        elif sys.stderr and sys.stderr.isatty():
+            sys.stderr.buffer.write(payload)
+            sys.stderr.flush()
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def title_for(path, duration_seconds=0.0):
+    """The title text shown while `path` plays."""
+    label = os.path.basename(path) or "audio"
+    if duration_seconds and duration_seconds > 0:
+        return "%s %s %s" % (TITLE_ICON, format_time(duration_seconds), label)
+    return "%s %s" % (TITLE_ICON, label)
+
+
+def play_detached(path, preferred="", verbose=False, session=None, title=True):
     """Start playback in the background. Returns (pid, duration_seconds), or (None, 0).
 
     Does not itself block, but the audio may: it's queued behind a small runner
@@ -267,8 +342,10 @@ def play_detached(path, preferred="", verbose=False, session=None):
     except (wave.Error, EOFError, OSError):
         length = 0.0
 
+    tty = terminal_path() if title else ""
     runner_cmd = [sys.executable, "-m", "localtts._playback_runner",
-                 playback_lock_path(), session or ""] + cmd
+                 playback_lock_path(), session or "", tty,
+                 title_for(path, length)] + cmd
     kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "stdin": subprocess.DEVNULL}
     if sys.platform == "win32":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -351,6 +428,9 @@ def stop_playback(session=None):
             return False, "could not stop pid %d: %s" % (pid, exc)
     path = state.get("path")
     clear_state(session)
+    # SIGTERM/taskkill kills the runner outright, so its own title-clearing `finally`
+    # never runs. We are the ones with a terminal here, so clear it from this side.
+    write_terminal_title("")
     return True, "stopped: %s" % (path or pid)
 
 

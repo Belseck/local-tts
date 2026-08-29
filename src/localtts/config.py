@@ -18,6 +18,10 @@ DEFAULTS = {
     "play": True,
     # Force a specific playback command (e.g. "ffplay"). Empty => autodetect.
     "player": "",
+    # Show a speaker icon in the terminal's tab/window title while audio plays,
+    # restoring the title when it stops. Purely cosmetic and skipped entirely when
+    # there's no terminal to write to (piped output, a hook, CI).
+    "terminal_title": True,
     # Which backend speaks which language, e.g.
     #   {"es": {"provider": "piper", "voice": "~/voices/es_MX-claude-high.onnx"}}
     # Shared by every coding agent so the preference is remembered in one place.
@@ -136,6 +140,18 @@ DEFAULTS = {
             "server_url": "",          # e.g. http://127.0.0.1:8766
             "server_start": "",        # command to launch it if not already reachable
             "server_timeout": 60,      # seconds to wait -- a cold torch+model load is slow
+            # A multi-model server holds several voices resident at once and picks one
+            # per request, so a second language no longer costs a second server (or a
+            # second copy of torch in memory). `server_models` maps the name the server
+            # was started with to the files behind it -- local-tts never loads these
+            # itself, it only names one in the request and reports them in `tts check`.
+            "server_models": {},       # {"jarvis": {"model": "...pth", "index": "...index"}}
+            # Which of those names to ask for. `language_models` wins when the call has
+            # a --lang; `server_model` is the fallback for everything else. Both empty
+            # means "whatever the server loaded first", i.e. today's single-model
+            # behavior, so an existing setup keeps working untouched.
+            "server_model": "",        # e.g. "jarvis"
+            "language_models": {},     # {"es": "cortana-es", "en": "jarvis"}
         },
         "command": {
             # Escape hatch: any CLI that writes a wav file.
@@ -152,7 +168,7 @@ DEFAULTS = {
 }
 
 
-TOP_LEVEL_KEYS = ("provider", "play", "player")
+TOP_LEVEL_KEYS = ("provider", "play", "player", "terminal_title")
 LANGUAGE_KEYS = ("provider", "voice")
 
 
@@ -321,12 +337,41 @@ def set_values(assignments):
             if provider not in DEFAULTS["providers"]:
                 raise TTSError("unknown provider %r" % provider)
             known = DEFAULTS["providers"][provider]
+            # A dict-valued setting (rvc.language_models, rvc.server_models) takes one
+            # more level, so a single entry can be set without rewriting the whole map
+            # as JSON: `rvc.language_models.es=cortana-es`. Setting it to an empty value
+            # removes that entry rather than storing a blank one.
+            entry = ""
+            if sub not in known and "." in sub:
+                head, _, entry = sub.partition(".")
+                if head in known and not isinstance(known[head], dict):
+                    raise TTSError(
+                        "%s.%s is a single value, not a map -- use %s.%s=<value>"
+                        % (provider, head, provider, head)
+                    )
+                if isinstance(known.get(head), dict):
+                    if not entry:
+                        raise TTSError("expected %s.%s.<name>=<value>" % (provider, head))
+                    sub = head
+                else:
+                    entry = ""          # unknown head: fall through to the normal error
             if sub not in known:
                 raise TTSError(
                     "unknown key %r for provider %r (valid: %s)"
                     % (sub, provider, ", ".join(sorted(known)))
                 )
-            user.setdefault("providers", {}).setdefault(provider, {})[sub] = _coerce(raw, known[sub])
+            bucket = user.setdefault("providers", {}).setdefault(provider, {})
+            if entry:
+                target = bucket.setdefault(sub, {})
+                if not isinstance(target, dict):
+                    target = {}
+                    bucket[sub] = target
+                if raw == "":
+                    target.pop(entry, None)
+                else:
+                    target[entry] = raw
+            else:
+                bucket[sub] = _coerce(raw, known[sub])
         else:
             if key not in TOP_LEVEL_KEYS:
                 raise TTSError(

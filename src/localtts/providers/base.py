@@ -25,6 +25,17 @@ class Provider:
     #: synthesize_chunked() strips the tags before a provider that can't use them ever
     #: sees the literal brackets, rather than have it try to pronounce them.
     supports_tone_tags = False
+    #: Which dimensions of a tone profile this backend applies *itself*. Anything left
+    #: False is realized after synthesis instead (audiofx.apply_profile), so an emotion
+    #: still sounds different on a backend with no such flag. A provider that varies
+    #: tone only through free-text instructions (openai) still sets both, because its
+    #: own request carries the speed and the model performs the loudness.
+    realizes_speed = False
+    realizes_volume = False
+    #: True for a provider that splits tone segments itself (rvc, which must convert each
+    #: one separately or they all come out with a single flat tone). text.
+    #: synthesize_chunked() then leaves the segmenting to it instead of doing its own.
+    handles_tone_segments = False
 
     @property
     def max_words(self):
@@ -42,9 +53,13 @@ class Provider:
         """
         return max(1, int(self.settings.get("max_workers") or 1))
 
-    def __init__(self, settings, verbose=False, cfg=None):
+    def __init__(self, settings, verbose=False, cfg=None, lang=""):
         self.settings = settings
         self.verbose = verbose
+        #: The --lang tag this call resolved to ("" when none was given). Only
+        #: providers that vary per language need it -- rvc picks which resident
+        #: voice model to ask a multi-model server for.
+        self.lang = lang or ""
         #: The full loaded configuration, not just this provider's own settings sub-dict.
         #: None unless the caller passed one via providers.build(). Only providers that
         #: compose another provider (rvc, chaining a base TTS backend) need this; most

@@ -22,6 +22,8 @@ class OpenAIProvider(Provider):
     name = "openai"
     default_format = "mp3"
     supports_tone_tags = True
+    realizes_speed = True
+    realizes_volume = True
 
     def api_key(self):
         return self.settings.get("api_key") or os.environ.get("OPENAI_API_KEY", "")

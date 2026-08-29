@@ -16,6 +16,8 @@ class PiperProvider(Provider):
     #: against `piper --help` -- so a <tag>'s speed/volume can be genuinely realized here,
     #: not just its instructions phrase (which piper has no hook for at all).
     supports_tone_tags = True
+    realizes_speed = True
+    realizes_volume = True
 
     def build_command(self, text, out_path, voice=None, overrides=None):
         """The text is piped on stdin, so it does not appear in the argv. `overrides`

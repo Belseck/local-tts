@@ -32,11 +32,11 @@ def names():
     return list(REGISTRY)
 
 
-def build(name, cfg, verbose=False):
+def build(name, cfg, verbose=False, lang=""):
     if name not in REGISTRY:
         raise TTSError("unknown provider %r (available: %s)" % (name, ", ".join(names())))
     settings = dict(cfg.get("providers", {}).get(name, {}))
-    return REGISTRY[name](settings, verbose=verbose, cfg=cfg)
+    return REGISTRY[name](settings, verbose=verbose, cfg=cfg, lang=lang)
 
 
 __all__ = ["REGISTRY", "DESCRIPTIONS", "Provider", "build", "names"]

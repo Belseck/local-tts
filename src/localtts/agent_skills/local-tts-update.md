@@ -129,12 +129,42 @@ tts hooks --install     # only if `tts hooks --status` shows one is active
 ```
 
 **A kokoro or rvc persistent server**, if either is configured (`kokoro.server_url` /
-`rvc.server_url` set — `tts check` shows whether one is currently running). Its script is
-also a copy, written into the provider's own venv, never touched by `git pull`. This only
-matters if step 3's commit list mentions the server protocol (the `/synthesize` or
-`/convert` request shape) changing — if so, kill the running process; the next call starts
-a fresh one from whatever script is on disk. Otherwise leave it running, there's nothing to
-do here.
+`rvc.server_url` set — `tts check` shows whether one is currently running). Its script
+(`kokoro_server.py` / `rvc_server.py`) lives inside the provider's own venv, written there
+once by an agent following the configure skill. **`git pull` never touches it**, and it is
+the single most likely thing to be stale after an update: the script is *not* installed by
+`tts skills --install` either, so nothing refreshes it automatically.
+
+**Compare it against the current template and rewrite it if they differ**, rather than
+assuming it is fine:
+
+```bash
+tts skills --print local-tts-configure | grep -n "rvc_server.py\|kokoro_server.py"
+diff <(tts skills --print local-tts-configure | sed -n '/^cat > .*rvc_server.py/,/^EOF$/p' \
+        | sed '1d;$d') ~/.local/share/rvc-venv/rvc_server.py
+```
+
+Any difference means the running server is missing whatever the update added. Rewrite the
+script from the block in the freshly-printed configure skill, then **kill the running
+process** — the next `tts` call auto-starts a fresh one from the new file. Do this
+whenever the diff is non-empty, not only when the commit list happens to mention servers;
+a server script silently missing a flag is exactly the kind of thing that looks like a
+voice-quality problem instead of a stale file.
+
+Capabilities added to these scripts over time that an older copy will not have — check for
+each, since a missing one fails silently rather than erroring:
+
+- **multiple models in one server** (`--model NAME=PATH`, repeatable, plus `/models`), so
+  one process serves several languages instead of one server per voice
+- **conversion parameters at startup** (`--index-rate`, `--protect`, `--f0method`,
+  `--pitch`) — without these the server runs rvc-python's own defaults no matter what
+  `tts config` says, because the request body carries only `input_path`, `model` and
+  `pitch`
+- **`--idle-timeout`**, which releases the model (and VRAM) after 5 minutes idle
+
+If you rewrite an rvc server that was serving one voice per port, this is also the moment
+to collapse those into a single multi-model server and set `rvc.language_models` — mention
+it to the user, since it frees a whole copy of torch.
 
 ## 7. Check for a `command` provider that a new update now supports natively
 

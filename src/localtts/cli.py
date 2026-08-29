@@ -178,7 +178,7 @@ def speak(argv):
         raise TTSError("nothing to speak: the input was empty")
 
     name, voice = _resolve_language(cfg, args)
-    provider = providers.build(name, cfg, verbose=args.verbose)
+    provider = providers.build(name, cfg, verbose=args.verbose, lang=args.lang or "")
     _apply_overrides(provider, args)
 
     if args.output:
@@ -302,7 +302,8 @@ def speak(argv):
         if should_play and args.background:
             session = _resolve_session(args.session)
             pid, length = audio.play_detached(out_path, args.player or cfg["player"],
-                                              verbose=args.verbose, session=session)
+                                              verbose=args.verbose, session=session,
+                                              title=bool(cfg.get("terminal_title", True)))
             played = pid is not None
             if played:
                 # `tts stop` (no flag) resolves the same session automatically as long as
@@ -314,7 +315,8 @@ def speak(argv):
             # The file outlives this process, so it must not be deleted on the way out.
             temporary = False
         elif should_play:
-            played = audio.play(out_path, args.player or cfg["player"], verbose=args.verbose)
+            played = audio.play(out_path, args.player or cfg["player"], verbose=args.verbose,
+                                title=bool(cfg.get("terminal_title", True)))
 
         if should_play and not played:
             print("no audio player found (tried: %s). Install ffmpeg, or use --output."

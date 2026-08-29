@@ -30,6 +30,7 @@ class KokoroProvider(Provider):
     #: pitch knob exists anywhere in kokoro/kokoro_onnx, so a <tag>'s volume multiplier is
     #: simply not realized here (honest silence, not a fabricated flag).
     supports_tone_tags = True
+    realizes_speed = True    # -s is real; no volume knob exists, so audiofx does that
 
     def _model_dir(self):
         model_dir = os.path.expanduser(self.settings.get("model_dir") or "")
