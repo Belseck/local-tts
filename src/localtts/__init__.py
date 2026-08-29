@@ -1,3 +1,3 @@
 """local-tts: a tiny, dependency-free CLI for local text-to-speech."""
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
