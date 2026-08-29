@@ -361,6 +361,113 @@ def play_detached(path, preferred="", verbose=False, session=None, title=True):
     return process.pid, length
 
 
+# --- streamed playback -------------------------------------------------
+#
+# Long text sounds late: with one joined file nothing plays until the *last* fragment is
+# rendered, which for a tagged story or a document is most of a minute of silence.
+# Streaming inverts that -- each fragment is published the moment it exists and the
+# runner plays them in order while the rest are still being made, so time-to-first-sound
+# stops depending on the length of the text.
+#
+# The hand-off is a directory rather than a pipe because producer and runner are separate
+# processes with no shared handles, and the runner may still be queued behind another
+# session's audio when the first fragment lands. Parts are numbered, written under a
+# temporary name and renamed into place, so the runner can never read a half-written wav.
+# `done` records the final count, which is also how the runner learns the producer
+# finished rather than died.
+
+STREAM_DONE = "done"
+
+
+def stream_new():
+    return tempfile.mkdtemp(prefix="local-tts-stream-")
+
+
+def stream_part_path(stream_dir, index):
+    return os.path.join(stream_dir, "%04d.wav" % index)
+
+
+def stream_add(stream_dir, index, src):
+    """Publish one finished fragment. Copied, not moved: the producer still needs its own
+    part to join into the single output file afterwards."""
+    final = stream_part_path(stream_dir, index)
+    temporary = final + ".part"
+    shutil.copyfile(src, temporary)
+    os.replace(temporary, final)      # atomic: no half-written wav is ever visible
+    return final
+
+
+def stream_finish(stream_dir, count):
+    """Record that no further fragments are coming. Written the same rename-into-place
+    way, so a runner polling for it never sees an empty file and reads 0 parts."""
+    temporary = os.path.join(stream_dir, STREAM_DONE + ".part")
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(str(int(count)))
+        os.replace(temporary, os.path.join(stream_dir, STREAM_DONE))
+    except OSError:
+        pass
+
+
+def stream_count(stream_dir):
+    """Final fragment count, or None while the producer is still going."""
+    try:
+        with open(os.path.join(stream_dir, STREAM_DONE), "r", encoding="utf-8") as handle:
+            return int((handle.read() or "0").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def stream_known_duration(stream_dir):
+    """Total length of the fragments published *so far*. Grows as the producer works, so
+    a progress bar over a stream is honest about what it knows rather than pretending to
+    a total nobody can compute until synthesis ends."""
+    total, index = 0.0, 0
+    while True:
+        part = stream_part_path(stream_dir, index)
+        if not os.path.exists(part):
+            return total
+        total += _safe_duration(part)
+        index += 1
+
+
+def stream_cleanup(stream_dir):
+    shutil.rmtree(stream_dir, ignore_errors=True)
+
+
+def play_stream_detached(stream_dir, preferred="", verbose=False, session=None, title=True,
+                         producer_pid=None, label=""):
+    """Start a background runner that plays fragments from `stream_dir` in order as they
+    appear. Returns (pid, popen), or (None, None) when no player exists at all.
+
+    Unlike play_detached() the total duration is not known yet -- it grows as fragments
+    land -- so the state file starts at zero and the runner keeps it current.
+    """
+    if not find_player(stream_part_path(stream_dir, 0), preferred):
+        return None, None
+    stop_previous(session=session)
+    tty = terminal_path() if title else ""
+    runner_cmd = [sys.executable, "-m", "localtts._playback_runner", "--stream",
+                  playback_lock_path(), session or "", tty, "1" if title else "",
+                  stream_dir, preferred or "", str(int(producer_pid or 0)),
+                  label or stream_dir]
+    if verbose:
+        print("+ %s &" % " ".join(runner_cmd), file=sys.stderr)
+    kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+              "stdin": subprocess.DEVNULL}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        process = subprocess.Popen(runner_cmd, **kwargs)
+    except OSError as exc:
+        raise TTSError("could not start playback: %s" % exc)
+    _write_state(process.pid, label or stream_dir, duration_seconds=0.0,
+                 segment_start=None, session=session)
+    return process.pid, process
+
+
 def _elapsed(state):
     base = float(state.get("elapsed") or 0.0)
     segment_start = state.get("segment_start")

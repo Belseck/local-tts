@@ -12,11 +12,11 @@ varies by segment -- shaping the join afterwards could not tell them apart.
 
 Deliberately dependency-free: volume is exact integer scaling via `array`, and time
 stretching prefers ffmpeg's `atempo` (proper, pitch-preserving) with a pure-Python
-overlap-add fallback so the feature never silently does nothing on a machine without
-ffmpeg. Both are no-ops for a factor of 1.0, so the untagged path is untouched.
+WSOLA fallback so the feature never silently does nothing on a machine without ffmpeg. Both are no-ops for a factor of 1.0, so the untagged path is untouched.
 """
 
 import array
+import math
 import os
 import shutil
 import subprocess
@@ -89,13 +89,73 @@ def _ffmpeg_tempo(path, factor):
             os.unlink(tmp)
 
 
-def _ola_tempo(path, factor):
-    """Overlap-add time stretch: pure stdlib, keeps pitch roughly intact.
+#: WSOLA alignment search radius, in seconds. Has to cover at least one pitch period of
+#: the lowest voice we care about (~70 Hz -> 14 ms) or the search cannot find the phase
+#: match it is looking for.
+_SEARCH_SECONDS = 0.015
+#: The search runs in two passes: a coarse sweep of the whole radius, then a fine sweep
+#: of +/-_COARSE_STRIDE around the winner. Alignment has to be accurate to a few degrees
+#: of a pitch period -- at a coarse stride alone a 220 Hz tone loses a fifth of its
+#: energy -- but paying that accuracy across the entire radius costs four times as much
+#: for the same answer. This is pure Python, and it runs on every tagged span.
+_COARSE_STRIDE = 8
+#: Correlation is evaluated on every _CORR_STRIDE'th sample of the overlap.
+_CORR_STRIDE = 2
 
-    Cross-fades fixed-size output windows taken from input positions advancing at
-    `factor` times the output rate. Not as clean as atempo on music, entirely adequate
-    for a sentence of speech, and it means the fallback path still changes the timing
-    instead of doing nothing.
+
+def _match_score(samples, channels, start, tail, overlap):
+    """Normalized correlation between the input at `start` and what was just emitted.
+    Normalized because a plain dot product just picks whichever candidate is loudest,
+    which is not the same question as which one lines up."""
+    dot = energy = 0.0
+    base = start * channels
+    for i in range(0, overlap, _CORR_STRIDE):
+        a = tail[i * channels]
+        b = samples[base + i * channels]
+        dot += a * b
+        energy += b * b
+    return dot / math.sqrt(energy) if energy > 0 else 0.0
+
+
+def _best_offset(samples, channels, ideal, tail, overlap, limit, radius):
+    """The input offset near `ideal` whose leading samples best continue what was just
+    emitted -- the "waveform similarity" in WSOLA.
+
+    This is the whole difference between speech and a robot. A blind fixed hop lands at
+    an arbitrary point in the pitch period, so each cross-fade sums two copies of the
+    same harmonic at a different phase; they partly cancel, and because the error walks
+    with every window the cancellation modulates at the hop rate and reads as a buzz.
+    Aligning first means the two halves of every cross-fade are already in phase.
+    """
+    low = max(0, ideal - radius)
+    high = min(limit, ideal + radius)
+    if high <= low:
+        return max(0, min(ideal, limit))
+
+    best_score, best = None, max(low, min(ideal, high))
+    for start in range(low, high + 1, _COARSE_STRIDE):
+        score = _match_score(samples, channels, start, tail, overlap)
+        if best_score is None or score > best_score:
+            best_score, best = score, start
+    for start in range(max(low, best - _COARSE_STRIDE),
+                       min(high, best + _COARSE_STRIDE) + 1):
+        score = _match_score(samples, channels, start, tail, overlap)
+        if score > best_score:
+            best_score, best = score, start
+    return best
+
+
+def _ola_tempo(path, factor):
+    """WSOLA time stretch: pure stdlib, keeps pitch intact.
+
+    Emits fixed-size output windows cross-faded into each other, taking each one from
+    the input position that both advances at `factor` times the output rate *and* best
+    continues the waveform already emitted (see _best_offset). The ideal input position
+    still advances by exactly one hop per window regardless of which offset was chosen,
+    so alignment never accumulates into timing drift.
+
+    Not quite ffmpeg's atempo, but close enough for a sentence of speech, and it means a
+    machine without ffmpeg gets a real, listenable tempo change rather than a buzz.
     """
     params, raw = _read(path)
     channels = params.nchannels
@@ -108,12 +168,20 @@ def _ola_tempo(path, factor):
     overlap = window // 2
     hop_out = window - overlap
     hop_in = hop_out * factor
+    radius = max(_COARSE_STRIDE, int(params.framerate * _SEARCH_SECONDS))
+    limit = total - window - 1
+    if limit <= 0:
+        return False
     out = array.array("h", bytes(0))
     fade = [i / float(overlap) for i in range(overlap)]
-    position = 0.0
+    ideal = 0.0
     previous_tail = None
-    while int(position) + window < total:
-        start = int(position)
+    while int(ideal) < limit:
+        if previous_tail is None:
+            start = int(ideal)
+        else:
+            start = _best_offset(samples, channels, int(ideal), previous_tail,
+                                 overlap, limit, radius)
         block = samples[start * channels:(start + window) * channels]
         if previous_tail is not None:
             for i in range(overlap):
@@ -122,7 +190,7 @@ def _ola_tempo(path, factor):
                     block[k] = int(previous_tail[k] * (1.0 - fade[i]) + block[k] * fade[i])
         out.extend(block[:hop_out * channels])
         previous_tail = block[hop_out * channels:]
-        position += hop_in
+        ideal += hop_in
     if previous_tail:
         out.extend(previous_tail)
     if not out:

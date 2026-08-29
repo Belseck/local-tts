@@ -30,11 +30,12 @@ class RvcProvider(Provider):
     #: on them and shapes each converted span. Declaring this keeps synthesize_chunked()
     #: from stripping the markup before rvc ever gets to see where the spans are.
     supports_tone_tags = True
-    #: Neither dimension is realized during synthesis. resolve_tone_segments() hands back
-    #: tag-free text, so the base provider is given no markup to act on even when it
-    #: could (piper's --length-scale) -- the profile is applied to the converted audio
-    #: instead. Stated explicitly because assuming the base did it would silently drop
-    #: the emotion.
+    #: Neither dimension is realized by *rvc itself* -- conversion has no text, tone or
+    #: rate input at all. Speed is nonetheless realized at synthesis time whenever the
+    #: base provider has a real rate control, by handing it Provider.speed_settings()
+    #: (see _synthesize_one); only what the base cannot do falls through to audiofx.
+    #: These stay False because they describe this backend's own hooks, and
+    #: _synthesize_with_audiofx() reads them to decide what is left over.
     realizes_speed = False
     realizes_volume = False
 
@@ -132,6 +133,7 @@ class RvcProvider(Provider):
         try:
             for (chunk, profile), part in zip(segments, parts):
                 self._synthesize_one(base, chunk, part, voice, profile)
+                self.emit_part(part)
             audiomod.concat_wavs(parts, out_path)
         finally:
             for part in parts:
@@ -142,15 +144,35 @@ class RvcProvider(Provider):
         return out_path
 
     def _synthesize_one(self, base, chunk, out_path, voice, profile):
-        """Base synthesis -> conversion -> whatever tone the base could not realize.
+        """Base synthesis -> conversion -> whatever tone is still unrealized.
 
-        resolve_tone_segments() strips the markup, so the base is handed plain text and
-        realizes nothing itself -- the profile is applied here, once, to the converted
-        span. Applied *after* conversion rather than before so the shaping survives:
-        rvc resynthesizes its output and would otherwise flatten it back out.
+        Speed is pushed down to the base provider whenever it has a real rate control
+        (piper's --length-scale, kokoro's -s). Conversion is frame-wise and preserves
+        duration exactly, so pacing chosen before it survives it intact -- and asking
+        piper to speak slowly is a genuine prosody change, where time-stretching the
+        rendered wav afterwards is a lossy pass over every sample that reads as a robotic
+        buzz. resolve_tone_segments() has already stripped the markup by this point, so
+        the speed has to travel as a setting rather than as a tag the base could see.
+
+        Volume cannot travel the same way: rvc renormalizes amplitude, so a quieter base
+        comes back at full level. It stays a post-conversion step, which costs nothing --
+        apply_volume is exact integer scaling, not a resampling.
         """
         from localtts import audiofx
         from localtts import text as textutil
+
+        speed = profile["speed"] if profile else 1.0
+        volume = profile["volume"] if profile else 1.0
+        residual_speed = speed
+        if abs(speed - 1.0) >= audiofx.EPSILON:
+            # getattr rather than a direct call: the base is duck-typed here (see the
+            # auto_tone lookup in synthesize()), so anything without the hook simply
+            # keeps the old audiofx path.
+            speed_settings = getattr(base, "speed_settings", None)
+            overrides = speed_settings(speed) if speed_settings else None
+            if overrides:
+                base = base.with_settings(overrides)
+                residual_speed = 1.0
 
         handle, base_wav = tempfile.mkstemp(prefix="local-tts-rvc-base-", suffix=".wav")
         os.close(handle)
@@ -169,11 +191,7 @@ class RvcProvider(Provider):
             raise TTSError("rvc-python wrote no audio to %s" % out_path)
 
         if profile:
-            audiofx.apply_profile(
-                out_path,
-                speed=1.0 if self.realizes_speed else profile["speed"],
-                volume=1.0 if self.realizes_volume else profile["volume"],
-            )
+            audiofx.apply_profile(out_path, speed=residual_speed, volume=volume)
         return out_path
 
 

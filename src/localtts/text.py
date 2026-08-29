@@ -1,6 +1,7 @@
 """Turning documents into speakable text: markdown stripping and chunking."""
 
 import concurrent.futures
+import contextlib
 import os
 import re
 import tempfile
@@ -280,6 +281,26 @@ def strip_tone_tags(text):
 
 
 
+@contextlib.contextmanager
+def _own_the_stream(provider):
+    """Take fragment publishing away from `provider` for the duration of a loop that is
+    itself producing the ordered parts, and hand that loop the sink.
+
+    Without this a provider that also emits internally (its own tone segments) would
+    publish both its pieces and ours, and the stream would play the same audio twice.
+    Whoever owns the outermost loop owns the ordering, so it owns the sink.
+    """
+    sink = getattr(provider, "on_part", None)
+    if sink is None:
+        yield None
+        return
+    provider.on_part = None
+    try:
+        yield sink
+    finally:
+        provider.on_part = sink
+
+
 def _synthesize_with_audiofx(provider, text, out_path, voice, on_progress):
     """Render `text` segment by segment, applying each segment's speed/volume to its own
     wav, and join the result. Returns the output path, or None when this is not worth
@@ -294,6 +315,8 @@ def _synthesize_with_audiofx(provider, text, out_path, voice, on_progress):
 
     if provider.default_format != "wav":
         return None
+    if not getattr(provider, "allow_audio_fx", True):
+        return None      # the backend's own output is left exactly as it rendered it
     settings = getattr(provider, "settings", None) or {}
     segments = resolve_tone_segments(text, auto_tone=bool(settings.get("auto_tone")))
     if len(segments) == 1 and segments[0][1] is None:
@@ -313,11 +336,14 @@ def _synthesize_with_audiofx(provider, text, out_path, voice, on_progress):
     work = tempfile.mkdtemp(prefix="local-tts-tone-")
     parts = [os.path.join(work, "%04d.wav" % index) for index in range(len(pending))]
     try:
-        for index, ((chunk, speed, volume), part) in enumerate(zip(pending, parts)):
-            provider.synthesize(strip_tone_tags(chunk), part, voice=voice)
-            audiofx.apply_profile(part, speed=speed, volume=volume)
-            if on_progress:
-                on_progress(index + 1, len(pending))
+        with _own_the_stream(provider) as emit:
+            for index, ((chunk, speed, volume), part) in enumerate(zip(pending, parts)):
+                provider.synthesize(strip_tone_tags(chunk), part, voice=voice)
+                audiofx.apply_profile(part, speed=speed, volume=volume)
+                if emit:
+                    emit(part)          # playable now; the rest are still being made
+                if on_progress:
+                    on_progress(index + 1, len(pending))
         audio.concat_wavs(parts, out_path)
     finally:
         for part in parts:
@@ -371,26 +397,41 @@ def synthesize_chunked(provider, text, out_path, voice=None, on_progress=None):
     done = 0
     done_lock = threading.Lock()
 
-    def synth_one(index):
-        nonlocal done
-        provider.synthesize(pieces[index], parts[index], voice=voice)
-        with done_lock:
-            done += 1
-            if on_progress:
-                on_progress(done, len(pieces))
+    with _own_the_stream(provider) as emit:
+        finished, next_to_emit = set(), 0
 
-    workers = max(1, min(provider.max_workers, len(pieces)))
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
-    try:
-        futures = [pool.submit(synth_one, index) for index in range(len(pieces))]
-        for future in concurrent.futures.as_completed(futures):
-            future.result()  # re-raises the first chunk failure; others keep running
-        audio.concat_wavs(parts, out_path)
-    finally:
-        pool.shutdown(wait=True, cancel_futures=True)
-        for part in parts:
-            if os.path.exists(part):
-                os.unlink(part)
-        if os.path.isdir(work):
-            os.rmdir(work)
+        def publish(index):
+            """Chunks finish out of order but must be *heard* in order, so a chunk is
+            published only once every chunk before it has been. Called with done_lock
+            held."""
+            nonlocal next_to_emit
+            finished.add(index)
+            while next_to_emit in finished:
+                emit(parts[next_to_emit])
+                next_to_emit += 1
+
+        def synth_one(index):
+            nonlocal done
+            provider.synthesize(pieces[index], parts[index], voice=voice)
+            with done_lock:
+                done += 1
+                if emit:
+                    publish(index)
+                if on_progress:
+                    on_progress(done, len(pieces))
+
+        workers = max(1, min(provider.max_workers, len(pieces)))
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+        try:
+            futures = [pool.submit(synth_one, index) for index in range(len(pieces))]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()  # re-raises the first chunk failure; others keep running
+            audio.concat_wavs(parts, out_path)
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+            for part in parts:
+                if os.path.exists(part):
+                    os.unlink(part)
+            if os.path.isdir(work):
+                os.rmdir(work)
     return out_path

@@ -206,6 +206,20 @@ tts check
 tts skills
 ```
 
+Read the `tone shaping:` line in `tts check`. If it says **built-in WSOLA**, ffmpeg is
+missing, and every tone tag that changes pacing (`<happy>`, `<sad>`, `<whisper>`, most of
+them) is being retimed in pure Python instead of through ffmpeg's `atempo`. That is
+listenable but audibly noisier, and nothing else ever reports it — so an update is a
+natural moment to offer it:
+
+```bash
+sudo apt install ffmpeg     # Debian/Ubuntu (needs sudo — ask first)
+brew install ffmpeg         # macOS
+```
+
+Say what it improves and let the user decide; never install it as part of a routine
+update. Skip the offer entirely if the line already says `ffmpeg atempo`.
+
 Confirm the version actually moved and that `tts check` still shows `[ok]` on the user's
 default provider — a missed `pyproject.toml`-driven reinstall (step 5) is exactly the kind
 of thing this would catch. Then tell the user what changed, using the commit list from step

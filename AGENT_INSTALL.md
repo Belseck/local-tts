@@ -265,6 +265,15 @@ brew install ffmpeg         # macOS
 Without a player, synthesis still works: the file is kept and its path printed instead of
 being played.
 
+**Recommend ffmpeg even when a player was already found, and say why.** It does a second,
+less obvious job: tone tags (`<happy>`, `<sad>`, `<whisper>`) change a span's pacing, and
+on any backend without its own rate control that retiming is done to the rendered audio.
+With ffmpeg it goes through `atempo`; without it, through a built-in WSOLA stretch —
+listenable, but measurably noisier. A user who never installs ffmpeg gets audibly worse
+tagged speech and no error explaining it, so `tts check` reports which one is in use.
+It is not required, and it needs `sudo` on Linux — mention the benefit and ask, don't
+install it silently.
+
 ---
 
 ## Step 6b — Agent skills and the language memory — **ASK**

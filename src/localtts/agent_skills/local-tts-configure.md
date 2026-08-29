@@ -733,10 +733,29 @@ costs nothing when no tag asks for a change — untagged text still takes the pl
 single-call path, byte for byte as before.
 
 Speed uses ffmpeg's `atempo` when ffmpeg is on PATH (pitch-preserving), and falls back to
-a pure-Python overlap-add stretch otherwise, so the feature never silently does nothing on
-a machine without ffmpeg — it is just cleaner with it. Volume is exact integer scaling,
-clamped rather than wrapped. **Installing ffmpeg is the one thing that improves this**;
-mention it if a user says tagged speech sounds warbly, and ask before installing.
+a pure-Python WSOLA stretch otherwise, so the feature never silently does nothing on a
+machine without ffmpeg — it is just cleaner with it. Volume is exact integer scaling,
+clamped rather than wrapped.
+
+**If a user says tagged speech sounds robotic, buzzy or warbly, check ffmpeg first** —
+`tts check` prints a `tone shaping:` line naming which path is in use. This is the single
+most likely cause, because a tag's speed change touches every sample of the span:
+
+```bash
+command -v ffmpeg || echo "no ffmpeg -- tagged speech is using the built-in stretch"
+sudo apt install ffmpeg     # Debian/Ubuntu (needs sudo — ask first)
+brew install ffmpeg         # macOS
+```
+
+Recommend it during any install or configuration too, not only when something already
+sounds wrong — but **say what it buys and ask**, since it needs `sudo` on Linux. The
+fallback is deliberately adequate, so nothing is broken without ffmpeg; it is just worse,
+and silently so.
+
+The other reason a tag can sound wrong is the *base* voice, not the shaping: a tag whose
+profile leaves speed at 1.0 (`<question>`, `<confident>`, `<sarcastic>`) is never
+retimed at all, so if those sound fine and the rest do not, the shaping path is the
+culprit — and if all of them sound the same, the tags are not reaching the provider.
 
 Only 16-bit PCM wav can be shaped this way, which covers every offline backend. A provider
 whose `default_format` is compressed (openai's mp3) opts out rather than be decoded and
@@ -767,6 +786,34 @@ written to parse the markup itself — ask first, since local-tts has no way to 
 tts config --set command.tone_tags=pass
 ```
 
+**`command.audio_fx`** (default `false`) is the matching decision for the *audio* half.
+Every other backend has had its capabilities verified here, so whatever it cannot do at
+synthesis time is safely local-tts's to apply afterwards. A `command` template is somebody
+else's script: it may already vary its own delivery, and speeding up or rescaling audio it
+deliberately shaped would fight it. So by default the command's output is left exactly as
+it rendered it. Turn it on only when the user confirms their script does nothing with tone:
+
+```bash
+tts config --set command.audio_fx=true
+```
+
+## Streaming playback (on by default)
+
+Long text used to be silent until the *last* fragment was rendered — most of a minute for
+a tagged story. Each fragment is now played the moment it exists, while the rest are still
+being synthesized, so time-to-first-sound stops depending on how long the text is. The
+single joined file is still written exactly as before.
+
+```bash
+tts config --set stream=false     # go back to synthesize-everything-then-play
+tts --no-stream "..."             # or just for one run
+```
+
+It applies to any wav backend and needs no setup. `tts check` prints a `streaming:` line
+saying which mode is active. Leave it on unless a user has a specific reason to want one
+file assembled before anything is heard — the fragment boundaries are the tone-tag and
+chunk boundaries that were already there, so nothing is split that was not split before.
+
 ## Diagnosing
 
 | `tts check` / error says | Meaning | Fix |
@@ -777,6 +824,7 @@ tts config --set command.tone_tags=pass
 | `('x' is not on PATH)` on `command` | template points at a missing binary | install it or change the template |
 | `no api_key and $OPENAI_API_KEY is unset` | only matters if they use `openai` | export the key, or ignore |
 | `players : none found` | no audio player (Linux only) | install `ffmpeg`, or always use `-o` |
+| `tone shaping: built-in WSOLA` | no ffmpeg; tagged speech is retimed in pure Python | install `ffmpeg` for `atempo` — ask first, it needs sudo |
 | right words, wrong accent | llamacpp used for an unsupported language | switch that language to piper |
 
 Useful when something is off: `--verbose` streams the backend's own stderr, and `--dry-run`

@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import shutil
 import sys
 import tempfile
 
@@ -95,6 +96,11 @@ def _speak_parser():
     parser.add_argument("--play", action="store_true", help="play the audio even when --output is given")
     parser.add_argument("--no-play", action="store_true", help="never play, just report the file path")
     parser.add_argument("--player", help="playback command to use (default: autodetect)")
+    parser.add_argument("--stream", dest="stream", action="store_true", default=None,
+                        help="start playing the first fragment while the rest is still "
+                             "being synthesized (default; see the `stream` setting)")
+    parser.add_argument("--no-stream", dest="stream", action="store_false",
+                        help="synthesize the whole text first, then play one joined file")
     parser.add_argument("--keep", action="store_true", help="keep the temporary file and print its path")
     parser.add_argument("--dry-run", action="store_true", help="print the command that would run, then exit")
     parser.add_argument("--verbose", action="store_true", help="show the backend's own output")
@@ -293,14 +299,58 @@ def speak(argv):
             os.unlink(out_path)
         return 0
 
-    try:
-        _synthesize(provider, text, out_path, args)
+    should_play = not args.no_play and (
+        args.play or args.background or (temporary and cfg["play"]))
+    session = _resolve_session(args.session) if should_play else None
+    stream_on = cfg.get("stream", True) if args.stream is None else args.stream
+    # Streaming hands the player one fragment file at a time, so it needs a format every
+    # installed player can open standalone -- true of wav, not of a compressed stream
+    # (Windows' built-in player cannot take mp3 at all).
+    use_stream = should_play and stream_on and provider.default_format == "wav"
 
-        should_play = not args.no_play and (
-            args.play or args.background or (temporary and cfg["play"]))
+    sink = _StreamSink(audio.stream_new()) if use_stream else None
+    runner = None
+    try:
+        if sink:
+            # Started *before* synthesis so it is already queueing for the playback lock
+            # while the first fragment is still being made.
+            runner_pid, runner = audio.play_stream_detached(
+                sink.directory, args.player or cfg["player"], verbose=args.verbose,
+                session=session, title=bool(cfg.get("terminal_title", True)),
+                producer_pid=os.getpid(), label=out_path)
+            if runner is None:
+                audio.stream_cleanup(sink.directory)   # no player at all -- fall through
+                sink = None
+            else:
+                provider.on_part = sink.add
+
+        try:
+            _synthesize(provider, text, out_path, args)
+        finally:
+            provider.on_part = None
+            if sink:
+                # Also on failure: the runner must play whatever was rendered before the
+                # error and then stop, rather than wait on a producer that has given up.
+                if not sink.count and os.path.exists(out_path):
+                    sink.add(out_path)     # one part only -- stream it as a stream of one
+                sink.finish()
+
         played = False
-        if should_play and args.background:
-            session = _resolve_session(args.session)
+        if sink:
+            played = True
+            length = audio._safe_duration(out_path)
+            if args.background:
+                print("playing in the background (pid %d, %s) — `%s stop` to end it, "
+                      "`%s playback` for progress"
+                      % (runner_pid, audio.format_time(length), PROG, PROG), file=sys.stderr)
+                # The file outlives this process, so it must not be deleted on the way out.
+                temporary = False
+            else:
+                try:
+                    runner.wait()          # blocking playback, same as audio.play()
+                except KeyboardInterrupt:
+                    audio.stop_playback(session)
+        elif should_play and args.background:
             pid, length = audio.play_detached(out_path, args.player or cfg["player"],
                                               verbose=args.verbose, session=session,
                                               title=bool(cfg.get("terminal_title", True)))
@@ -331,6 +381,23 @@ def speak(argv):
         if temporary and os.path.exists(out_path):
             os.unlink(out_path)
     return 0
+
+
+class _StreamSink:
+    """Publishes finished fragments into a stream directory, numbering them in the order
+    they arrive. Providers call this through Provider.emit_part(); see audio.stream_add.
+    """
+
+    def __init__(self, directory):
+        self.directory = directory
+        self.count = 0
+
+    def add(self, path):
+        audio.stream_add(self.directory, self.count, path)
+        self.count += 1
+
+    def finish(self):
+        audio.stream_finish(self.directory, self.count)
 
 
 def _synthesize(provider, text, out_path, args):
@@ -416,7 +483,25 @@ def check(argv):
     print("")
     found = audio.available_players()
     print("players     : %s" % (", ".join(found) if found else "none found (install ffmpeg for ffplay)"))
+    print("tone shaping: %s" % _tone_shaping_status())
+    print("streaming   : %s" % ("on -- each fragment plays as it is synthesized"
+                                if cfg.get("stream", True) else
+                                "off (`%s config --set stream=true` to play as it renders)" % PROG))
     return 0 if ok_default else 1
+
+
+def _tone_shaping_status():
+    """Whether a <tag>'s speed change goes through ffmpeg or the built-in fallback.
+
+    Worth a line of its own because the difference is audible, not academic: the
+    fallback is a pure-Python WSOLA stretch, good enough for speech but measurably
+    noisier than ffmpeg's atempo, and there is no other way for a user to discover
+    which one their tagged speech is getting.
+    """
+    if shutil.which("ffmpeg"):
+        return "ffmpeg atempo (best quality)"
+    return ("built-in WSOLA -- install ffmpeg for cleaner tagged speech "
+            "(<happy>, <sad>, ... change pacing, and ffmpeg does that resampling better)")
 
 
 def playback_command(argv, action=None):

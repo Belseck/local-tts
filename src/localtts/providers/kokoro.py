@@ -30,7 +30,8 @@ class KokoroProvider(Provider):
     #: pitch knob exists anywhere in kokoro/kokoro_onnx, so a <tag>'s volume multiplier is
     #: simply not realized here (honest silence, not a fabricated flag).
     supports_tone_tags = True
-    realizes_speed = True    # -s is real; no volume knob exists, so audiofx does that
+    realizes_speed = True    # -s is real; volume is applied to the rendered
+    realizes_volume = False  # segment in synthesize(), since nothing else will
 
     def _model_dir(self):
         model_dir = os.path.expanduser(self.settings.get("model_dir") or "")
@@ -41,6 +42,10 @@ class KokoroProvider(Provider):
             raise TTSError("kokoro.model_dir is missing %s (looked in %s)"
                            % (", ".join(missing), model_dir))
         return model_dir
+
+    def speed_settings(self, speed):
+        """kokoro's speed is a direct rate multiplier, so it just compounds."""
+        return {"speed": float(self.settings.get("speed") or 1.0) * speed}
 
     def _effective_speed(self, profile):
         """Base `speed` setting times a <tag> profile's own speed multiplier, or just the
@@ -70,6 +75,8 @@ class KokoroProvider(Provider):
         return cmd
 
     def synthesize(self, text, out_path, voice=None):
+        from localtts import audiofx
+
         segments = textutil.resolve_tone_segments(text, auto_tone=bool(self.settings.get("auto_tone")))
         if len(segments) == 1 and segments[0][1] is None:
             self._run_one(segments[0][0], out_path, voice, None)
@@ -80,6 +87,13 @@ class KokoroProvider(Provider):
         try:
             for (chunk, profile), part in zip(segments, parts):
                 self._run_one(chunk, part, voice, self._effective_speed(profile))
+                # kokoro has no volume knob of its own, and declaring supports_tone_tags
+                # keeps synthesize_chunked()'s audiofx pass from ever running for us --
+                # so a tag's volume has to be applied right here or it is silently lost,
+                # which made <whisper> merely slow instead of quiet.
+                if profile and profile["volume"] != 1.0:
+                    audiofx.apply_profile(part, speed=1.0, volume=profile["volume"])
+                self.emit_part(part)
             audiomod.concat_wavs(parts, out_path)
         finally:
             for part in parts:

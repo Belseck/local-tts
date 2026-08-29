@@ -47,6 +47,11 @@ class PiperProvider(Provider):
             cmd += ["--volume", str(volume)]
         return cmd + list(settings.get("extra_args") or [])
 
+    def speed_settings(self, speed):
+        """length_scale is the inverse of rate (piper convention), so a >1 speed
+        multiplier divides it."""
+        return {"length_scale": float(self.settings.get("length_scale") or 1.0) / speed}
+
     def _prosody_overrides(self, profile):
         """Fold a <tag> profile's speed/volume multiplier into this call's *effective*
         length_scale/volume, on top of whatever base value is already configured --
@@ -56,7 +61,7 @@ class PiperProvider(Provider):
             return None
         overrides = {}
         if profile["speed"] != 1.0:
-            overrides["length_scale"] = float(self.settings.get("length_scale") or 1.0) / profile["speed"]
+            overrides.update(self.speed_settings(profile["speed"]))
         if profile["volume"] != 1.0:
             overrides["volume"] = float(self.settings.get("volume") or 1.0) * profile["volume"]
         return overrides or None
@@ -81,6 +86,7 @@ class PiperProvider(Provider):
         try:
             for (chunk, profile), part in zip(segments, parts):
                 self._run_one(chunk, part, voice, self._prosody_overrides(profile))
+                self.emit_part(part)
             audiomod.concat_wavs(parts, out_path)
         finally:
             for part in parts:

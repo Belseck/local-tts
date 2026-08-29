@@ -21,6 +21,16 @@ class CommandProvider(Provider):
         user chooses, not a capability this file verified."""
         return self.settings.get("tone_tags") == "pass"
 
+    @property
+    def allow_audio_fx(self):
+        """Off by default. For every other backend local-tts has verified what it can do
+        at synthesis time, so anything left over is safely ours to apply. Here the
+        command is somebody else's script: it may well act on the tags itself (or vary
+        its own delivery some other way), and speeding up or scaling audio it already
+        shaped would fight it. Turn it on with `command.audio_fx=true` when the script
+        is known to do nothing with tone."""
+        return bool(self.settings.get("audio_fx"))
+
     def build_command(self, text, out_path):
         template = self.settings.get("template") or ""
         if not template:

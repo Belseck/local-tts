@@ -685,6 +685,88 @@ class RvcProviderTest(unittest.TestCase):
             self.assertTrue(os.path.getsize(out) > 0)
         self.assertEqual(len(server.requests), 2, "one conversion per tone segment")
 
+    def test_tag_speed_is_realized_by_the_base_not_by_stretching(self):
+        """A tag's pacing is handed to the base provider's own rate control instead of
+        being time-stretched onto the converted wav afterwards.
+
+        Conversion is frame-wise and preserves duration, so speed chosen before it
+        survives it -- and asking piper to speak slowly is a real prosody change, where
+        stretching the rendered audio is a lossy pass over every sample. Volume cannot go
+        the same way: rvc renormalizes amplitude, so it stays a post-conversion step.
+        """
+        server = _FakeAudioServer("/convert", audio_bytes=_wav_bytes(1))
+        self.addCleanup(server.stop)
+        seen = []
+
+        class FakeBase:
+            name = "fake"
+            default_format = "wav"
+            max_words = 0
+            max_workers = 1
+            supports_tone_tags = False
+
+            def __init__(self, settings=None):
+                self.settings = settings or {}
+                self.verbose = False
+                self.cfg = None
+                self.lang = ""
+
+            def speed_settings(self, speed):
+                return {"length_scale": 1.0 / speed}
+
+            def with_settings(self, overrides):
+                return FakeBase(dict(self.settings, **overrides))
+
+            def synthesize(self, text, out_path, voice=None):
+                seen.append(self.settings.get("length_scale"))
+                with open(out_path, "wb") as fh:
+                    fh.write(_wav_bytes(1))
+                return out_path
+
+        provider = self.build(server_url=server.url)
+        provider.base_provider_instance = lambda: FakeBase()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.wav")
+            textutil.synthesize_chunked(
+                provider, "<tired>Slow.</tired> <urgent>Fast!</urgent> Plain.", out)
+
+        tired = textutil.tag_profile("tired")["speed"]
+        urgent = textutil.tag_profile("urgent")["speed"]
+        self.assertEqual(len(seen), 3)
+        self.assertAlmostEqual(seen[0], 1.0 / tired, places=6)
+        self.assertAlmostEqual(seen[1], 1.0 / urgent, places=6)
+        self.assertIsNone(seen[2], "untagged text must not be re-rated")
+
+    def test_a_base_without_a_rate_control_still_falls_back_to_stretching(self):
+        # The base is duck-typed, so anything without speed_settings keeps the old path
+        # rather than losing the tag entirely.
+        server = _FakeAudioServer("/convert", audio_bytes=_wav_bytes(1))
+        self.addCleanup(server.stop)
+        applied = []
+
+        class FakeBase:
+            name = "fake"
+            default_format = "wav"
+            max_words = 0
+            max_workers = 1
+            supports_tone_tags = False
+            settings = {}
+
+            def synthesize(self, text, out_path, voice=None):
+                with open(out_path, "wb") as fh:
+                    fh.write(_wav_bytes(1))
+                return out_path
+
+        provider = self.build(server_url=server.url)
+        provider.base_provider_instance = lambda: FakeBase()
+        with unittest.mock.patch.object(
+                audiofx, "apply_profile",
+                side_effect=lambda path, speed=1.0, volume=1.0: applied.append(speed)):
+            with tempfile.TemporaryDirectory() as tmp:
+                textutil.synthesize_chunked(
+                    provider, "<tired>Slow.</tired>", os.path.join(tmp, "out.wav"))
+        self.assertEqual(applied, [textutil.tag_profile("tired")["speed"]])
+
     def test_server_mode_does_not_require_python_or_model_configured(self):
         # Server mode is a fully separate path from the subprocess CLI fallback -- the
         # model is fixed by whatever the server was started with, not rvc.model/rvc.python.
@@ -2135,6 +2217,178 @@ class AudioFxTest(unittest.TestCase):
         with open(broken, "wb") as fh:
             fh.write(b"not a wav")
         self.assertFalse(audiofx.apply_profile(broken, speed=1.5, volume=2.0))
+
+    def fundamental_share(self, path, freq=220.0):
+        """Fraction of the signal's energy still at `freq`. A clean pitch-preserving
+        stretch of a pure tone returns a pure tone; a blind fixed-hop overlap-add
+        returns mostly phase-cancellation noise, which is what "robotic" sounds like."""
+        import array
+        import math
+        with wave.open(path, "rb") as w:
+            data = array.array("h"); data.frombytes(w.readframes(w.getnframes()))
+            rate = w.getframerate()
+        total = math.sqrt(sum(float(v) * v for v in data))
+        if not total:
+            return 0.0
+        coeff = 2 * math.cos(2 * math.pi * freq / rate)
+        s1 = s2 = 0.0
+        for value in data:
+            s1, s2 = value + coeff * s1 - s2, s1
+        magnitude = math.hypot(s1 - s2 * math.cos(2 * math.pi * freq / rate),
+                               s2 * math.sin(2 * math.pi * freq / rate))
+        return (magnitude * math.sqrt(2.0 / len(data))) / total
+
+    def test_fallback_stretch_preserves_the_waveform(self):
+        """Regression guard. The fallback used to advance by a blind fixed hop, so every
+        cross-fade summed the same harmonic at a different phase: a 220 Hz tone came back
+        with ~3% of its energy still at its own frequency and the rest as buzz. WSOLA aligns each
+        window to what was already emitted, which is what keeps speech sounding like
+        speech on a machine with no ffmpeg."""
+        self.assertGreater(self.fundamental_share(self.tone(seconds=1.0)), 0.99,
+                           "control: an untouched tone must read as pure")
+        for factor in (0.85, 0.95, 1.10):
+            path = self.tone(seconds=1.0)
+            self.assertTrue(audiofx._ola_tempo(path, factor))
+            self.assertGreater(self.fundamental_share(path), 0.90,
+                               "x%.2f lost the fundamental" % factor)
+
+
+class ToneRealizationTest(unittest.TestCase):
+    """What each backend actually does with a <tag>, checked against the audio."""
+
+    def peak(self, path):
+        import array
+        with wave.open(path, "rb") as w:
+            data = array.array("h"); data.frombytes(w.readframes(w.getnframes()))
+        return max(abs(x) for x in data)
+
+    def loud_wav(self, path, amplitude=10000, frames=4000):
+        import array
+        import math
+        samples = array.array("h", [int(amplitude * math.sin(2 * math.pi * 220 * i / 22050))
+                                    for i in range(frames)])
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(22050)
+            w.writeframes(samples.tobytes())
+
+    def test_kokoro_realizes_a_tag_volume(self):
+        """kokoro has a real speed flag but no volume knob anywhere, and declaring
+        supports_tone_tags keeps synthesize_chunked()'s audiofx pass from running for it
+        -- so a tag's volume has to be applied in its own loop. It used to be dropped
+        silently, which made <whisper> merely slow rather than quiet."""
+        provider = KokoroProvider(dict(config.DEFAULTS["providers"]["kokoro"],
+                                       binary="kokoro-tts"))
+        provider.run = lambda cmd, **kw: self.loud_wav(cmd[cmd.index("-o") + 1])
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.wav")
+            textutil.synthesize_chunked(provider, "<whisper>quiet please</whisper>", out)
+            expected = 10000 * textutil.tag_profile("whisper")["volume"]
+            self.assertAlmostEqual(self.peak(out), expected, delta=120)
+
+    def test_command_output_is_not_reshaped_unless_asked(self):
+        """Every other backend's capabilities are known here, so leftovers are safely
+        ours to apply. A command template is somebody else's script and may already be
+        acting on the tone, so its audio is left exactly as rendered by default."""
+        for audio_fx, reshaped in ((False, False), (True, True)):
+            provider = CommandProvider(dict(config.DEFAULTS["providers"]["command"],
+                                            audio_fx=audio_fx))
+            provider.run = lambda cmd, **kw: self.loud_wav(cmd[cmd.index("-w") + 1])
+            with tempfile.TemporaryDirectory() as tmp:
+                out = os.path.join(tmp, "out.wav")
+                textutil.synthesize_chunked(provider, "<whisper>quiet</whisper>", out)
+                quieter = self.peak(out) < 9000
+                self.assertEqual(quieter, reshaped, "audio_fx=%s" % audio_fx)
+
+    def test_command_audio_fx_defaults_to_off(self):
+        self.assertIs(config.DEFAULTS["providers"]["command"]["audio_fx"], False)
+
+
+class StreamPublishingTest(unittest.TestCase):
+    """Fragments are published as they are rendered, so playback can start on the first
+    one instead of waiting for the whole text (audio.play_stream_detached)."""
+
+    def writer(self, flag):
+        """A fake `run` that writes a tiny wav to the output named after `flag`."""
+        def run(cmd, **kwargs):
+            with open(cmd[cmd.index(flag) + 1], "wb") as handle:
+                handle.write(_wav_bytes(1))
+        return run
+
+    def test_parts_are_published_in_order_as_they_render(self):
+        provider = KokoroProvider(dict(config.DEFAULTS["providers"]["kokoro"],
+                                       binary="kokoro-tts"))
+        published = []
+        provider.run = self.writer("-o")
+        provider.on_part = lambda path: published.append(
+            (len(published), os.path.exists(path)))
+        with tempfile.TemporaryDirectory() as tmp:
+            textutil.synthesize_chunked(
+                provider, "<happy>One.</happy> <sad>Two.</sad> <urgent>Three.</urgent>",
+                os.path.join(tmp, "out.wav"))
+        self.assertEqual(published, [(0, True), (1, True), (2, True)])
+
+    def test_chunked_synthesis_publishes_in_order_despite_finishing_out_of_order(self):
+        """Chunks are synthesized concurrently and finish in any order, but they must be
+        *heard* in order -- so a chunk is published only once every chunk before it has
+        been."""
+        order = []
+
+        class SlowFirst(Provider):
+            name = "slow"
+            default_format = "wav"
+
+            @property
+            def max_words(self):
+                return 1
+
+            @property
+            def max_workers(self):
+                return 3
+
+            def synthesize(self, text, out_path, voice=None):
+                # The first word finishes last, so naive emission would invert the audio.
+                time.sleep(0.25 if text == "one" else 0.01)
+                with open(out_path, "wb") as fh:
+                    fh.write(_wav_bytes(1))
+                return out_path
+
+        provider = SlowFirst({})
+        provider.on_part = lambda path: order.append(os.path.basename(path))
+        with tempfile.TemporaryDirectory() as tmp:
+            textutil.synthesize_chunked(provider, "one two three",
+                                        os.path.join(tmp, "out.wav"))
+        self.assertEqual(order, sorted(order), "published out of order: %r" % (order,))
+        self.assertEqual(len(order), 3)
+
+    def test_a_provider_that_segments_internally_does_not_double_publish(self):
+        """Whoever owns the outermost loop owns the ordering, and so owns the sink --
+        otherwise the same audio is published twice and the stream stutters."""
+        provider = CommandProvider(dict(config.DEFAULTS["providers"]["command"],
+                                        audio_fx=True))
+        provider.run = self.writer("-w")
+        published = []
+        provider.on_part = published.append
+        with tempfile.TemporaryDirectory() as tmp:
+            textutil.synthesize_chunked(provider, "<happy>One.</happy> <sad>Two.</sad>",
+                                        os.path.join(tmp, "out.wav"))
+        self.assertEqual(len(published), 2, "one publish per tone segment, not two")
+
+    def test_stream_directory_round_trip(self):
+        directory = audio.stream_new()
+        self.addCleanup(audio.stream_cleanup, directory)
+        self.assertIsNone(audio.stream_count(directory), "not finished yet")
+        source = os.path.join(directory, "src.wav")
+        with open(source, "wb") as fh:
+            fh.write(_wav_bytes(1, frames=24000))
+        audio.stream_add(directory, 0, source)
+        self.assertTrue(os.path.exists(audio.stream_part_path(directory, 0)))
+        self.assertGreater(audio.stream_known_duration(directory), 0.0)
+        audio.stream_finish(directory, 1)
+        self.assertEqual(audio.stream_count(directory), 1)
+
+    def test_stream_setting_defaults_to_on(self):
+        self.assertIs(config.DEFAULTS["stream"], True)
+        self.assertIn("stream", config.TOP_LEVEL_KEYS)
 
 
 class ToneFallbackTest(unittest.TestCase):

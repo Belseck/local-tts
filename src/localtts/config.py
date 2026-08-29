@@ -22,6 +22,12 @@ DEFAULTS = {
     # restoring the title when it stops. Purely cosmetic and skipped entirely when
     # there's no terminal to write to (piped output, a hook, CI).
     "terminal_title": True,
+    # Play each fragment as soon as it is synthesized, instead of waiting for the whole
+    # text to finish and playing one joined file. Time-to-first-sound then stops
+    # depending on how long the text is -- the difference between a second and most of a
+    # minute for a tagged story or a document. The single joined file is still written
+    # either way. Set false to go back to synthesize-everything-then-play.
+    "stream": True,
     # Which backend speaks which language, e.g.
     #   {"es": {"provider": "piper", "voice": "~/voices/es_MX-claude-high.onnx"}}
     # Shared by every coding agent so the preference is remembered in one place.
@@ -157,6 +163,12 @@ DEFAULTS = {
             # Escape hatch: any CLI that writes a wav file.
             # {text} and {output} are substituted as single argv items.
             "template": "espeak-ng -w {output} {text}",
+            # Whether local-tts may reshape what the command produced (a <tag>'s speed
+            # and volume, applied to the rendered wav). False by default: the command is
+            # somebody else's script and may already be acting on the tone itself, and
+            # post-processing audio it deliberately shaped would fight it. Every other
+            # backend's capabilities are known here, so only this one has the choice.
+            "audio_fx": False,
             # local-tts can't know whether an arbitrary command understands <tag> markup,
             # so this is a plain user choice, not an auto-detected capability (see
             # CommandProvider.supports_tone_tags): "strip" (default) removes <tag>s before
@@ -168,7 +180,7 @@ DEFAULTS = {
 }
 
 
-TOP_LEVEL_KEYS = ("provider", "play", "player", "terminal_title")
+TOP_LEVEL_KEYS = ("provider", "play", "player", "terminal_title", "stream")
 LANGUAGE_KEYS = ("provider", "voice")
 
 

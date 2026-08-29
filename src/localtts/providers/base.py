@@ -36,6 +36,18 @@ class Provider:
     #: one separately or they all come out with a single flat tone). text.
     #: synthesize_chunked() then leaves the segmenting to it instead of doing its own.
     handles_tone_segments = False
+    #: Sink for streamed playback (audio.play_stream_detached): called as on_part(path)
+    #: with each finished fragment, in order, while later ones are still being
+    #: synthesized. None disables streaming and nothing changes. Set by cli.py on the
+    #: top-level provider only -- a provider used as somebody else's base (rvc's) gets a
+    #: fresh instance, so its pre-conversion pieces never reach the stream.
+    on_part = None
+    #: Whether anything this backend renders may be reshaped by audiofx afterwards.
+    #: True everywhere local-tts knows what the backend can and cannot do itself. False
+    #: for a backend driven by a command nobody here wrote, where "no tone hook" is an
+    #: assumption rather than a verified fact -- reshaping its output would then be
+    #: fighting a script that may already be handling the tags.
+    allow_audio_fx = True
 
     @property
     def max_words(self):
@@ -68,6 +80,37 @@ class Provider:
 
     def synthesize(self, text, out_path, voice=None):
         raise NotImplementedError
+
+    def emit_part(self, path):
+        """Publish one finished, in-order fragment to the streaming sink, if any.
+
+        Called by providers that render ordered parts internally (their own tone
+        segments). Doing it from inside the loop is the whole point: the fragment is
+        playable long before the ones after it exist.
+        """
+        sink = self.on_part
+        if sink:
+            sink(path)
+
+    def speed_settings(self, speed):
+        """Settings that make this backend synthesize at `speed` times its normal rate,
+        or None if it has no rate control of its own.
+
+        Exists so a provider that *composes* another one (rvc) can have the base realize
+        a <tag>'s pacing at synthesis time -- a genuine prosody change -- instead of
+        time-stretching the rendered wav afterwards, which is a lossy DSP pass over every
+        sample. Returning None means "I have no such knob"; the caller then falls back to
+        audiofx.
+        """
+        return None
+
+    def with_settings(self, overrides):
+        """A copy of this provider with `overrides` merged over its settings, leaving
+        this instance untouched -- the settings dict is shared with the loaded config,
+        so mutating it in place would leak into every later call."""
+        return type(self)(dict(self.settings, **overrides), verbose=self.verbose,
+                          cfg=self.cfg, lang=self.lang)
+
 
     def check(self):
         """Return (ok, message) describing whether this backend can run."""

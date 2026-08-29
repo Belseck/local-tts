@@ -840,6 +840,15 @@ By default, a `<tag>` is stripped before `{text}` is filled in, like any provide
 no real tone hook. If your own script is written to parse the markup itself, opt in with
 `tts config --set command.tone_tags=pass`.
 
+Also unlike every other provider, local-tts does **not** reshape what your command
+produced. Elsewhere its capabilities are known, so a tag's leftover speed and volume are
+safely applied to the rendered audio; here the script is yours and may already be varying
+its own delivery. Opt in only if it doesn't:
+
+```bash
+tts config --set command.audio_fx=true
+```
+
 If you wired up something through `command` that now has a real provider above (kokoro,
 rvc), `tts config --detect-migrations` finds it and prints the exact `--set` commands to
 switch — it never applies them, and never touches `command.template` itself:
@@ -947,6 +956,27 @@ tts config --set player=ffplay
 ```
 
 If nothing is found, the file is kept and its path printed instead of vanishing.
+
+**ffmpeg is worth installing even if you already have a player.** Tone tags change a
+span's pacing, and on any backend without its own rate control that retiming happens to
+the rendered audio: with ffmpeg through `atempo`, without it through a built-in WSOLA
+stretch that is listenable but measurably noisier. `tts check` prints a `tone shaping:`
+line naming which one you are getting.
+
+### Streaming playback
+
+Each fragment plays as soon as it is synthesized, rather than the whole text being
+rendered and joined first — so the first words arrive in about a second instead of after
+however long the full text takes. The joined file is still written either way.
+
+```bash
+tts config --set stream=false    # render everything first, then play one file
+tts --no-stream "..."            # same, for one run only
+```
+
+Fragment boundaries are the tone-tag and chunk boundaries that already existed; nothing is
+split that was not split before. Playback stays serialized machine-wide, and the runner
+holds the lock across the whole stream, so another session cannot cut in mid-sentence.
 
 ---
 

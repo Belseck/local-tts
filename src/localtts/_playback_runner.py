@@ -16,17 +16,89 @@ in play_detached() leaves this process without a controlling terminal.
 Invoked as:
     python -m localtts._playback_runner <lock_path> <session-or-empty>
         <tty-or-empty> <title-or-empty> <player argv...>
+
+or, for streamed playback (audio.play_stream_detached):
+    python -m localtts._playback_runner --stream <lock_path> <session-or-empty>
+        <tty-or-empty> <title-flag> <stream_dir> <player-or-empty> <producer_pid>
+        <label>
 """
 
 import os
+import signal
 import subprocess
 import sys
 import time
 
 from localtts import audio, lock
 
+#: How often to look for the next fragment. Short enough to be inaudible as a gap
+#: between fragments, long enough not to spin a core while synthesis is the slow part.
+POLL_SECONDS = 0.05
+
+
+def _play(cmd):
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   stdin=subprocess.DEVNULL)
+
+
+def run_stream(argv):
+    """Play `stream_dir`'s fragments in order, waiting for each one to be published.
+
+    Holds the machine-wide playback lock across the *whole* stream, not per fragment:
+    releasing between fragments would let another session cut in halfway through a
+    sentence. The producer's pid is watched so a crashed producer ends the stream instead
+    of leaving the runner waiting for a fragment that will never arrive.
+    """
+    lock_path, session = argv[0], (argv[1] or None)
+    tty, title_on = argv[2], bool(argv[3])
+    stream_dir, preferred = argv[4], (argv[5] or "")
+    producer_pid, label = int(argv[6] or 0), argv[7]
+
+    # SIGTERM (what `tts stop` sends the group) would otherwise skip the cleanup below,
+    # leaving the title set and the stream directory behind.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    with open(lock_path, "a+") as handle:
+        lock.acquire(handle)
+        painted = False
+        index, elapsed = 0, 0.0
+        try:
+            while True:
+                part = audio.stream_part_path(stream_dir, index)
+                if os.path.exists(part):
+                    cmd = audio.find_player(part, preferred)
+                    if not cmd:
+                        break
+                    # Total grows as fragments land; report what is known now rather
+                    # than a number nobody can have until synthesis ends.
+                    total = audio.stream_known_duration(stream_dir)
+                    audio._write_state(os.getpid(), label, duration_seconds=total,
+                                       paused=False, elapsed=elapsed,
+                                       segment_start=time.time(), session=session)
+                    if title_on:
+                        audio.write_terminal_title(audio.title_for(label, total), tty)
+                        painted = True
+                    _play(cmd)
+                    elapsed += audio._safe_duration(part)
+                    index += 1
+                    continue
+                count = audio.stream_count(stream_dir)
+                if count is not None:
+                    if index >= count:
+                        break
+                elif producer_pid and not audio.is_running(producer_pid):
+                    break        # producer died without publishing a final count
+                time.sleep(POLL_SECONDS)
+        finally:
+            if painted:
+                audio.write_terminal_title("", tty)
+            lock.release(handle)
+            audio.stream_cleanup(stream_dir)
+
 
 def main(argv):
+    if argv and argv[0] == "--stream":
+        return run_stream(argv[1:])
     lock_path, session = argv[0], (argv[1] or None)
     tty, title = argv[2], argv[3]
     player_cmd = argv[4:]
