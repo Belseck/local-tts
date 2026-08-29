@@ -219,6 +219,9 @@ DEFAULTS = {
             # per-language rather than one number.
             #   language_tags  honor <en>...</en> inside this language's text, so a
             #                  borrowed word keeps its own phonetics
+            #   trim_ms        silence left at each fragment edge before the pause is
+            #                  applied, so pause_ms actually controls the rhythm rather
+            #                  than being added on top of each fragment's own dead air
             #   foreign_voices which base voice speaks a borrowed language while this one
             #                  is the host, e.g. {"en": "bm_lewis"} under "es"
             "delivery": {

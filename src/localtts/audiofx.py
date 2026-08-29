@@ -214,6 +214,56 @@ def apply_speed(path, factor):
         return False
 
 
+def trim_silence(path, keep_seconds=0.01):
+    """Trim near-silence from both ends, in place, leaving `keep_seconds` of margin.
+
+    Every fragment arrives with its own lead-in and tail -- a synthesizer's own padding,
+    plus whatever conversion adds at the edges. Joined, eight fragments carry eight lots
+    of it, which both stretches the utterance and makes the configured gap between
+    fragments meaningless: the real gap is that dead air plus the pause. Trimming first
+    is what puts `pause_ms` back in charge of the rhythm.
+    """
+    params, raw = _read(path)
+    samples = array.array("h")
+    samples.frombytes(raw)
+    if sys.byteorder == "big":
+        samples.byteswap()
+    channels = params.nchannels
+    total = len(samples) // channels
+    if total < 2:
+        return False
+    peak = max((abs(v) for v in samples), default=0)
+    if not peak:
+        return False
+    # Relative to this fragment's own peak: an absolute threshold would clip a quiet
+    # <whisper> span entirely while doing nothing for a loud one.
+    threshold = max(96, int(peak * 0.02))
+
+    def loud(frame):
+        base = frame * channels
+        return any(abs(samples[base + c]) >= threshold for c in range(channels))
+
+    first = 0
+    while first < total and not loud(first):
+        first += 1
+    if first >= total:
+        return False                       # nothing but silence: leave it alone
+    last = total - 1
+    while last > first and not loud(last):
+        last -= 1
+
+    margin = max(0, int(params.framerate * keep_seconds))
+    first = max(0, first - margin)
+    last = min(total - 1, last + margin)
+    if first == 0 and last == total - 1:
+        return False
+    trimmed = samples[first * channels:(last + 1) * channels]
+    if sys.byteorder == "big":
+        trimmed.byteswap()
+    _write(path, params._replace(nframes=len(trimmed) // channels), trimmed.tobytes())
+    return True
+
+
 def append_silence(path, seconds):
     """Pad a wav with trailing silence, in place. Returns whether anything was written.
 

@@ -266,7 +266,29 @@ def resolve_tone_segments(text, auto_tone=False):
             merged[-1][0] += " " + chunk
         else:
             merged.append([chunk, profile])
-    return [(chunk.strip(), profile) for chunk, profile in merged if chunk.strip()] or [(text, None)]
+    segments = [(chunk.strip(), profile) for chunk, profile in merged if chunk.strip()]
+    return _fold_unspeakable(segments) or [(text, None)]
+
+
+def _fold_unspeakable(segments):
+    """Fold a segment with nothing to pronounce into its neighbour.
+
+    Splitting on a tag can leave a fragment that is only punctuation -- the "." between
+    `</en>` and the next tag, say. Synthesized on its own it costs a full round trip and
+    comes back as a quarter-second of audio for a period, which is both wasted work and
+    an audible artifact. Attached to the neighbouring words it is simply punctuation
+    again.
+    """
+    folded = []
+    for chunk, profile in segments:
+        if folded and not any(ch.isalnum() for ch in chunk):
+            previous, previous_profile = folded[-1]
+            folded[-1] = (previous + chunk, previous_profile)
+        elif not folded and not any(ch.isalnum() for ch in chunk) and len(segments) > 1:
+            continue                      # leading punctuation: the next chunk keeps it
+        else:
+            folded.append((chunk, profile))
+    return folded
 
 
 #: Tone-tag markup and backslash escapes -- the parts of the text that are notation
@@ -445,7 +467,7 @@ def synthesize_language_spans(provider, text, out_path, voice=None):
     own per-language resolution, so this stays one implementation rather than one per
     backend.
     """
-    from localtts import audio
+    from localtts import audio, audiofx
 
     if not provider.language_tags_enabled():
         return None
@@ -465,6 +487,9 @@ def synthesize_language_spans(provider, text, out_path, voice=None):
                     provider.synthesize(chunk, part, voice=voice)
                 else:
                     provider.for_language_instance(lang).synthesize(chunk, part)
+                # Each fragment carries its own lead-in and tail; joined, they add up
+                # to real dead air between borrowed words.
+                audiofx.trim_silence(part)
                 if emit:
                     emit(part)
         audio.concat_wavs(parts, out_path, gap_seconds=0)

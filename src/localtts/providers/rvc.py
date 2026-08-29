@@ -27,6 +27,12 @@ DELIVERY_DEFAULTS = {
     "pause_ms": 45,             # between fragments delivered the same way
     "pause_tone_ms": 130,       # when the tone changes -- the breath
     "emphasis_lengthen": 0,     # IPA length marks on the stressed vowel (kokoro only)
+    "trim_ms": 10,              # silence left at each fragment edge before the pause
+    # Which resident rvc model converts a *borrowed* language, e.g. {"en": "cortana-en"}
+    # under "es". Without one, a borrowed span converts with the host language's model --
+    # the same character, but a model trained on one language rendering another's
+    # phonemes, which is where an English word inside Spanish can lose its edges.
+    "foreign_models": {},
     "language_tags": True,      # honor <en>...</en> inside this language's text
     # Which base voice speaks a *borrowed* language while this language is the host, e.g.
     # {"en": "bm_lewis"} under "es". Separate from the global per-language voice because
@@ -186,8 +192,17 @@ class RvcProvider(Provider):
         work = tempfile.mkdtemp(prefix="local-tts-rvc-tone-")
         parts = [os.path.join(work, "%04d.wav" % index) for index in range(len(segments))]
         try:
+            foreign_models = delivery["foreign_models"] or {}
             for index, ((chunk, profile, span_base), part) in enumerate(zip(segments, parts)):
-                self._synthesize_one(span_base, chunk, part, voice, profile)
+                # A borrowed span may convert with its own model; without one it keeps
+                # the host language's, which is still the same character.
+                # getattr: the base is duck-typed here, as elsewhere in this file.
+                span_lang = getattr(span_base, "lang", self.lang)
+                model = foreign_models.get(span_lang) if span_lang != self.lang else None
+                self._synthesize_one(span_base, chunk, part, voice, profile, model=model)
+                # Before padding: otherwise the real gap is this fragment's own dead air
+                # plus the configured pause, and the setting controls neither.
+                audiofx.trim_silence(part, delivery["trim_ms"] / 1000.0)
                 if index < len(segments) - 1:
                     # A change of tone gets a longer gap than an ordinary one -- the
                     # breath a speaker takes when the delivery shifts. Padded onto the
@@ -221,7 +236,7 @@ class RvcProvider(Provider):
             merged.update({k: v for k, v in chosen.items() if k in DELIVERY_DEFAULTS})
         return merged
 
-    def _synthesize_one(self, base, chunk, out_path, voice, profile):
+    def _synthesize_one(self, base, chunk, out_path, voice, profile, model=None):
         """Base synthesis -> conversion -> whatever tone is still unrealized.
 
         Speed is pushed down to the base provider whenever it has a real rate control
@@ -262,7 +277,7 @@ class RvcProvider(Provider):
             textutil.synthesize_chunked(base, chunk, base_wav, voice=voice)
             server_url = self.settings.get("server_url")
             if server_url:
-                self._convert_via_server(server_url, base_wav, out_path)
+                self._convert_via_server(server_url, base_wav, out_path, model=model)
             else:
                 self.run(self.build_command(base_wav, out_path))
         finally:
@@ -277,7 +292,7 @@ class RvcProvider(Provider):
         return out_path
 
 
-    def _convert_via_server(self, server_url, wav_in, out_path):
+    def _convert_via_server(self, server_url, wav_in, out_path, model=None):
         """Talk to a persistent server that already has the model (and torch) loaded,
         instead of paying that cost on every call. Which voices exist is fixed at server
         startup -- rvc.model/rvc.index configure the CLI fallback above, not a running
@@ -287,7 +302,7 @@ class RvcProvider(Provider):
         self.ensure_server(server_url, self.settings.get("server_start"),
                            float(self.settings.get("server_timeout") or 60))
         payload = {"input_path": os.path.abspath(wav_in)}
-        model_name = self.server_model_name()
+        model_name = model or self.server_model_name()
         if model_name:
             # A single-model server (or an older one) simply ignores this key, so
             # naming a voice is always safe to send.

@@ -391,6 +391,10 @@ whichever agents it finds on your machine:
 - **`local-tts-configure`** — install, diagnose and configure: backends, voices for a new
   language, playback, and the per-language memory. Starts from `tts check` and asks before
   installing or downloading anything.
+- **`local-tts-tune`** — make it *sound* better once it already works: pacing, pauses,
+  emphasis, which voice reads a borrowed word, and the noise or robotic artifacts that
+  come from the wrong player or a missing ffmpeg. Diagnoses by measurement first, changes
+  one setting at a time, and asks for your ears only where a measurement cannot decide.
 - **`local-tts-update`** — update an already-installed CLI to the latest version. Locates
   the repo behind the running `tts` command, pulls it, reinstalls only if that's actually
   needed, and refreshes the skill/hook files that are copies rather than live links to the
@@ -1098,6 +1102,9 @@ tts config --set 'rvc.delivery.en={"speed": 1.0, "pause_ms": 60, "pause_tone_ms"
 | `pause_ms` | Silence between fragments delivered the same way |
 | `pause_tone_ms` | Silence where the tone changes — the breath a speaker takes |
 | `emphasis_lengthen` | IPA length marks on the stressed vowel (kokoro base only) |
+| `trim_ms` | Silence left at each fragment edge *before* the pause is applied |
+| `foreign_voices` | Which base voice reads a borrowed language while this one hosts |
+| `foreign_models` | Which resident rvc model converts a borrowed language (rvc only) |
 
 `"*"` applies to any language not named. Spanish runs faster with shorter gaps than
 English, which is why this is per-language rather than one number — and why the previous
@@ -1105,6 +1112,22 @@ behavior, a hardcoded 350 ms between every fragment, read as a stall rather than
 
 The pause is padded onto the fragment itself rather than inserted while joining, so
 streamed playback and the saved file are the same sound.
+
+**`trim_ms` is what makes `pause_ms` mean anything.** Every fragment arrives with its own
+lead-in and tail — the synthesizer's padding, plus whatever conversion adds at the edges.
+Joined, eight fragments carry eight lots of it, so the real gap would be that dead air
+*plus* your pause. Each fragment is trimmed to `trim_ms` of margin first, which puts the
+configured pause back in charge of the rhythm. On one mixed-language sentence this cut
+7.24s to 5.79s without changing a word.
+
+`foreign_models` is the rvc counterpart to `foreign_voices`: without it a borrowed span
+converts with the *host* language's model — still the same character, but a model trained
+on one language rendering another's phonemes, which is where an English word inside
+Spanish loses its edges.
+
+```bash
+tts config --set 'rvc.delivery.es={"language_tags": true, "foreign_models": {"en": "cortana-en"}}'
+```
 
 ## Audio playback
 
