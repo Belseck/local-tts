@@ -171,11 +171,15 @@ class _FakeAudioServer:
     it received and returns canned bytes. Used instead of mocking urllib so the actual
     request/response wire format is exercised, not just the call site."""
 
-    def __init__(self, route, audio_bytes=b"RIFF....WAVEfake", status=200, healthy=True):
+    def __init__(self, route, audio_bytes=b"RIFF....WAVEfake", status=200, healthy=True,
+                 capabilities=None):
         self.route = route
         self.audio_bytes = audio_bytes
         self.status = status
         self.healthy = healthy
+        #: What /health claims. None keeps the plain-text "ok" an older server sends,
+        #: which is the case worth testing: it answers, and understands nothing new.
+        self.capabilities = capabilities
         self.requests = []
         outer = self
 
@@ -185,9 +189,11 @@ class _FakeAudioServer:
 
             def do_GET(self):
                 if self.path == "/health" and outer.healthy:
+                    body = (json.dumps(outer.capabilities).encode("utf-8")
+                            if outer.capabilities is not None else b"ok")
                     self.send_response(200)
                     self.end_headers()
-                    self.wfile.write(b"ok")
+                    self.wfile.write(body)
                 else:
                     self.send_response(503)
                     self.end_headers()
@@ -2734,3 +2740,72 @@ class PhoneticDictionaryTest(unittest.TestCase):
     def test_a_backend_without_a_phonemizer_says_so(self):
         self.assertFalse(PiperProvider(dict(config.DEFAULTS["providers"]["piper"])).supports_phonetics)
         self.assertFalse(LlamaCppProvider(dict(config.DEFAULTS["providers"]["llamacpp"])).supports_phonetics)
+
+
+class PhoneticsOnTheWireTest(unittest.TestCase):
+    """The half that makes the feature work: the table has to reach the server, and
+    only a server that says it understands it may be told it does."""
+
+    ENTRIES = {"pull request": "/p\u02c8\u028al \u0279\u1d3ckw\u02c8\u025bst/",
+               "kubectl": "kube control"}
+
+    def build(self, server, **overrides):
+        cfg = {"pronunciations": self.ENTRIES,
+               "providers": {"kokoro": dict(config.DEFAULTS["providers"]["kokoro"],
+                                            server_url=server.url, **overrides)}}
+        return KokoroProvider(cfg["providers"]["kokoro"], cfg=cfg, lang="es")
+
+    def test_a_current_server_is_sent_the_table(self):
+        server = _FakeAudioServer("/synthesize", audio_bytes=b"audio",
+                                  capabilities={"ok": True, "phonetics": True})
+        self.addCleanup(server.stop)
+        provider = self.build(server)
+        with tempfile.TemporaryDirectory() as tmp:
+            provider.synthesize("Ya subí el pull request", os.path.join(tmp, "out.wav"))
+        sent = server.requests[0]
+        self.assertEqual(sent["phonetics"],
+                         {"pull request": "p\u02c8\u028al \u0279\u1d3ckw\u02c8\u025bst"})
+        self.assertNotIn("kubectl", sent["phonetics"])   # a respelling is not phonemes
+
+    def test_a_respelling_never_travels_as_phonemes(self):
+        """Respellings are rewritten into the text upstream (cli.py, before any provider
+        sees it), so a provider must never mistake one for a transcription."""
+        server = _FakeAudioServer("/synthesize", audio_bytes=b"audio",
+                                  capabilities={"ok": True, "phonetics": True})
+        self.addCleanup(server.stop)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.build(server).synthesize("corre kubectl", os.path.join(tmp, "out.wav"))
+        self.assertNotIn("kubectl", server.requests[0].get("phonetics", {}))
+
+    def test_an_older_server_is_not_told_it_understands(self):
+        """It answers /health with a plain "ok" and would drop the table without a word,
+        so `supports_phonetics` must be False and nothing may be sent."""
+        server = _FakeAudioServer("/synthesize", audio_bytes=b"audio")   # plain "ok"
+        self.addCleanup(server.stop)
+        provider = self.build(server)
+        self.assertFalse(provider.supports_phonetics)
+        with tempfile.TemporaryDirectory() as tmp:
+            provider.synthesize("Ya subí el pull request", os.path.join(tmp, "out.wav"))
+        self.assertNotIn("phonetics", server.requests[0])
+
+    def test_an_unreachable_server_does_not_claim_support(self):
+        cfg = {"pronunciations": self.ENTRIES,
+               "providers": {"kokoro": dict(config.DEFAULTS["providers"]["kokoro"],
+                                            server_url="http://127.0.0.1:1")}}
+        provider = KokoroProvider(cfg["providers"]["kokoro"], cfg=cfg)
+        self.assertFalse(provider.supports_phonetics)
+
+    def test_rvc_inherits_the_answer_from_its_base(self):
+        """rvc converts a voice, it does not read text, so the dictionary is whatever
+        speaks underneath."""
+        server = _FakeAudioServer("/synthesize", audio_bytes=b"audio",
+                                  capabilities={"ok": True, "phonetics": True})
+        self.addCleanup(server.stop)
+        cfg = {"providers": {
+            "rvc": dict(config.DEFAULTS["providers"]["rvc"], base_provider="kokoro"),
+            "kokoro": dict(config.DEFAULTS["providers"]["kokoro"], server_url=server.url),
+        }}
+        self.assertTrue(RvcProvider(cfg["providers"]["rvc"], cfg=cfg).supports_phonetics)
+
+        cfg["providers"]["rvc"]["base_provider"] = "piper"
+        self.assertFalse(RvcProvider(cfg["providers"]["rvc"], cfg=cfg).supports_phonetics)

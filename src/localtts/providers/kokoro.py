@@ -45,9 +45,20 @@ class KokoroProvider(Provider):
 
     @property
     def supports_phonetics(self):
-        """Only through the persistent server, which is where the phonemizer lives.
-        The per-call CLI wrapper takes text and has nowhere to put a transcription."""
-        return bool(self.settings.get("server_url"))
+        """Only through the persistent server, which is where the phonemizer lives --
+        the per-call CLI wrapper takes text and has nowhere to put a transcription.
+
+        Asks the server rather than trusting that `server_url` is set. A URL says one
+        was written down, and a process answering says nothing about whether it is the
+        script this version of the skill installs: an older copy answers /health and
+        drops a `phonetics` table it never learned to read, silently. Reporting that as
+        working is the exact failure this feature exists to remove.
+        """
+        url = self.settings.get("server_url")
+        if not url:
+            return False
+        claimed = self.server_capabilities(url)
+        return bool(claimed and claimed.get("phonetics"))
 
     def _model_dir(self):
         model_dir = os.path.expanduser(self.settings.get("model_dir") or "")
@@ -174,8 +185,12 @@ class KokoroProvider(Provider):
         # Server-only: the server has the phonemizer and kokoro's own pause arguments.
         # A server that predates these simply ignores unknown keys, so sending them is
         # always safe; the subprocess CLI wrapper has no equivalent flags.
-        phonetics = textutil.phonetic_entries(
+        # Only to a server that says it understands them. An older copy of the script
+        # accepts the key and drops it without a word, and reporting that as working is
+        # the exact silent no-op this feature exists to remove.
+        phonetics = (textutil.phonetic_entries(
             (self.cfg or {}).get("pronunciations") or {}, self.lang)
+            if self.supports_phonetics else {})
         if phonetics:
             # The server holds the phonemizer, so it is the one that can transcribe the
             # sentence and drop these in. Sending the table rather than a pre-built

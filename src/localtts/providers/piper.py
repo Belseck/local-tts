@@ -48,6 +48,9 @@ class PiperProvider(Provider):
         return cmd + list(settings.get("extra_args") or [])
 
     def resolved_model(self, voice=None):
+        """The .onnx for this call: an explicit --voice, else this call's language
+        entry from `language_models`, else the flat `model` setting. A piper voice *is*
+        a language, so speaking two means having two files."""
         if voice:
             return voice
         return (self.for_language(self.settings.get("language_models") or {})

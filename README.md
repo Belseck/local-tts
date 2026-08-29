@@ -1086,9 +1086,15 @@ was never trained on comes out as the nearest thing it has.
 **Not every backend can use them.** local-tts has no runtime dependencies and cannot
 transcribe text itself, so it passes the table to backends that have a phonemizer of
 their own. No extra install is involved: `kokoro-onnx` already requires `phonemizer`
-and `espeakng-loader`, and the server uses kokoro's own tokenizer so a transcription
-matches what the model would have produced from the text itself. Today that is `kokoro` with `server_url` set, and `rvc` when kokoro is its
-base. `tts check` says so outright rather than leaving a silent no-op:
+and `espeakng-loader`, and the server uses kokoro's own tokenizer, so a transcription
+matches what the model would have produced from the text itself.
+
+`tts check` asks the server rather than assuming. A `server_url` says a URL was written
+down, not that anything is listening, and a server copied from an earlier version of the
+skill answers `/health` perfectly well while dropping a table it never learned to read.
+Today that is `kokoro` with `server_url` set and a current server script, and `rvc` when
+kokoro is its base. Anything else comes out as *ignored*, which `tts check` says outright
+rather than leaving a silent no-op:
 
 ```
 phonetics   : 2 /IPA/ entries -> kokoro, rvc; ignored by llamacpp, openai, piper, command
@@ -1105,6 +1111,27 @@ difference being dead air at six fragment edges.
 
 Older text may still contain `<en>…</en>` markup. It is recognized and removed rather
 than read aloud or mistaken for a tone tag.
+
+#### Migrating from language spans
+
+`piper.language_tags`, `kokoro.language_tags`, `rvc.delivery.*.language_tags`,
+`foreign_voices` and `foreign_models` are gone. An existing config file containing them
+still loads — unknown keys are ignored, nothing crashes — but `tts config --set` no
+longer accepts them, and anyone who had `foreign_voices` set loses that behaviour.
+
+Replace each borrowed word with a dictionary entry:
+
+```bash
+# before: a span, a second voice, and a seam at each edge
+tts --lang es "Ya subí el <en>pull request</en>"
+
+# after: one entry, one voice, one utterance
+tts config --set 'pronunciations.pull request=/pˈʊl ɹᵻkwˈɛst/'
+tts --lang es "Ya subí el pull request"
+```
+
+`language_voices` and `language_models` are **not** affected: they pick the voice for the
+call's own language, which is the language memory (`tts languages`), a separate feature.
 
 ### Pronunciation dictionary
 

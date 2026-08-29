@@ -503,15 +503,16 @@ def check(argv):
     return 0 if ok_default else 1
 
 
-
 def _phonetics_status(cfg):
     """Whether the dictionary's IPA entries can actually reach the model.
 
     Reported rather than left to be discovered, because a `/…/` entry that silently
     does nothing is the worst kind of setting: the word still gets said, just the wrong
-    way, and nothing anywhere says why. local-tts has no runtime dependencies and
-    cannot transcribe text itself, so it can only pass the table to a backend that has
-    a phonemizer of its own.
+    way, and nothing anywhere says why. local-tts has no runtime dependencies and cannot
+    transcribe text itself, so it can only pass the table to a backend that has a
+    phonemizer of its own -- and it asks that backend rather than assuming, because a
+    server that is merely configured, or is an older copy of the script, would take the
+    table and drop it.
     """
     entries = cfg.get("pronunciations") or {}
     phonetic = [key for key, value in entries.items() if textutil.is_phonetic(value)]
@@ -526,13 +527,13 @@ def _phonetics_status(cfg):
             continue
         (able if getattr(instance, "supports_phonetics", False) else unable).append(name)
     if not able:
-        return ("%d /IPA/ entries, but no configured backend accepts phonemes -- they "
-                "are ignored (kokoro with `server_url` set is the one that can)"
+        return ("%d /IPA/ entries, but no backend here accepts phonemes right now -- "
+                "they are ignored. kokoro's persistent server is the one that can; if "
+                "it is configured, check it is running and its script is current."
                 % len(phonetic))
     return "%d /IPA/ entries -> %s%s" % (
         len(phonetic), ", ".join(able),
         "; ignored by %s" % ", ".join(unable) if unable else "")
-
 
 def _tone_shaping_status():
     """Whether a <tag>'s speed change goes through ffmpeg or the built-in fallback.

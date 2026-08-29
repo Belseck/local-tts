@@ -314,7 +314,11 @@ _MARKUP = re.compile(r"(\\.|</?[A-Za-z][\w.-]*>)")
 #: `/pˈʊl ɹᵻkwˈɛst/` rather than "pull rikwest". Slashes are the phonetician's own
 #: notation for a phonemic transcription, so the file reads the way the reference
 #: material does, and no real respelling starts and ends with one.
-_PHONETIC_VALUE = re.compile(r"\A\s*/(.+)/\s*\Z", re.DOTALL)
+#: Non-greedy, and the body may not contain a slash: "/a/ y /b/" is two transcriptions
+#: written where one was expected, not a single one reading "a/ y /b". Rejecting it is
+#: the honest answer -- so is rejecting "/ /", which would otherwise be an empty
+#: transcription that silently deletes the word.
+_PHONETIC_VALUE = re.compile(r"\A\s*/([^/]*\S[^/]*)/\s*\Z", re.DOTALL)
 
 
 def is_phonetic(value):

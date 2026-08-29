@@ -28,15 +28,6 @@ DELIVERY_DEFAULTS = {
     "pause_tone_ms": 130,       # when the tone changes -- the breath
     "emphasis_lengthen": 0,     # IPA length marks on the stressed vowel (kokoro only)
     "trim_ms": 10,              # silence left at each fragment edge before the pause
-    # Which resident rvc model converts a *borrowed* language, e.g. {"en": "cortana-en"}
-    # under "es". Without one, a borrowed span converts with the host language's model --
-    # the same character, but a model trained on one language rendering another's
-    # phonemes, which is where an English word inside Spanish can lose its edges.
-    # Which base voice speaks a *borrowed* language while this language is the host, e.g.
-    # {"en": "bm_lewis"} under "es". Separate from the global per-language voice because
-    # the best voice for a quoted English phrase inside Spanish is not always the one you
-    # would pick to narrate a whole English paragraph -- a closer timbre matters more
-    # when it sits mid-sentence.
 }
 
 
@@ -205,7 +196,7 @@ class RvcProvider(Provider):
             merged.update({k: v for k, v in chosen.items() if k in DELIVERY_DEFAULTS})
         return merged
 
-    def _synthesize_one(self, base, chunk, out_path, voice, profile, model=None):
+    def _synthesize_one(self, base, chunk, out_path, voice, profile):
         """Base synthesis -> conversion -> whatever tone is still unrealized.
 
         Speed is pushed down to the base provider whenever it has a real rate control
@@ -246,7 +237,7 @@ class RvcProvider(Provider):
             textutil.synthesize_chunked(base, chunk, base_wav, voice=voice)
             server_url = self.settings.get("server_url")
             if server_url:
-                self._convert_via_server(server_url, base_wav, out_path, model=model)
+                self._convert_via_server(server_url, base_wav, out_path)
             else:
                 self.run(self.build_command(base_wav, out_path))
         finally:

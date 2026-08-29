@@ -1,6 +1,6 @@
 ---
 name: local-tts-configure
-description: Install, diagnose, and configure the local `tts` CLI (local-tts) — backends (kokoro by default, piper, RVC, llama.cpp, OpenAI-compatible), a voice per language, mixed-language text (`<en>…</en>` spans reading a borrowed word with its own phonetics, and which voice or RVC model handles it), pronunciation dictionaries, persistent model servers, streamed playback, player selection and per-machine player tuning, and the per-language provider memory. TRIGGER whenever the user asks to install, add, set up, enable or switch to ANY speech backend, provider, TTS engine or voice model — named ("install piper", "add kokoro", "set up rvc", "use OpenAI for speech") or not ("install a TTS backend", "add another voice engine", "I want a better/second/offline TTS", "instala un backend de voz") — that request means follow this skill's install steps, not improvise your own, and it applies to a backend this skill does not list too: the answer there is `command` or a new provider, never an ad-hoc install. kokoro and rvc are meant to run as a persistent server, and setting that up is part of installing them. Also use when text-to-speech is missing or broken, when the user wants a different or better voice, when they need a new language, when speech is slow and could use a persistent server, or when they ask to change any speech setting — including adding a second language for pronunciation, mapping a voice to a language, or asking what a setting does. Contains a complete reference of every setting local-tts has. For speech that already works but *sounds* wrong (robotic, noisy, too fast, choppy), use local-tts-tune instead.
+description: Install, diagnose, and configure the local `tts` CLI (local-tts) — backends (kokoro by default, piper, RVC, llama.cpp, OpenAI-compatible), a voice per language, mixed-language text (a borrowed word keeps its own sound through the pronunciation dictionary's `/IPA/` entries, said by the same voice inside the same sentence), pronunciation dictionaries, persistent model servers, streamed playback, player selection and per-machine player tuning, and the per-language provider memory. TRIGGER whenever the user asks to install, add, set up, enable or switch to ANY speech backend, provider, TTS engine or voice model — named ("install piper", "add kokoro", "set up rvc", "use OpenAI for speech") or not ("install a TTS backend", "add another voice engine", "I want a better/second/offline TTS", "instala un backend de voz") — that request means follow this skill's install steps, not improvise your own, and it applies to a backend this skill does not list too: the answer there is `command` or a new provider, never an ad-hoc install. kokoro and rvc are meant to run as a persistent server, and setting that up is part of installing them. Also use when text-to-speech is missing or broken, when the user wants a different or better voice, when they need a new language, when speech is slow and could use a persistent server, or when they ask to change any speech setting — including adding a second language for pronunciation, mapping a voice to a language, or asking what a setting does. Contains a complete reference of every setting local-tts has. For speech that already works but *sounds* wrong (robotic, noisy, too fast, choppy), use local-tts-tune instead.
 ---
 
 # Configuring `local-tts`
@@ -427,9 +427,16 @@ def make_handler(kokoro, last_activity):
             # A health check is not "activity" -- it must not keep the process alive
             # forever just because something is polling it.
             if self.path == "/health":
+                # JSON, not "ok": local-tts asks this endpoint what the server can do,
+                # so that `tts check` can tell a server that understands the
+                # pronunciation dictionary's IPA entries from an older copy that
+                # would accept them and drop them without a word.
+                body = json.dumps({"ok": True, "phonetics": True}).encode("utf-8")
                 self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(b"ok")
+                self.wfile.write(body)
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -1134,7 +1141,7 @@ text itself, so it passes the table to a backend with its own phonemizer:
 
 | Backend | IPA entries |
 | --- | --- |
-| `kokoro` with `server_url` | yes -- the server holds the phonemizer |
+| `kokoro` with a **running, current** server | yes -- the server holds the phonemizer |
 | `rvc` over a kokoro base | yes -- inherited from the base |
 | `kokoro` without a server | no -- the CLI wrapper takes text only |
 | `piper`, `llamacpp`, `openai`, `command` | no -- the word is said their own way |
@@ -1147,6 +1154,14 @@ phonetics   : 2 /IPA/ entries -> kokoro, rvc; ignored by llamacpp, openai, piper
 
 An ignored entry is not an error. If the user needs IPA and their backend cannot take
 it, the fix is the persistent kokoro server (above), not a different dictionary entry.
+
+**`check` asks the server, it does not assume.** A configured `server_url` says a URL was
+written down; a running process says nothing about whether it is this version of the
+script. `/health` reports `{"ok": true, "phonetics": true}`, and a server copied from an
+earlier version answers with a plain `ok` -- so it reads as *ignored* rather than as
+working, and local-tts does not send it a table it would drop. If a user's entries show
+as ignored while their server is up, **re-copy the server script from this skill**: that
+is the upgrade path.
 
 **Where to get the IPA.** Wiktionary prints it for most words; `espeak-ng --ipa -q -v en
 "pull request"` prints it for anything. Use the transcription of the language the word

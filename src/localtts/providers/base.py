@@ -100,18 +100,6 @@ class Provider:
         if sink:
             sink(path)
 
-    def speed_settings(self, speed):
-        """Settings that make this backend synthesize at `speed` times its normal rate,
-        or None if it has no rate control of its own.
-
-        Exists so a provider that *composes* another one (rvc) can have the base realize
-        a <tag>'s pacing at synthesis time -- a genuine prosody change -- instead of
-        time-stretching the rendered wav afterwards, which is a lossy DSP pass over every
-        sample. Returning None means "I have no such knob"; the caller then falls back to
-        audiofx.
-        """
-        return None
-
     def for_language(self, mapping, default=""):
         """This call's entry from a {language tag: value} map, or `default`.
 
@@ -126,10 +114,19 @@ class Provider:
         for candidate in (tag, tag.replace("_", "-"), tag.split("-")[0].split("_")[0]):
             if candidate in mapping:
                 return mapping[candidate]
-            for key, value in mapping.items():
-                if str(key).strip().lower() == candidate.lower():
-                    return value
         return default
+
+    def speed_settings(self, speed):
+        """Settings that make this backend synthesize at `speed` times its normal rate,
+        or None if it has no rate control of its own.
+
+        Exists so a provider that *composes* another one (rvc) can have the base realize
+        a <tag>'s pacing at synthesis time -- a genuine prosody change -- instead of
+        time-stretching the rendered wav afterwards, which is a lossy DSP pass over every
+        sample. Returning None means "I have no such knob"; the caller then falls back to
+        audiofx.
+        """
+        return None
 
     def with_settings(self, overrides):
         """A copy of this provider with `overrides` merged over its settings, leaving
@@ -202,6 +199,34 @@ class Provider:
                 return 200 <= response.status < 300
         except (urllib.error.URLError, OSError, ValueError):
             return False
+
+    def server_capabilities(self, url, health_path="/health"):
+        """What a persistent server says it can do, from its own health endpoint.
+
+        Three outcomes, and the difference matters: `None` means nothing answered,
+        `{}` means something answered but did not say (an older server whose health
+        check predates this, and which would drop a capability it never learned to
+        read), and a dict is what it claims.
+
+        Asking is the only way to tell. A configured `server_url` says a URL was
+        written down, not that a process is listening, and a running process does not
+        say whether it is the script this version of the skill installs -- a copy from
+        an earlier version answers /health perfectly well and silently ignores what it
+        does not understand, which is exactly the failure this reporting exists to
+        make loud.
+        """
+        try:
+            with urllib.request.urlopen(url.rstrip("/") + health_path, timeout=2) as response:
+                if not 200 <= response.status < 300:
+                    return None
+                body = response.read(4096)
+        except (urllib.error.URLError, OSError, ValueError):
+            return None
+        try:
+            claimed = json.loads(body)
+        except (ValueError, TypeError):
+            return {}                       # answering, but with a plain-text "ok"
+        return claimed if isinstance(claimed, dict) else {}
 
     def ensure_server(self, url, start_command, timeout, health_path="/health"):
         """If `url` isn't already answering `health_path`, launch `start_command` in the

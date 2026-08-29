@@ -30,16 +30,19 @@ DEFAULTS = {
     # Inserted just before the file argument. Audio stacks differ per box (WSL's pulse
     # bridge, a resampling ALSA default, a device that wants a bigger buffer), and the
     # fix is nearly always a flag rather than a code change -- so it is configuration.
-    # Say these words this way. Keys are matched whole-word and case-insensitively;
-    # the value is a respelling used exactly as written, e.g.
-    #   {"jarvis": "JAR-viss", "es:jarvis": "yarvis", "kubectl": "cube cuddle"}
+    # Say these words this way. Keys are matched whole-word and case-insensitively, and
+    # a value takes one of two forms:
+    #   {"jarvis": "JAR-viss"}            a respelling, used exactly as written and
+    #                                     rewritten into the text, so it works on every
+    #                                     backend
+    #   {"pull request": "/pˈʊl ɹᵻkwˈɛst/"}  IPA between slashes, handed to the model as
+    #                                     phonemes so a borrowed word keeps its own sound
+    #                                     without the sentence being cut into pieces
+    # IPA needs a backend with a phonemizer of its own -- `tts check` prints which, and
+    # an entry a backend cannot use is ignored rather than mangled.
     # A bare key applies to every language; `<lang>:<word>` applies to that one only, so
-    # a word said differently in two languages needs no nested structure. Applied before
-    # synthesis, on every backend; <tag> markup is left untouched.
-    # Word -> how to say it. A plain value is a respelling ("kubectl": "kube control");
-    # a value between slashes is IPA ("pull request": "/pˈʊl ɹᵻkwˈɛst/"), which is how a
-    # borrowed word keeps its own sound without the sentence being cut in pieces. IPA
-    # needs a backend that accepts phonemes -- `tts check` says which do.
+    # a word said differently in two languages needs no nested structure. <tag> markup is
+    # left untouched either way.
     "pronunciations": {},
     "player_args": {},
     # Environment applied to the player process only, e.g.
