@@ -302,13 +302,55 @@ def lengthen_stressed(ipa, marks):
     return "".join(out)
 
 
+#: Entries already reported, so a warning is printed once and not per call.
+_WARNED = set()
+
+
+def _warn_unsayable(table, lang):
+    """Say out loud when an entry asks for phonemes this model has no token for.
+
+    They are dropped silently otherwise, which is the worst failure to debug: the word
+    still comes out, just mangled, and nothing anywhere says why. Usually a typo -- an
+    ASCII "r" where IPA wants "ɹ", or a stress mark copied as an apostrophe.
+    """
+    try:
+        vocab = set(_BACKENDS.setdefault(lang, None).vocab) if _BACKENDS.get(lang) else None
+        if vocab is None:
+            phonemes("a", lang)                 # builds the tokenizer for this language
+            vocab = set(_BACKENDS[lang].vocab)
+    except Exception:
+        return
+    for word, ipa in table.items():
+        missing = sorted({c for c in ipa if c not in vocab and not c.isspace()})
+        if missing and (word, lang) not in _WARNED:
+            _WARNED.add((word, lang))
+            print("phonetics: %r asks for %s, which this model has no token for -- "
+                  "dropped" % (word, ", ".join(repr(c) for c in missing)),
+                  file=sys.stderr, flush=True)
+
+
 def substitute_phonetics(text, lang, table):
-    """Transcribe the sentence and drop the dictionary's IPA in for the words it names.
+    """Transcribe the whole line, then swap in the dictionary's IPA for the words it
+    names.
 
     This is how a borrowed word keeps its own sound without the sentence being cut into
     pieces. A word synthesized on its own gets its own end-of-sentence fall, and dropped
-    mid-sentence that reads as an interruption; transcribing the whole line and swapping
-    phonemes leaves one utterance with one intonation curve.
+    mid-sentence that reads as an interruption.
+
+    The line is transcribed WHOLE, exactly as Kokoro._prepare does, and only then are
+    phonemes swapped. Transcribing the fragments around each word instead looks
+    equivalent and is not: espeak assigns stress per utterance, so every fragment gets
+    its own citation-form stress and each boundary invents a stressed word.
+
+        whole line   ʝˈa suβˈi  el  pˈuʎ rekˈest al rˌepositˈoɾjo.
+        fragments    ʝˈa suβˈi ˈel  pˈʊl ɹᵻkwˈɛst al rˌepositˈoɾjo.
+                               ^^^ the article should not carry stress
+
+    Where a word lands in the transcription is found by transcribing the line a second
+    time with that word replaced by a nonsense placeholder: everything before and after
+    it comes out identical, so the region that differs is the word. Spans are measured
+    against the same baseline, so several words do not disturb each other, and they are
+    applied right to left so earlier offsets stay valid.
 
     Any language works -- IPA is not tied to one -- but the model can only say the
     phonemes its own vocabulary contains, so a sound it was never trained on comes out
@@ -317,19 +359,63 @@ def substitute_phonetics(text, lang, table):
     import re as _re
     if not table:
         return text, False
-    pattern = _re.compile(r"(?<!\w)(%s)(?!\w)" % "|".join(
-        _re.escape(word) for word in sorted(table, key=len, reverse=True)), _re.IGNORECASE)
-    if not pattern.search(text):
+    _warn_unsayable(table, lang)
+
+    #: Nonsense, unlikely to appear, and pronounceable in every language espeak knows,
+    #: so its presence does not disturb the stress of what surrounds it.
+    marker = "Kalakala"
+
+    baseline = phonemes(text, lang)
+    spans = []
+    for word in sorted(table, key=len, reverse=True):
+        # A hyphen counts as part of the word: "pre-build" is not "build", and matching
+        # inside it used to snap the span out to the surrounding spaces and swallow the
+        # prefix -- the audio lost "pre" entirely.
+        pattern = _re.compile(r"(?<![\w-])%s(?![\w-])" % _re.escape(word), _re.IGNORECASE)
+        found = list(pattern.finditer(text))
+        for occurrence, hit in enumerate(found):
+            # One placeholder run per occurrence: replacing them all at once would leave
+            # a single differing region covering everything between the first and last,
+            # and replacing only the first left every later one in the host language.
+            marked_text = text[:hit.start()] + marker + text[hit.end():]
+            marked = phonemes(marked_text, lang)
+            head = 0
+            while head < min(len(baseline), len(marked)) and baseline[head] == marked[head]:
+                head += 1
+            tail = 0
+            while (tail < min(len(baseline), len(marked)) - head
+                   and baseline[-1 - tail] == marked[-1 - tail]):
+                tail += 1
+            start, end = head, len(baseline) - tail
+            # Snap outwards to whitespace. The scan stops at the first character that
+            # differs, so a placeholder sharing a leading letter with the word
+            # ("Kalakala" against "klustˈeɾ") leaves it behind and the swap produces
+            # "kklˈʌstɚ". Phonemes are space separated, so the gaps are the real edges.
+            while start > 0 and not baseline[start - 1].isspace():
+                start -= 1
+            while end < len(baseline) and not baseline[end].isspace():
+                end += 1
+            # A span that is empty, or that swallowed most of the line, means the
+            # second transcription diverged for another reason. Skipping is the safe
+            # answer: the word is still said, just this language's way.
+            if start >= end or (end - start) > len(baseline) * 0.6:
+                continue
+            # Punctuation rides along with the word it follows ("backend?" has no
+            # space before the mark) and the snap would swallow it. Losing it costs the
+            # sentence its intonation, so it is put back after the transcription.
+            carried = ""
+            while (carried != baseline[start:end]
+                   and baseline[end - 1 - len(carried)] in ".,;:!?…"):
+                carried = baseline[end - 1 - len(carried)] + carried
+            spans.append((start, end, table[word] + carried))
+
+    if not spans:
         return text, False
 
-    parts, last = [], 0
-    for match in pattern.finditer(text):
-        parts.append(phonemes(text[last:match.start()], lang) if match.start() > last else "")
-        parts.append(table[match.group(1).lower()])
-        last = match.end()
-    if last < len(text):
-        parts.append(phonemes(text[last:], lang))
-    return " ".join(p for p in parts if p), True
+    out = baseline
+    for start, end, ipa in sorted(spans, reverse=True):
+        out = out[:start] + ipa + out[end:]
+    return out, True
 
 
 def make_handler(kokoro, last_activity):
