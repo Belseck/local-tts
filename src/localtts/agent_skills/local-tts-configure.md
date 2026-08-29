@@ -1,6 +1,6 @@
 ---
 name: local-tts-configure
-description: Install, diagnose, and configure the local `tts` CLI (local-tts) — backends (llama.cpp, piper, kokoro, RVC, OpenAI-compatible), voices for a given language, persistent model servers, playback, and the per-language provider memory. TRIGGER whenever the user asks to install, add, set up, enable or switch to ANY provider or backend by name ("install piper", "add kokoro", "set up rvc", "use OpenAI for speech") — that request means follow this skill's install steps, not improvise your own. Also use when text-to-speech is missing or broken, when the user wants a different or better voice, when they need a new language, when speech is slow and could use a persistent server, or when they ask to change any speech setting.
+description: Install, diagnose, and configure the local `tts` CLI (local-tts) — backends (kokoro by default, piper, RVC, llama.cpp, OpenAI-compatible), a voice per language, mixed-language text (`<en>…</en>` spans reading a borrowed word with its own phonetics, and which voice or RVC model handles it), pronunciation dictionaries, persistent model servers, streamed playback, player selection and per-machine player tuning, and the per-language provider memory. TRIGGER whenever the user asks to install, add, set up, enable or switch to ANY provider or backend by name ("install piper", "add kokoro", "set up rvc", "use OpenAI for speech") — that request means follow this skill's install steps, not improvise your own. Also use when text-to-speech is missing or broken, when the user wants a different or better voice, when they need a new language, when speech is slow and could use a persistent server, or when they ask to change any speech setting — including adding a second language for pronunciation, mapping a voice to a language, or asking what a setting does. Contains a complete reference of every setting local-tts has. For speech that already works but *sounds* wrong (robotic, noisy, too fast, choppy), use local-tts-tune instead.
 ---
 
 # Configuring `local-tts`
@@ -989,9 +989,26 @@ on any backend that can speak more than one language on demand:
 
 ```bash
 tts config --set piper.language_models.en=~/.local/share/piper-voices/en_US-lessac-high.onnx
-tts config --set kokoro.language_tags=false      # to turn it off for a backend
+tts config --set piper.language_tags=false       # or kokoro.language_tags, per backend
 tts config --set 'rvc.delivery.es={"pause_ms": 45, "language_tags": true}'
 ```
+
+**Two things decide how a borrowed span sounds**, and they are separate knobs:
+
+| | Setting | Answers |
+| --- | --- | --- |
+| phonetics | `foreign_voices` | which *base* voice reads the borrowed words |
+| timbre | `foreign_models` | which resident *rvc model* converts them (rvc only) |
+
+```bash
+tts config --set 'rvc.delivery.es={"language_tags": true, "foreign_voices": {"en": "bm_lewis"}, "foreign_models": {"en": "cortana-en"}}'
+```
+
+Without `foreign_models` a borrowed span converts with the **host** language's model —
+still the same character, but a model trained on one language rendering another's
+phonemes, which is where an English word inside Spanish loses its edges. If the user has a
+model per language, wire it up; if they have one, leave it and say so rather than inventing
+a model name.
 
 rvc scopes it per host language rather than one flag, because whether a borrowed word
 should switch voice depends on which language is doing the borrowing.
@@ -1051,6 +1068,19 @@ inherits them.
 Spanish, `ff_` French, `hf_`/`hm_` Hindi, `if_`/`im_` Italian, `jf_`/`jm_` Japanese,
 `pf_`/`pm_` Brazilian Portuguese, `zf_`/`zm_` Mandarin.
 
+Kokoro also has three delivery settings of its own, distinct from rvc's `delivery` map
+(which is about the gaps *between* fragments):
+
+```bash
+tts config --set kokoro.emphasis_lengthen=2   # IPA length marks on the stressed vowel
+tts config --set kokoro.sentence_pause=0.25   # kokoro's own within-utterance pauses,
+tts config --set kokoro.clause_pause=0.1      # in seconds; empty leaves them alone
+```
+
+`emphasis_lengthen` needs the **persistent server**, which is where the phonemizer lives —
+the subprocess CLI wrapper has no equivalent flag. The server falls back to plain text if
+phonemization fails, so it can never cost the user their audio.
+
 ## Delivery: pacing, pauses, emphasis
 
 ```bash
@@ -1060,6 +1090,13 @@ tts config --set 'rvc.delivery.en={"speed": 1.0, "pause_ms": 60, "pause_tone_ms"
 
 `pause_ms` is the gap between fragments delivered the same way; `pause_tone_ms` the
 longer one where the tone changes — the breath. `"*"` covers unnamed languages.
+
+`trim_ms` (default 10) is the silence left at each fragment edge **before** the pause is
+applied. It exists because every fragment arrives with its own lead-in and tail — the
+synthesizer's padding plus whatever conversion adds, measured at 0.15–0.25s each — so
+without trimming, the real gap is that dead air *plus* `pause_ms`, and the setting
+controls neither. On one mixed-language sentence, trimming cut 7.24s to 5.79s without
+changing a word. Raise it if onsets sound clipped; lower it if gaps still feel long.
 
 `emphasis_lengthen` puts N IPA length marks on the vowel carrying primary stress
 (`kˈasa` → `kˈaːsa`). It needs a **kokoro base with the persistent server**, since that
@@ -1084,6 +1121,94 @@ It applies to any wav backend and needs no setup. `tts check` prints a `streamin
 saying which mode is active. Leave it on unless a user has a specific reason to want one
 file assembled before anything is heard — the fragment boundaries are the tone-tag and
 chunk boundaries that were already there, so nothing is split that was not split before.
+
+## Every setting, in one place
+
+`tts config --show` prints the effective configuration; `tts config --init` writes a file
+containing every default, ready to edit. This is the map of what those keys mean, so you
+never have to guess whether something is configurable.
+
+**Top level**
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `provider` | `kokoro` | backend used when `--provider` is not given |
+| `play` | `true` | play after synthesis (unless `--output`) |
+| `player` | `""` | force a player; `windows`/`powershell` names the Windows one |
+| `player_args` | `{}` | extra argv per player, e.g. `{"ffplay": ["-af", "aresample=48000"]}` |
+| `player_env` | `{}` | environment for the player process only |
+| `pronunciations` | `{}` | word → respelling; `<lang>:<word>` scopes it to one language |
+| `terminal_title` | `true` | speaker icon in the terminal tab while playing |
+| `stream` | `true` | play each fragment as it is synthesized |
+| `languages` | `{}` | the language memory — see `tts languages` |
+
+**kokoro** (the default backend)
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `binary` | `kokoro-tts` | the wrapper CLI |
+| `model_dir` | `""` | only for a CLI that resolves models by working directory |
+| `voice` / `lang` | `""` | flat fallback when no per-language voice applies |
+| `language_voices` | `{}` | language → voice; the phonemizer language follows the voice |
+| `language_tags` | `true` | honor `<en>…</en>` spans |
+| `speed` | `1.0` | rate multiplier |
+| `emphasis_lengthen` | `0` | IPA length marks on the stressed vowel (server only) |
+| `sentence_pause` / `clause_pause` | `""` | kokoro's own within-utterance pauses, seconds |
+| `auto_tone` | `false` | derive tone from `?`/`!` when no tag is active |
+| `server_url` / `server_start` / `server_timeout` | | the persistent server |
+| `extra_args` | `[]` | appended to every call |
+
+**piper**
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `binary` / `model` | | the executable and the flat `.onnx` voice |
+| `language_models` | `{}` | language → `.onnx`; a piper voice *is* a language |
+| `language_tags` | `true` | honor `<en>…</en>` spans |
+| `speaker` | `null` | speaker id for a multi-speaker voice |
+| `length_scale` / `volume` | `null` | base rate and loudness (a tag multiplies these) |
+| `auto_tone`, `extra_args` | | as kokoro |
+
+**rvc** — voice conversion over a base provider
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `python` | `""` | interpreter of the rvc-python venv |
+| `base_provider` | `""` | which backend speaks before conversion (kokoro is the sensible one) |
+| `model` / `index` | `""` | the `.pth` and `.index` for the CLI fallback |
+| `device` | `cpu` | `cuda:0` only if that venv has a CUDA torch |
+| `pitch` / `method` / `index_rate` / `protect` | | conversion parameters (CLI fallback) |
+| `server_url` / `server_start` / `server_timeout` | | the persistent multi-voice server |
+| `server_models` / `server_model` | | voices the server holds, and the fallback one |
+| `language_models` | `{}` | language → resident voice name |
+| `delivery` | see below | per-language pacing |
+
+**`rvc.delivery.<lang>`** — `"*"` covers any language not named
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `speed` | `1.0` | folded into the base provider's own rate control |
+| `pause_ms` | `45` | gap between fragments delivered the same way |
+| `pause_tone_ms` | `130` | gap where the tone changes — the breath |
+| `trim_ms` | `10` | silence left at each fragment edge *before* the pause |
+| `emphasis_lengthen` | `0` | IPA length marks (needs a kokoro base + server) |
+| `language_tags` | `true` | honor `<en>…</en>` while this language hosts |
+| `foreign_voices` | `{}` | which base voice reads a borrowed language |
+| `foreign_models` | `{}` | which rvc model converts a borrowed language |
+
+**openai** — `base_url`, `api_key`, `model` (`gpt-4o-mini-tts` for tone), `voice`, `speed`,
+`timeout`, `tone` (flat instructions), `auto_tone`.
+
+**llamacpp** — `binary`, `model`/`vocoder` (both or neither), or pull from Hugging Face
+instead with `hf_repo`/`hf_file` and `hf_repo_vocoder`/`hf_file_vocoder`; plus
+`speaker_file`, `max_words` (26), `max_workers` (2), `threads`, `gpu_layers`,
+`guide_tokens`, `extra_args`.
+
+**command** — `template` (must contain `{text}` and `{output}`), `tone_tags`
+(`strip`/`pass`), `audio_fx` (`false` — see above).
+
+**If the user asks to make it *sound* better** rather than to set something up — pacing,
+robotic artifacts, noise, gaps — that is the `local-tts-tune` skill, not this one.
 
 ## Diagnosing
 
