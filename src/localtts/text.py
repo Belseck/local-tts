@@ -89,7 +89,10 @@ def chunks(text, limit):
 
 #: <name>...</name> tone tags. \<, \>, \\ escape a literal angle bracket or backslash --
 #: for text that has to say "<anger>" out loud instead of meaning the tag.
-_TAG_TOKEN = re.compile(r"\\(?P<esc>[<>\\])|</(?P<close>[a-zA-Z][\w-]*)>|<(?P<open>[a-zA-Z][\w-]*)>")
+#: `lang:` is allowed in a name so an explicit `<lang:en>` is recognized as markup. Without
+#: it the tokenizer saw plain text and the words "lang:en" were read out loud.
+_TAG_TOKEN = re.compile(
+    r"\\(?P<esc>[<>\\])|</(?P<close>(?:lang:)?[a-zA-Z][\w-]*)>|<(?P<open>(?:lang:)?[a-zA-Z][\w-]*)>")
 
 
 class ToneTagError(TTSError):
@@ -241,6 +244,12 @@ def resolve_tone_segments(text, auto_tone=False):
     """
     expanded = []
     for chunk, active_tags in _tagged_spans(text):
+        # A language tag that survived to here is one nothing acted on -- language tags
+        # are off, or that language has no voice. It must not become a *tone*: it would
+        # split the audio for nothing, and, being an unknown tag name, would invent
+        # instructions ("Speak in a tone that conveys en.") that a backend with a
+        # free-text style hook would genuinely send. Drop the markup, keep the words.
+        active_tags = tuple(name for name in active_tags if not is_language_tag(name))
         if active_tags:
             profile = _combine_profiles(active_tags)
             expanded.append((chunk, profile if profile != _NEUTRAL_PROFILE else None))
@@ -266,7 +275,11 @@ def resolve_tone_segments(text, auto_tone=False):
             merged[-1][0] += " " + chunk
         else:
             merged.append([chunk, profile])
-    segments = [(chunk.strip(), profile) for chunk, profile in merged if chunk.strip()]
+    # Collapse the whitespace a removed tag leaves behind: "el <en>x</en> ya" would
+    # otherwise come back as "el  x  ya", and a double space is a real pause to a
+    # synthesizer, not just untidy text.
+    segments = [(re.sub(r"[ \t]{2,}", " ", chunk).strip(), profile)
+                for chunk, profile in merged if chunk.strip()]
     return _fold_unspeakable(segments) or [(text, None)]
 
 
@@ -354,6 +367,29 @@ def apply_pronunciations(text, entries, lang=""):
 _ANY_TAG = re.compile(r"\\.|<(/?)(?:lang:)?([A-Za-z][\w-]*)>")
 
 
+#: The shape of a language code: "en", "es", "pt-BR", "cmn". Two or three letters, with
+#: an optional region.
+_LANG_SHAPE = re.compile(r"[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,4})?\Z")
+
+
+def is_language_tag(name, explicit=False):
+    """Whether a tag names a language rather than a tone.
+
+    `<lang:en>` says so outright. Otherwise it has to look like a language code *and* not
+    be a tone tag we know -- `<sad>` and `<joy>` are three letters and would otherwise be
+    mistaken for languages, which is the whole reason this checks TAG_PROFILES first.
+
+    Deliberately not "any two-letter word": an unknown *tone* tag is a supported thing
+    (it still carries free-text instructions to a backend that can use them), so the test
+    has to be narrow enough that inventing one never silently makes it a language.
+    """
+    if explicit or name.lower().startswith("lang:"):
+        return True
+    if name.lower() in TAG_PROFILES:
+        return False
+    return bool(_LANG_SHAPE.match(name))
+
+
 def _normalize_tag(code):
     return code.strip().replace("_", "-").lower()
 
@@ -408,6 +444,12 @@ def split_language_spans(text, default_lang="", known=()):
                     lang_stack.pop()
             else:
                 lang_stack.append(code)
+            continue
+        if is_language_tag(name):
+            # A language we cannot act on: drop the markup here rather than leave it for
+            # the tone layer to mistake for a tone tag.
+            buf.append(text[pos:match.start()])
+            pos = match.end()
             continue
         # A tone tag: it stays in the text, but we track it so a language cut inside it
         # can be re-balanced.

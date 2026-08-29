@@ -2325,11 +2325,44 @@ class LanguageSpanTest(unittest.TestCase):
         self.assertTrue(all(c.startswith("<calm>") and c.endswith("</calm>")
                             for c, _ in spans))
 
-    def test_only_configured_languages_count(self):
-        """Otherwise a tone tag nobody anticipated silently becomes a language switch."""
+    def test_an_unconfigured_language_is_removed_not_switched(self):
+        """It must not switch language -- there is no voice for it -- but the markup must
+        not survive either: left in place the tone layer would mistake it for a tone tag,
+        split the audio for nothing and invent instructions from the code."""
         self.assertEqual(
             textutil.split_language_spans("Un <it>ciao</it> aqui", "es", self.KNOWN),
-            [("Un <it>ciao</it> aqui", "es")])
+            [("Un ciao aqui", "es")])
+
+    def test_an_unhandled_language_tag_never_becomes_a_tone(self):
+        """The bug this guards: with language tags off, <en> was read as an unknown tone
+        tag -- three segments instead of one, and a fabricated
+        "Speak in a tone that conveys en." that a backend with a free-text style hook
+        would genuinely send to the model."""
+        for text in ("Sube el <en>pull request</en> ya",
+                     "Un <it>ciao</it> aqui",
+                     "a <lang:en>b</lang:en> c"):
+            segments = textutil.resolve_tone_segments(text)
+            self.assertEqual(len(segments), 1, "%r split for nothing" % text)
+            chunk, profile = segments[0]
+            self.assertIsNone(profile, "%r invented a tone" % text)
+            self.assertNotIn("<", chunk, "%r left markup to be spoken" % text)
+            self.assertNotIn("  ", chunk, "%r left a double space where the tag was" % text)
+
+    def test_three_letter_tone_tags_are_not_mistaken_for_languages(self):
+        """<sad> and <joy> are language-code shaped; TAG_PROFILES is what saves them."""
+        for name in ("sad", "joy"):
+            segments = textutil.resolve_tone_segments("<%s>x</%s>" % (name, name))
+            self.assertIsNotNone(segments[0][1], name)
+        # ...while an unknown *tone* tag is long enough not to look like a language, and
+        # still carries its free-text instructions.
+        self.assertIsNotNone(
+            textutil.resolve_tone_segments("<mysterious>x</mysterious>")[0][1])
+
+    def test_a_language_tag_inside_a_tone_tag_leaves_the_tone_alone(self):
+        segments = textutil.resolve_tone_segments("<calm>a <en>b</en> c</calm>")
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0][0], "a b c")
+        self.assertEqual(segments[0][1]["speed"], textutil.tag_profile("calm")["speed"])
 
     def test_escaped_brackets_stay_literal(self):
         text = r"escaped \<en\> stays"
