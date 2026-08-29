@@ -1026,7 +1026,8 @@ speaking, just with the right phonetics for each word.
 tts config --set 'rvc.delivery.es={"pause_ms": 45, "language_tags": true}'
 ```
 
-Enabled per language, so it can be on for Spanish and off elsewhere. `<lang:en>` works
+Enabled per language, so it can be on for Spanish and off elsewhere. Tagging a language
+requires that language to be configured, so add a voice for it first. `<lang:en>` works
 too, as do region tags (`<es-MX>`). Only languages you have actually configured count as
 language tags — otherwise a tone tag nobody anticipated would silently become a language
 switch. Tone tags straddling a language boundary are re-balanced across the cut, so

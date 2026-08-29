@@ -191,10 +191,11 @@ EOF
 chmod +x ~/.local/bin/kokoro-tts
 ```
 
-**Set up English plus the user's own language, not just one.** Language tags (below) can
-only name languages that are configured, and a borrowed English word inside another
-language is the common case. Kokoro holds one model for every language, so a second entry
-in `language_voices` costs nothing at runtime.
+**Offer a second language, don't assume one.** Language tags (below) can only name
+languages that are configured, and borrowed English words inside another language are
+common — so it is worth asking whether they want English set up alongside their own
+language. Kokoro holds one model for every language, so the extra entry costs nothing at
+runtime. Ask; don't add it unprompted.
 
 Ask which voice and language the user wants — voice IDs are per-language (e.g. `af_heart`
 for US English, `ef_dora` for Spanish; the underlying model card lists the full set) —
@@ -970,20 +971,26 @@ character speaking — only the base pronunciation changes. Enabled per language
 tts config --set 'rvc.delivery.es={"pause_ms": 45, "language_tags": true}'
 ```
 
-Only languages the user has actually configured count as language tags, so **set up at
-least English and Spanish whenever you install a voice model** — a language that is not
-configured cannot be tagged, and the tag is left as literal text instead. When installing
-kokoro (or any base for rvc), map both by default rather than only the user's primary
-language:
+Only languages the user has actually configured count as language tags — an unconfigured
+one is left as literal text. So when you finish installing a base model, **ask whether
+they want another language set up for pronunciation**, and say why rather than just
+offering:
+
+> Borrowed words are common — "el *pull request*", "hacer *deploy*". If you add English
+> alongside Spanish, those can be tagged `<en>...</en>` and get English phonetics instead
+> of being read with Spanish vowels. Want me to add it?
+
+Then map whichever they choose:
 
 ```bash
-tts config --set kokoro.language_voices.en=bm_george
 tts config --set kokoro.language_voices.es=ef_dora
+tts config --set kokoro.language_voices.en=bm_george   # only if they said yes
 ```
 
-Ask which specific voices they want, but do not ship a single-language setup by default —
-English words inside another language are the common case, not the exception, and the
-second voice costs nothing extra at runtime (kokoro holds one model for all languages).
+**Do not add a second language on your own.** It is cheap at runtime — kokoro holds one
+model for every language — but it is still their configuration, and the same
+ask-before-installing rule applies here as everywhere else in this skill. Ask which
+languages and which voices; if they only want one, one is correct.
 
 ## Pronunciation dictionary
 
