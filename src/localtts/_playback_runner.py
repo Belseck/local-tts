@@ -38,7 +38,7 @@ POLL_SECONDS = 0.05
 
 def _play(cmd):
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                   stdin=subprocess.DEVNULL)
+                   stdin=subprocess.DEVNULL, env=audio.player_environment())
 
 
 def run_stream(argv):
@@ -118,7 +118,7 @@ def main(argv):
                 audio.write_terminal_title(title, tty)
             try:
                 subprocess.run(player_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               stdin=subprocess.DEVNULL)
+                               stdin=subprocess.DEVNULL, env=audio.player_environment())
             finally:
                 if title:
                     audio.write_terminal_title("", tty)

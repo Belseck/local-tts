@@ -2303,6 +2303,75 @@ class ToneRealizationTest(unittest.TestCase):
         self.assertIs(config.DEFAULTS["providers"]["command"]["audio_fx"], False)
 
 
+class PlayerSelectionTest(unittest.TestCase):
+    """Which player autodetect picks, and how it can be overridden."""
+
+    def test_windows_player_is_selectable_by_name(self):
+        """`player=powershell.exe` used to resolve through the generic branch to
+        `powershell.exe <file.wav>`, which runs the wav as a script instead of playing
+        it -- so there was no way to ask for the Windows player at all."""
+        with unittest.mock.patch.object(audio, "_powershell_exe", return_value="/ps"), \
+             unittest.mock.patch.object(audio, "_is_wsl", return_value=False):
+            for name in ("windows", "powershell", "PowerShell.exe"):
+                command = audio.find_player("/tmp/x.wav", name)
+                self.assertEqual(command[0], "/ps", name)
+                self.assertIn("SoundPlayer", " ".join(command), name)
+
+    def test_wsl_prefers_the_windows_player_over_an_installed_ffplay(self):
+        """Installing ffmpeg -- which local-tts recommends for tone shaping -- must not
+        silently demote a working player. WSL's Linux audio bridge is frequently the
+        noisier of the two, so the Windows player stays the default there."""
+        exe = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+        with unittest.mock.patch.object(audio, "_is_wsl", return_value=True), \
+             unittest.mock.patch.object(audio, "_powershell_exe", return_value=exe), \
+             unittest.mock.patch.object(audio.shutil, "which",
+                                        side_effect=lambda n: "/usr/bin/" + n):
+            self.assertEqual(audio.find_player("/tmp/x.wav")[0], exe)
+            self.assertIn("powershell.exe", audio.available_players()[0])
+            # ...but only as a default: naming a Linux player still selects it.
+            self.assertEqual(audio.find_player("/tmp/x.wav", "ffplay")[0], "ffplay")
+
+    def test_player_args_are_inserted_before_the_file(self):
+        """Audio stacks differ per machine and the fix is nearly always a flag, not a
+        code change -- so extra player arguments are configuration. They go just before
+        the file, which every builder in PLAYERS puts last."""
+        with unittest.mock.patch.object(
+                audio, "_player_tuning",
+                return_value=({"ffplay": ["-af", "aresample=48000"]}, {})), \
+             unittest.mock.patch.object(audio.shutil, "which",
+                                        side_effect=lambda n: "/usr/bin/" + n):
+            command = audio.find_player("/tmp/x.wav", "ffplay")
+        self.assertEqual(command[-3:], ["-af", "aresample=48000", "/tmp/x.wav"])
+
+    def test_player_env_is_applied_only_when_configured(self):
+        with unittest.mock.patch.object(audio, "_player_tuning", return_value=({}, {})):
+            self.assertIsNone(audio.player_environment(),
+                              "no config means the child just inherits, as before")
+        with unittest.mock.patch.object(
+                audio, "_player_tuning",
+                return_value=({}, {"SDL_AUDIODRIVER": "pulseaudio"})):
+            self.assertEqual(audio.player_environment()["SDL_AUDIODRIVER"], "pulseaudio")
+
+    def test_player_maps_are_set_and_cleared_one_entry_at_a_time(self):
+        tmp = tempfile.mkdtemp()
+        os.environ["LOCALTTS_CONFIG"] = os.path.join(tmp, "config.json")
+        self.addCleanup(os.environ.pop, "LOCALTTS_CONFIG", None)
+        config.set_values(["player_args.ffplay=-af aresample=48000"])
+        config.set_values(["player_env.SDL_AUDIODRIVER=pulseaudio"])
+        cfg = config.load()
+        self.assertEqual(cfg["player_args"]["ffplay"], ["-af", "aresample=48000"])
+        self.assertEqual(cfg["player_env"]["SDL_AUDIODRIVER"], "pulseaudio")
+        config.set_values(["player_args.ffplay="])       # empty removes the entry
+        self.assertEqual(config.load()["player_args"], {})
+
+    def test_plain_linux_still_prefers_a_linux_player(self):
+        with unittest.mock.patch.object(audio, "_is_wsl", return_value=False), \
+             unittest.mock.patch.object(audio.sys, "platform", "linux"), \
+             unittest.mock.patch.object(audio.shutil, "which",
+                                        side_effect=lambda n: "/usr/bin/" + n):
+            self.assertEqual(audio.find_player("/tmp/x.wav")[0], "ffplay")
+
+
 class StreamPublishingTest(unittest.TestCase):
     """Fragments are published as they are rendered, so playback can start on the first
     one instead of waiting for the whole text (audio.play_stream_detached)."""

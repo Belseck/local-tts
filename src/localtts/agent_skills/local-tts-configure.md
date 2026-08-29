@@ -797,6 +797,44 @@ it rendered it. Turn it on only when the user confirms their script does nothing
 tts config --set command.audio_fx=true
 ```
 
+## Picking and tuning the audio player
+
+Autodetect prefers **Windows' own player on both Windows and WSL** (always present, and
+the native way out of either), and the first available Linux player elsewhere. This is
+deliberate on WSL: installing ffmpeg — which this skill recommends for tone shaping —
+would otherwise let a fresh `ffplay` silently take over from a player that was already
+working, and WSL's PulseAudio bridge is often the noisier of the two.
+
+```bash
+tts config --set player=ffplay      # name a Linux player explicitly
+tts config --set player=windows     # or force Windows' own (also "powershell")
+```
+
+**If a user reports noisy, crackling or distorted playback, suspect the player before the
+synthesis.** The quickest discriminator is to play one file two ways and ask which is
+clean — a plain untagged file, so tone shaping is not in the picture:
+
+```bash
+tts -p piper --no-play -o /tmp/ab.wav "The quick brown fox jumps over the lazy dog."
+ffplay -nodisp -autoexit -loglevel error /tmp/ab.wav
+powershell.exe -NoProfile -NonInteractive -Command "(New-Object Media.SoundPlayer '$(wslpath -w /tmp/ab.wav)').PlaySync()"
+```
+
+If only one is noisy, it is the player, and the answer is `player=` — not a config change
+to any provider. If both are, the noise is in the audio itself.
+
+Per-machine tuning, for when a player is *nearly* right:
+
+```bash
+tts config --set 'player_args.ffplay=-af aresample=48000'   # inserted before the file
+tts config --set player_env.PULSE_LATENCY_MSEC=90           # set for the player only
+tts config --set player_args.ffplay=                        # empty value removes it
+```
+
+Worth trying when a device resamples badly or underruns; **verify by ear rather than
+assuming**, since these are machine-specific and some combinations make things worse.
+`tts check` prints which player is being used and any tuning in effect.
+
 ## Streaming playback (on by default)
 
 Long text used to be silent until the *last* fragment was rendered — most of a minute for

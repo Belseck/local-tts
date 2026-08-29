@@ -63,32 +63,83 @@ def _powershell_command(path):
     return [exe, "-NoProfile", "-NonInteractive", "-Command", script]
 
 
+#: Names that explicitly select Windows' own sound player, from native Windows or from
+#: WSL. Needed as real names because it is not on PATH as a player: `player=powershell.exe`
+#: used to resolve to `powershell.exe <file.wav>`, which runs the wav as a script.
+WINDOWS_PLAYER_NAMES = ("windows", "powershell", "powershell.exe", "pwsh", "pwsh.exe")
+
+
+def _player_tuning():
+    """Per-machine `player_args` / `player_env`.
+
+    Read from the config here rather than threaded through every caller because the
+    detached runner is a separate process that never sees the CLI's loaded config, and
+    it is the one that actually spawns the player. Never fatal: a broken config must not
+    take playback down, it just means no tuning.
+    """
+    try:
+        from localtts import config
+        cfg = config.load()
+    except Exception:                    # noqa: BLE001 - tuning is strictly optional
+        return {}, {}
+    args = cfg.get("player_args")
+    env = cfg.get("player_env")
+    return (args if isinstance(args, dict) else {}), (env if isinstance(env, dict) else {})
+
+
+def _with_extra_args(name, command):
+    """Insert this player's configured extra arguments just before the file, which every
+    builder in PLAYERS puts last."""
+    extras, _ = _player_tuning()
+    extra = extras.get(name)
+    if not extra:
+        return command
+    if isinstance(extra, str):
+        extra = extra.split()
+    return command[:-1] + [str(item) for item in extra] + command[-1:]
+
+
+def player_environment():
+    """os.environ plus `player_env`, or None when nothing is configured -- so the child
+    simply inherits, exactly as it did before this existed."""
+    _, extra = _player_tuning()
+    if not extra:
+        return None
+    merged = dict(os.environ)
+    merged.update({str(key): str(value) for key, value in extra.items()})
+    return merged
+
+
 def find_player(path, preferred=""):
     if preferred:
+        if preferred.lower() in WINDOWS_PLAYER_NAMES:
+            command = _powershell_command(path)
+            if not command:
+                raise TTSError("configured player %r needs PowerShell, which was not "
+                               "found" % preferred)
+            return command
         exe = shutil.which(preferred)
         if not exe:
             raise TTSError("configured player %r was not found on PATH" % preferred)
         for name, build in PLAYERS:
             if name == os.path.basename(preferred):
-                return build(path)
+                return _with_extra_args(name, build(path))
         return [exe, path]
 
-    # On Windows, PowerShell's player is always there; prefer it over hunting for ffplay.
-    if sys.platform == "win32":
+    # Windows and WSL both default to Windows' own player: it is always there, and it is
+    # the native way out of either. On WSL this also closes a trap -- installing ffmpeg
+    # (which local-tts recommends, for tone shaping) would otherwise silently promote
+    # ffplay over a player that was already working, and WSL's Linux audio bridge is
+    # frequently the worse of the two. `player=ffplay` still picks it deliberately.
+    if sys.platform == "win32" or _is_wsl():
         return _powershell_command(path) or _first_player(path)
-
-    found = _first_player(path)
-    if found:
-        return found
-    if _is_wsl():
-        return _powershell_command(path)
-    return None
+    return _first_player(path)
 
 
 def _first_player(path):
     for name, build in PLAYERS:
         if shutil.which(name):
-            return build(path)
+            return _with_extra_args(name, build(path))
     return None
 
 
@@ -131,7 +182,8 @@ def play(path, preferred="", verbose=False, title=True):
                 write_terminal_title(title_for(path, _safe_duration(path)))
                 painted = True
             try:
-                subprocess.run(cmd, check=True, stdout=stream, stderr=stream)
+                subprocess.run(cmd, check=True, stdout=stream, stderr=stream,
+                               env=player_environment())
             except subprocess.CalledProcessError as exc:
                 raise TTSError("playback failed (%s exited with %d)" % (cmd[0], exc.returncode))
             except KeyboardInterrupt:
@@ -144,8 +196,9 @@ def play(path, preferred="", verbose=False, title=True):
 
 
 def available_players():
+    """Players that could be used, best first -- the same order find_player() picks in."""
     found = [name for name, _ in PLAYERS if shutil.which(name)]
-    if sys.platform == "win32" or (not found and _is_wsl()):
+    if sys.platform == "win32" or _is_wsl():
         exe = _powershell_exe()
         if exe:
             found.insert(0, os.path.basename(exe))

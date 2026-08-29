@@ -16,8 +16,22 @@ DEFAULTS = {
     "provider": "llamacpp",
     # Play the generated audio after synthesis (unless --output is given).
     "play": True,
-    # Force a specific playback command (e.g. "ffplay"). Empty => autodetect.
+    # Force a specific playback command (e.g. "ffplay"). Empty => autodetect, which
+    # prefers Windows' own player on Windows and WSL and a Linux player elsewhere.
+    # "windows" (or "powershell") selects the Windows player explicitly -- worth setting
+    # on a WSL box where the Linux audio bridge is noisier than reaching out to Windows.
     "player": "",
+    # Per-machine tuning for whichever player is used, keyed by player name, e.g.
+    #   {"ffplay": ["-af", "aresample=48000"]}
+    # Inserted just before the file argument. Audio stacks differ per box (WSL's pulse
+    # bridge, a resampling ALSA default, a device that wants a bigger buffer), and the
+    # fix is nearly always a flag rather than a code change -- so it is configuration.
+    "player_args": {},
+    # Environment applied to the player process only, e.g.
+    #   {"SDL_AUDIODRIVER": "pulseaudio", "PULSE_LATENCY_MSEC": "90"}
+    # The other half of the same problem: some players are tuned by environment rather
+    # than argv, and this keeps that out of the user's shell profile.
+    "player_env": {},
     # Show a speaker icon in the terminal's tab/window title while audio plays,
     # restoring the title when it stops. Purely cosmetic and skipped entirely when
     # there's no terminal to write to (piped output, a hook, CI).
@@ -180,7 +194,11 @@ DEFAULTS = {
 }
 
 
-TOP_LEVEL_KEYS = ("provider", "play", "player", "terminal_title", "stream")
+TOP_LEVEL_KEYS = ("provider", "play", "player", "terminal_title", "stream",
+                  "player_args", "player_env")
+#: Top-level settings that are maps, so `--set` takes one more level:
+#: `player_args.ffplay="-af aresample=48000"`, `player_env.SDL_AUDIODRIVER=pulseaudio`.
+TOP_LEVEL_MAPS = ("player_args", "player_env")
 LANGUAGE_KEYS = ("provider", "voice")
 
 
@@ -233,6 +251,15 @@ def _coerce(raw, current):
         except ValueError:
             return raw.split()
         return parsed if isinstance(parsed, list) else [parsed]
+    if isinstance(current, dict):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            raise TTSError("expected JSON for a map setting, got %r -- or set one entry "
+                           "at a time with <key>.<name>=<value>" % raw)
+        if not isinstance(parsed, dict):
+            raise TTSError("expected a JSON object, got %r" % raw)
+        return parsed
     return raw
 
 
@@ -343,6 +370,21 @@ def set_values(assignments):
                 bucket.update(parse_language_value(raw))
             if not bucket:
                 user["languages"].pop(code, None)
+            continue
+        if "." in key and key.split(".", 1)[0] in TOP_LEVEL_MAPS:
+            head, _, entry = key.partition(".")
+            if not entry:
+                raise TTSError("expected %s.<name>=<value>" % head)
+            bucket = user.setdefault(head, {})
+            if not isinstance(bucket, dict):
+                bucket = {}
+                user[head] = bucket
+            if raw == "":
+                bucket.pop(entry, None)          # empty value removes the entry
+            elif head == "player_args":
+                bucket[entry] = _coerce(raw, [])
+            else:
+                bucket[entry] = raw
             continue
         if "." in key:
             provider, sub = key.split(".", 1)

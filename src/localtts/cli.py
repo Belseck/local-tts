@@ -482,7 +482,15 @@ def check(argv):
             ok_default = ok
     print("")
     found = audio.available_players()
-    print("players     : %s" % (", ".join(found) if found else "none found (install ffmpeg for ffplay)"))
+    chosen = cfg.get("player") or (found[0] if found else "")
+    print("players     : %s%s" % (", ".join(found) if found else "none found (install ffmpeg for ffplay)",
+                                  "  -> using %s" % chosen if chosen and len(found) > 1 else ""))
+    tuning = ["%s %s" % (name, " ".join(str(a) for a in args))
+              for name, args in sorted((cfg.get("player_args") or {}).items()) if args]
+    tuning += ["%s=%s" % (key, value)
+               for key, value in sorted((cfg.get("player_env") or {}).items())]
+    if tuning:
+        print("player tuning: %s" % "; ".join(tuning))
     print("tone shaping: %s" % _tone_shaping_status())
     print("streaming   : %s" % ("on -- each fragment plays as it is synthesized"
                                 if cfg.get("stream", True) else

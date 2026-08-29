@@ -957,6 +957,32 @@ tts config --set player=ffplay
 
 If nothing is found, the file is kept and its path printed instead of vanishing.
 
+**On WSL, installing ffmpeg does not change your player.** Windows' own player is the
+default on both Windows and WSL, because it is always present and it is the native way
+out of either — and WSL's Linux audio bridge is frequently the noisier of the two, so
+letting a freshly-installed `ffplay` take over would be a silent downgrade. Name a Linux
+player explicitly if you want one:
+
+```bash
+tts config --set player=ffplay      # or mpv, paplay, ...
+tts config --set player=windows     # back to Windows' own player
+```
+
+### Tuning a player for one machine
+
+Audio stacks differ per box, and the fix is nearly always a flag or an environment
+variable rather than a code change — so both are configuration:
+
+```bash
+tts config --set 'player_args.ffplay=-af aresample=48000'   # inserted before the file
+tts config --set player_env.SDL_AUDIODRIVER=pulseaudio      # set for the player only
+tts config --set player_args.ffplay=                        # empty value removes it
+```
+
+`player_args` is keyed by player name and inserted just before the file argument;
+`player_env` is applied to the player process alone, so nothing leaks into your shell
+profile. `tts check` echoes both back when set.
+
 **ffmpeg is worth installing even if you already have a player.** Tone tags change a
 span's pacing, and on any backend without its own rate control that retiming happens to
 the rendered audio: with ffmpeg through `atempo`, without it through a built-in WSOLA
