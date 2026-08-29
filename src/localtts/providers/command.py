@@ -12,6 +12,15 @@ class CommandProvider(Provider):
     name = "command"
     default_format = "wav"
 
+    @property
+    def supports_tone_tags(self):
+        """False by default -- <tag> markup is stripped before the command ever sees it,
+        same as any other backend with no real tone/emotion hook -- unless
+        `command.tone_tags=pass`. Local-tts can't know whether an arbitrary shell script
+        understands the markup, so unlike every other provider here this is a setting the
+        user chooses, not a capability this file verified."""
+        return self.settings.get("tone_tags") == "pass"
+
     def build_command(self, text, out_path):
         template = self.settings.get("template") or ""
         if not template:

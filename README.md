@@ -594,6 +594,12 @@ with OpenAI itself and with local servers such as
 | `voice` | `alloy` |
 | `speed` | `1.0` |
 | `timeout` | `120` |
+| `tone` | *(empty)* |
+| `auto_tone` | `false` |
+
+`tone` is flat voice-style instructions sent with every call (`model=gpt-4o-mini-tts` only);
+`auto_tone` derives tone from `?`/`!`/`.` where no `<tag>` is active in the text. See
+[Tone and emotion tags](#tone-and-emotion-tags) below.
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -647,6 +653,9 @@ tts -p piper -f article.md -o article.wav
 | `binary` | `piper` | Path to or name of the executable. |
 | `model` | *(empty)* | Path to a `.onnx` voice. Required. |
 | `speaker` | `null` | Speaker id for multi-speaker voices. |
+| `length_scale` | `null` | Phoneme length (inverse of rate); `null` uses piper's own default. |
+| `volume` | `null` | Volume multiplier; `null` uses piper's own default. |
+| `auto_tone` | `false` | Derive tone from `?`/`!`/`.` where no `<tag>` is active — see [Tone and emotion tags](#tone-and-emotion-tags). |
 | `extra_args` | `[]` | Extra flags appended verbatim. |
 
 ### `kokoro` — small, fast, offline, many languages
@@ -721,6 +730,7 @@ tts -p kokoro "Prueba de voz con Kokoro."
 | `voice` | *(empty)* | Voice id. Empty uses the binary's own default. |
 | `lang` | *(empty)* | Language code. Empty uses the binary's own default. |
 | `speed` | `1.0` | Playback speed multiplier. |
+| `auto_tone` | `false` | Derive tone from `?`/`!`/`.` where no `<tag>` is active — see [Tone and emotion tags](#tone-and-emotion-tags). Speed only; kokoro has no volume knob. |
 | `extra_args` | `[]` | Extra flags appended verbatim. |
 | `server_url` | *(empty)* | Optional. See [Optional: a persistent server](#optional-a-persistent-server-kokoro--rvc) below. |
 | `server_start`, `server_timeout` | *(empty)*, `30` | Command to auto-start the server, and how long to wait for it. |
@@ -791,6 +801,28 @@ For `rvc`, the model is fixed at server startup (`--model`/`--index` in `server_
 not per request — that's inherent to keeping one loaded; switching voices means changing
 those and restarting the server.
 
+### Tone and emotion tags
+
+Wrap a stretch of text in `<name>...</name>` to mark its tone, e.g.
+`<happy>Good news!</happy> <serious>One thing needs your review.</serious>`. Any word works
+as a tag name; a built-in preset exists for common ones (anger, happy, joy, sad, fear,
+surprise, disgust, calm, excited, serious, whisper, sarcastic, urgent, gentle, confident,
+tired, playful, question, exclamation — see `TAG_PROFILES` in `src/localtts/text.py`), and
+anything else still works with a generic phrase, just without a hand-tuned preset. Tags can
+nest (`<serious><question>...</question></serious>` combines both) and escape a literal
+angle bracket with `\<` / `\>`.
+
+```bash
+tts -p openai --model gpt-4o-mini-tts "<happy>Good news!</happy> <serious>One thing needs your review.</serious>"
+tts -p piper "<whisper>Very quiet now.</whisper> Back to normal."
+```
+
+What a tag actually does depends on the backend, since not every one has a real hook for
+it — see each provider's own table above (`openai.tone`/`auto_tone`, `piper.auto_tone`,
+`kokoro.auto_tone`) and the `local-tts-configure` skill for the full breakdown. On a backend
+with no hook at all (the default `llamacpp`, `rvc`), a tag is a safe no-op: it's always
+stripped before the text is spoken, never read out literally.
+
 ### `command` — anything else
 
 An escape hatch for any binary that can write a WAV file. `{text}` and `{output}`
@@ -803,6 +835,10 @@ tts -p command "Whatever tool you like."
 # macOS
 tts config --set 'command.template=say -o {output} --data-format=LEI16@22050 {text}'
 ```
+
+By default, a `<tag>` is stripped before `{text}` is filled in, like any provider above with
+no real tone hook. If your own script is written to parse the markup itself, opt in with
+`tts config --set command.tone_tags=pass`.
 
 If you wired up something through `command` that now has a real provider above (kokoro,
 rvc), `tts config --detect-migrations` finds it and prints the exact `--set` commands to

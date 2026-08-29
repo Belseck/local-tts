@@ -20,6 +20,11 @@ class Provider:
     name = "base"
     #: Container format this backend writes. Used to name temp files.
     default_format = "wav"
+    #: Whether this backend can act on `<tag>` tone tags (text.tone_segments()) itself.
+    #: False for every backend without a real, verified tone/emotion hook -- text.
+    #: synthesize_chunked() strips the tags before a provider that can't use them ever
+    #: sees the literal brackets, rather than have it try to pronounce them.
+    supports_tone_tags = False
 
     @property
     def max_words(self):

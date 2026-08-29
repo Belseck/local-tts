@@ -6,6 +6,8 @@ import re
 import tempfile
 import threading
 
+from localtts.errors import TTSError
+
 MARKDOWN_SUFFIXES = (".md", ".markdown", ".mdown", ".mkd", ".mdx")
 
 _RULES = (
@@ -84,6 +86,199 @@ def chunks(text, limit):
     return pieces or [text]
 
 
+#: <name>...</name> tone tags. \<, \>, \\ escape a literal angle bracket or backslash --
+#: for text that has to say "<anger>" out loud instead of meaning the tag.
+_TAG_TOKEN = re.compile(r"\\(?P<esc>[<>\\])|</(?P<close>[a-zA-Z][\w-]*)>|<(?P<open>[a-zA-Z][\w-]*)>")
+
+
+class ToneTagError(TTSError):
+    """Malformed <tag>...</tag> markup: unclosed, or mismatched open/close."""
+
+
+def _tag_tokens(text):
+    """Tokenize into ("text", str) / ("open", name) / ("close", name), unescaping \\<, \\>,
+    \\\\ back to a literal character as plain "text" tokens along the way."""
+    pos = 0
+    for match in _TAG_TOKEN.finditer(text):
+        if match.start() > pos:
+            yield "text", text[pos:match.start()]
+        if match.group("esc"):
+            yield "text", match.group("esc")
+        elif match.group("open"):
+            yield "open", match.group("open")
+        else:
+            yield "close", match.group("close")
+        pos = match.end()
+    if pos < len(text):
+        yield "text", text[pos:]
+
+
+def _tagged_spans(text):
+    """(chunk, active_tag_names) pairs covering `text` in order, where active_tag_names is
+    the tuple of currently-open tags (outer-first) for that chunk -- () for plain text.
+    Nesting is allowed: text inside <a><b>...</b></a> gets ("a", "b"). Raises
+    ToneTagError on an unclosed tag or a </x> that doesn't match the innermost open tag --
+    almost certainly a typo, so this fails loudly rather than guessing what was meant.
+    """
+    stack = []
+    spans = []
+    buf = []
+
+    def flush():
+        chunk = "".join(buf)
+        if chunk:
+            spans.append((chunk, tuple(stack)))
+        buf.clear()
+
+    for kind, value in _tag_tokens(text):
+        if kind == "text":
+            buf.append(value)
+        elif kind == "open":
+            flush()
+            stack.append(value)
+        else:
+            if not stack or stack[-1].lower() != value.lower():
+                raise ToneTagError(
+                    "</%s> does not close the currently open tag (%s)"
+                    % (value, ("<%s>" % stack[-1]) if stack else "nothing is open")
+                )
+            flush()
+            stack.pop()
+    flush()
+    if stack:
+        raise ToneTagError("<%s> was never closed" % stack[-1])
+    return spans
+
+
+#: Built-in <tag> vocabulary: name -> (instructions phrase for a backend with a free-text
+#: style hook, speed multiplier, volume multiplier). Speed/volume are a *prosody
+#: approximation* -- real for any backend that exposes a genuine rate/volume knob (piper's
+#: --length-scale/--volume, kokoro's speed), not "true" emotional synthesis the way a
+#: model that actually reads the word "anger" and reacts to it is. The numbers are
+#: deliberately modest (not "1.5x volume, 3x speed") so a chain of them stays listenable;
+#: treat them as a reasonable default preset, not a measured fact -- override via a
+#: provider's own `speed`/`length_scale`/`volume` setting if you want something different,
+#: or per-tag if that's ever asked for.
+TAG_PROFILES = {
+    "anger":       ("Speak with a sharp, angry edge.", 1.10, 1.15),
+    "angry":       ("Speak with a sharp, angry edge.", 1.10, 1.15),
+    "happy":       ("Speak with a warm smile in your voice.", 1.05, 1.05),
+    "joy":         ("Speak with bright, joyful energy.", 1.08, 1.08),
+    "sad":         ("Speak slowly, in a sad, downcast tone.", 0.90, 0.90),
+    "sadness":     ("Speak slowly, in a sad, downcast tone.", 0.90, 0.90),
+    "fear":        ("Speak nervously, as if afraid.", 1.10, 0.90),
+    "afraid":      ("Speak nervously, as if afraid.", 1.10, 0.90),
+    "surprise":    ("Speak with sudden, surprised emphasis.", 1.05, 1.10),
+    "surprised":   ("Speak with sudden, surprised emphasis.", 1.05, 1.10),
+    "disgust":     ("Speak with a tone of disgust or distaste.", 0.95, 1.00),
+    "calm":        ("Speak calmly and evenly.", 0.95, 0.95),
+    "excited":     ("Speak with excited, energetic emphasis.", 1.12, 1.10),
+    "serious":     ("Speak in a serious, measured tone.", 0.95, 1.00),
+    "whisper":     ("Whisper, very quietly and softly.", 0.90, 0.55),
+    "sarcastic":   ("Speak with a dry, sarcastic edge.", 1.00, 1.00),
+    "sarcasm":     ("Speak with a dry, sarcastic edge.", 1.00, 1.00),
+    "urgent":      ("Speak urgently, with a sense of importance.", 1.15, 1.10),
+    "gentle":      ("Speak gently and softly.", 0.90, 0.85),
+    "confident":   ("Speak confidently and assertively.", 1.00, 1.05),
+    "tired":       ("Speak slowly, as if tired.", 0.85, 0.85),
+    "playful":     ("Speak in a light, playful tone.", 1.05, 1.00),
+    # These three also drive auto_tone (see resolve_tone_segments()) -- an explicit
+    # <question> tag and an auto-detected question sentence read the same way.
+    "question":    ("Speak with a curious, questioning lift at the end.", 1.00, 1.00),
+    "exclamation": ("Speak with excited, energetic emphasis.", 1.10, 1.10),
+    "assertion":   (None, 1.00, 1.00),
+}
+
+
+def tag_profile(name):
+    """One tag's {"instructions", "speed", "volume"} -- a built-in preset from
+    TAG_PROFILES when the name matches one (case-insensitive), else a generic
+    instructions-only phrase built from the name itself with speed/volume left at 1.0
+    (unchanged): there's no fixed vocabulary to fabricate a prosody preset for an
+    arbitrary word an agent invents, but the phrase alone still does something on a
+    backend with a real free-text style hook (openai)."""
+    key = name.lower()
+    if key in TAG_PROFILES:
+        instructions, speed, volume = TAG_PROFILES[key]
+        return {"instructions": instructions, "speed": speed, "volume": volume}
+    return {"instructions": "Speak in a tone that conveys %s." % name, "speed": 1.0, "volume": 1.0}
+
+
+def _combine_profiles(names):
+    """Nested tags (<a><b>...</b></a>) combine: instructions concatenate outer-first,
+    speed/volume multiply (so two mild adjustments compound into a stronger one)."""
+    phrases, speed, volume = [], 1.0, 1.0
+    for name in names:
+        profile = tag_profile(name)
+        if profile["instructions"]:
+            phrases.append(profile["instructions"])
+        speed *= profile["speed"]
+        volume *= profile["volume"]
+    return {"instructions": " ".join(phrases) or None, "speed": speed, "volume": volume}
+
+
+_NEUTRAL_PROFILE = {"instructions": None, "speed": 1.0, "volume": 1.0}
+
+
+def resolve_tone_segments(text, auto_tone=False):
+    """Split `text` into (chunk, profile) pairs for a backend that can vary tone/emotion
+    per call -- profile is None for plain text with no tag and no auto_tone match
+    (identical to today's zero-tag behavior), else a dict from _combine_profiles().
+
+    `<name>...</name>` sets the profile for everything inside it; an explicit tag always
+    wins over auto-detection for its span. Escape a literal angle bracket with `\\<` /
+    `\\>` (and `\\\\` for a literal backslash) if the text genuinely needs to say e.g.
+    "<anger>" out loud.
+
+    Where no tag is active and `auto_tone` is true, each *sentence* in that stretch is
+    classified by its own trailing punctuation ("question"/"exclamation"/else
+    "assertion") and gets that category's built-in profile.
+
+    Adjacent chunks that end up with the identical profile are merged, so plain text with
+    no tags and auto_tone off always collapses back to the single (text, None) segment
+    that a plain, untagged call has always been.
+    """
+    expanded = []
+    for chunk, active_tags in _tagged_spans(text):
+        if active_tags:
+            profile = _combine_profiles(active_tags)
+            expanded.append((chunk, profile if profile != _NEUTRAL_PROFILE else None))
+            continue
+        if not auto_tone:
+            expanded.append((chunk, None))
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+", chunk.strip()):
+            if not sentence:
+                continue
+            if sentence.endswith("?"):
+                category = "question"
+            elif sentence.endswith("!"):
+                category = "exclamation"
+            else:
+                category = "assertion"
+            profile = tag_profile(category)
+            expanded.append((sentence, profile if profile != _NEUTRAL_PROFILE else None))
+
+    merged = []
+    for chunk, profile in expanded:
+        if merged and merged[-1][1] == profile:
+            merged[-1][0] += " " + chunk
+        else:
+            merged.append([chunk, profile])
+    return [(chunk.strip(), profile) for chunk, profile in merged if chunk.strip()] or [(text, None)]
+
+
+def strip_tone_tags(text):
+    """Remove <name>...</name> tone tags -- keeping the words inside them, unescaping
+    \\<, \\>, \\\\ -- for any backend that doesn't understand them (see tone_segments()),
+    so it speaks the sentence instead of literally reading out the markup. Still raises
+    ToneTagError on malformed markup: a typo should be reported the same way regardless of
+    which provider happens to be configured, not silently swallowed differently per backend.
+    """
+    chunks = [chunk for chunk, _ in _tagged_spans(text)]
+    return re.sub(r"[ \t]+", " ", "".join(chunks)).strip()
+
+
 def synthesize_chunked(provider, text, out_path, voice=None, on_progress=None):
     """One call for short text; chunk-and-join when the backend needs small prompts.
 
@@ -96,11 +291,18 @@ def synthesize_chunked(provider, text, out_path, voice=None, on_progress=None):
     Lives here rather than in cli.py because a provider that composes another provider
     (rvc, converting a base voice) needs the same chunk-and-join behavior for its own
     inner synthesis call, and providers must not import cli.py (cli.py imports
-    providers -- that would be circular).
+    providers -- that would be circular). Also the one place <tag> tone tags (see
+    tone_segments()) get stripped for a provider that can't act on them -- rvc's own
+    inner call passes through here too, so a base_provider that doesn't support tags
+    (kokoro, piper, ...) never sees the literal brackets, while one that does (openai)
+    gets the raw text so it can do its own per-segment synthesis.
     """
     from localtts import audio   # local import: audio.py has no reason to import text.py,
                                   # but keeping the edge one-directional here avoids ever
                                   # having to worry about load order between the two.
+
+    if not getattr(provider, "supports_tone_tags", False):
+        text = strip_tone_tags(text)
 
     pieces = chunks(text, provider.max_words)
     if len(pieces) == 1:

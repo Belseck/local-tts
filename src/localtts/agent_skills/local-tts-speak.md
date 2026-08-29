@@ -109,6 +109,37 @@ briefly wait its turn behind another session before audibly starting), but *synt
 still happens first, and that takes a moment (a second or two for a sentence, ~12s for a
 1000-word document). Never sit blocked on it.
 
+### Sound human, not flat
+
+A monotone reading of everything is not the goal — **prefer expressive delivery over a flat
+recitation.** Wrap a stretch of text in `<name>...</name>` to mark its tone/emotion, e.g.:
+
+```bash
+tts -b "<happy>Good news, the tests pass!</happy> <serious>One thing still needs your review though.</serious>"
+```
+
+Use tags **whenever the content actually calls for it** — genuine excitement, a real
+question, delivering bad news gently, a joke — not mechanically on every sentence. A short,
+neutral status update needs none of this. A tag wraps only the words it actually applies to;
+plain text outside any tag is unaffected, and you can mix several in one call. If the text
+itself needs to literally contain an angle bracket (rare), escape it: `\<` / `\>`.
+
+Any reasonable word works as a tag name — `<anger>`, `<happy>`, `<sad>`, `<excited>`,
+`<serious>`, `<whisper>`, `<calm>`, `<urgent>`, `<gentle>`, `<sarcastic>`, `<playful>`,
+`<question>`, `<exclamation>` all have a built-in preset; anything else still does *something*
+reasonable, it just isn't hand-tuned. **How much a tag actually changes the audio depends on
+the backend** — openai's `gpt-4o-mini-tts` model genuinely performs the emotion; piper and
+kokoro approximate it with pacing (and, for piper, volume); other backends (the default
+`llamacpp`, `rvc`) have no such hook at all, so a tag there is a safe no-op — the markup is
+always stripped before the words reach them, never spoken literally. This means tags are
+always safe to use regardless of which backend is currently configured; you don't need to
+check first.
+
+If a user consistently wants their own text (already containing sentences that read as
+questions or exclamations) to sound that way automatically, without you adding tags by hand,
+that's a separate opt-in setting — point them at the `local-tts-configure` skill for
+`<provider>.auto_tone`, not something to enable yourself mid-conversation.
+
 ### Always play the whole thing
 
 **Play regardless of length.** Do not decide for the user that something is too long to

@@ -549,6 +549,57 @@ tts -p openai -o out.mp3 "hello"
 
 Per-run overrides that change nothing permanently: `tts -s threads=4 "..."`.
 
+## Tone and emotion tags
+
+Wrapping text in `<name>...</name>` (e.g. `<happy>Good news!</happy>`) marks its tone or
+emotion — `local-tts-speak` is where an agent is told to actually use this. Configuring it
+is what this section covers: what each backend does with a tag, and the two settings that
+control it. There is no fixed tag vocabulary to install or manage — any word works (see
+`text.TAG_PROFILES` in the source for the built-in presets: anger, happy, joy, sad, fear,
+surprise, disgust, calm, excited, serious, whisper, sarcastic, urgent, gentle, confident,
+tired, playful, question, exclamation); anything else still works, just without a hand-tuned
+speed/volume preset behind it.
+
+**Per-backend realization** (verified against each backend's own real interface, not
+assumed):
+
+| Backend | What a tag does |
+| --- | --- |
+| `openai` | The real thing — sends the tag's phrase as the `instructions` field. **Only `model=gpt-4o-mini-tts`** (or its dated alias) accepts this; `tts-1`/`tts-1-hd` reject it, and local-tts raises a clear error rather than silently dropping it if a tag is used with the wrong model. |
+| `piper` | Approximated with `--length-scale` (rate) and `--volume` (real piper flags) — not true emotional synthesis, just faster/slower and louder/quieter. |
+| `kokoro` | Approximated with speed (`-s`) only — kokoro/kokoro_onnx has no volume or pitch knob at all, verified against `Kokoro.create()`'s own signature. |
+| `llamacpp`, `rvc` | No real hook exists (verified: no style/emotion flag in `llama-tts --help`; rvc-python is voice *conversion*, it has no text/emotion input). Tags are always stripped before the text reaches them — never spoken literally, and never an error. Safe to use regardless of the configured provider. |
+| `command` | Depends on `command.tone_tags` (below) — local-tts can't know what an arbitrary script understands. |
+
+More than one segment (a tag partway through the text) means more than one synthesis call,
+joined afterward — the same chunk-and-join machinery already used for long text, so nothing
+extra to install or configure for that.
+
+**Two settings, each per-provider** (`openai`, `piper`, `kokoro`):
+
+```bash
+tts config --set openai.tone="speak warmly and slowly"   # flat instructions with NO tags anywhere in the text
+tts config --set openai.auto_tone=true                    # also derive tone from ?/!/. when no tag is active
+tts config --set piper.auto_tone=true
+tts config --set kokoro.auto_tone=true
+```
+
+`auto_tone` (off by default — ask before turning it on, it changes *how* things are said
+without being asked per-utterance) classifies any untagged sentence by its own trailing
+punctuation and applies the same built-in "question"/"exclamation" presets a `<question>`/
+`<exclamation>` tag would. `openai.tone` is a flat fallback instructions string used only
+where no tag/auto_tone applies at all — piper/kokoro have no free-text equivalent (no
+"instructions" hook to send one to), so they don't have this setting.
+
+**`command.tone_tags`** (default `"strip"`) controls whether a `<tag>` reaches a custom
+`command` template's `{text}` verbatim (`"pass"`) or gets removed first like every other
+backend with no real hook (`"strip"`). Only set this to `"pass"` if the user's own script is
+written to parse the markup itself — ask first, since local-tts has no way to verify that:
+
+```bash
+tts config --set command.tone_tags=pass
+```
+
 ## Diagnosing
 
 | `tts check` / error says | Meaning | Fix |

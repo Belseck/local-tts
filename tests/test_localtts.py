@@ -20,6 +20,7 @@ from localtts.providers.base import Provider
 from localtts.providers.command import CommandProvider
 from localtts.providers.kokoro import KokoroProvider
 from localtts.providers.llamacpp import LlamaCppProvider
+from localtts.providers.openai import OpenAIProvider
 from localtts.providers.rvc import RvcProvider
 
 
@@ -633,6 +634,219 @@ class RvcProviderTest(unittest.TestCase):
         self.assertIn("base voice from", message)
 
 
+def _wav_bytes(marker_byte, frames=50):
+    import io
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(24000)
+        handle.writeframes(bytes([marker_byte, 0]) * frames)
+    return buf.getvalue()
+
+
+class OpenAIProviderTest(unittest.TestCase):
+    def build(self, server, **overrides):
+        settings = dict(config.DEFAULTS["providers"]["openai"])
+        settings["base_url"] = server.url
+        settings.update(overrides)
+        return OpenAIProvider(settings)
+
+    def test_plain_call_sends_no_instructions_field(self):
+        server = _FakeAudioServer("/audio/speech", audio_bytes=_wav_bytes(1))
+        self.addCleanup(server.stop)
+        provider = self.build(server)
+        with tempfile.TemporaryDirectory() as tmp:
+            provider.synthesize("hello there", os.path.join(tmp, "out.wav"))
+        self.assertEqual(len(server.requests), 1)
+        self.assertNotIn("instructions", server.requests[0])
+        self.assertEqual(server.requests[0]["input"], "hello there")
+
+    def test_flat_tone_setting_is_sent_as_instructions(self):
+        server = _FakeAudioServer("/audio/speech", audio_bytes=_wav_bytes(1))
+        self.addCleanup(server.stop)
+        provider = self.build(server, model="gpt-4o-mini-tts", tone="speak cheerfully")
+        with tempfile.TemporaryDirectory() as tmp:
+            provider.synthesize("hello there", os.path.join(tmp, "out.wav"))
+        self.assertEqual(server.requests[0]["instructions"], "speak cheerfully")
+
+    def test_tone_is_rejected_for_a_model_that_does_not_support_it(self):
+        server = _FakeAudioServer("/audio/speech", audio_bytes=_wav_bytes(1))
+        self.addCleanup(server.stop)
+        provider = self.build(server, model="tts-1", tone="speak cheerfully")
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(TTSError):
+                provider.synthesize("hello there", os.path.join(tmp, "out.wav"))
+        self.assertEqual(server.requests, [], "must not call the API with a field it rejects")
+
+    def test_explicit_tag_makes_one_call_per_segment(self):
+        server = _FakeAudioServer("/audio/speech", audio_bytes=_wav_bytes(1))
+        self.addCleanup(server.stop)
+        provider = self.build(server, model="gpt-4o-mini-tts")
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = os.path.join(tmp, "out.wav")
+            provider.synthesize("<anger>Stop that!</anger> Then I calmed down.", out_path)
+            self.assertEqual(len(server.requests), 2)
+            anger = textutil.tag_profile("anger")
+            self.assertEqual(server.requests[0]["input"], "Stop that!")
+            self.assertEqual(server.requests[0]["instructions"], anger["instructions"])
+            self.assertAlmostEqual(server.requests[0]["speed"], anger["speed"])
+            self.assertEqual(server.requests[1]["input"], "Then I calmed down.")
+            self.assertNotIn("instructions", server.requests[1])
+            self.assertNotIn("speed", server.requests[1])
+            # The joined result must be real, playable wav -- not just "some bytes".
+            self.assertGreater(audio.duration(out_path), 0)
+
+    def test_response_format_is_forced_to_wav_for_multi_segment_joins(self):
+        server = _FakeAudioServer("/audio/speech", audio_bytes=_wav_bytes(1))
+        self.addCleanup(server.stop)
+        provider = self.build(server, model="gpt-4o-mini-tts")
+        with tempfile.TemporaryDirectory() as tmp:
+            # .mp3 extension -- the multi-segment path must still request wav internally
+            # (concat_wavs can only join real wav) and write valid wav bytes regardless.
+            out_path = os.path.join(tmp, "out.mp3")
+            provider.synthesize("<anger>Stop!</anger> Calm now.", out_path)
+        for request in server.requests:
+            self.assertEqual(request["response_format"], "wav")
+
+    def test_single_segment_uses_the_requested_response_format(self):
+        server = _FakeAudioServer("/audio/speech", audio_bytes=_wav_bytes(1))
+        self.addCleanup(server.stop)
+        provider = self.build(server)
+        with tempfile.TemporaryDirectory() as tmp:
+            provider.synthesize("hello there", os.path.join(tmp, "out.mp3"))
+        self.assertEqual(server.requests[0]["response_format"], "mp3")
+
+    def test_auto_tone_applies_when_enabled(self):
+        server = _FakeAudioServer("/audio/speech", audio_bytes=_wav_bytes(1))
+        self.addCleanup(server.stop)
+        provider = self.build(server, model="gpt-4o-mini-tts", auto_tone=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            provider.synthesize("Is this on?", os.path.join(tmp, "out.wav"))
+        self.assertEqual(server.requests[0]["instructions"],
+                         textutil.tag_profile("question")["instructions"])
+
+    def test_auto_tone_off_by_default(self):
+        server = _FakeAudioServer("/audio/speech", audio_bytes=_wav_bytes(1))
+        self.addCleanup(server.stop)
+        provider = self.build(server, model="gpt-4o-mini-tts")
+        with tempfile.TemporaryDirectory() as tmp:
+            provider.synthesize("Is this on?", os.path.join(tmp, "out.wav"))
+        self.assertNotIn("instructions", server.requests[0])
+
+    def test_malformed_tag_raises_before_any_request(self):
+        server = _FakeAudioServer("/audio/speech", audio_bytes=_wav_bytes(1))
+        self.addCleanup(server.stop)
+        provider = self.build(server, model="gpt-4o-mini-tts")
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(textutil.ToneTagError):
+                provider.synthesize("<anger>oops", os.path.join(tmp, "out.wav"))
+        self.assertEqual(server.requests, [])
+
+    def test_dry_run_shows_segments_without_calling_the_api(self):
+        server = _FakeAudioServer("/audio/speech", audio_bytes=_wav_bytes(1))
+        self.addCleanup(server.stop)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = {
+                "provider": "openai", "play": False, "player": "",
+                "providers": {**config.DEFAULTS["providers"],
+                              "openai": {**config.DEFAULTS["providers"]["openai"],
+                                        "base_url": server.url, "model": "gpt-4o-mini-tts"}},
+            }
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w") as fh:
+                json.dump(cfg, fh)
+            os.environ["LOCALTTS_CONFIG"] = path
+            try:
+                self.assertEqual(main(["--dry-run", "<anger>Stop!</anger> Calm now."]), 0)
+            finally:
+                os.environ.pop("LOCALTTS_CONFIG", None)
+        self.assertEqual(server.requests, [])
+
+
+class SupportsToneTagsTest(unittest.TestCase):
+    """A provider with no real tone/emotion hook must never see a literal <tag> -- see
+    text.synthesize_chunked() and Provider.supports_tone_tags."""
+
+    def test_expected_support_per_provider(self):
+        expected = {
+            "llamacpp": False,   # no speed/style flag exists at all (verified via --help)
+            "openai": True,      # instructions field [+ speed], gpt-4o-mini-tts only
+            "piper": True,       # --length-scale / --volume are real flags
+            "kokoro": True,      # -s/speed is real; no volume/pitch knob exists
+            "rvc": False,        # never touches text itself, delegates to base_provider
+            "command": False,    # user's call via command.tone_tags, default "strip"
+        }
+        self.assertEqual(set(expected), set(providers.names()), "update this test too")
+        for name, want in expected.items():
+            provider = providers.build(name, config.DEFAULTS)
+            self.assertEqual(provider.supports_tone_tags, want, name)
+
+    def test_kokoro_never_sees_a_literal_tag(self):
+        provider = KokoroProvider(dict(config.DEFAULTS["providers"]["kokoro"], binary="kokoro-tts"))
+        seen = []
+
+        def fake_run(cmd, **kwargs):
+            seen.append(cmd)
+            with open(cmd[cmd.index("-o") + 1], "wb") as fh:
+                fh.write(_wav_bytes(1))
+            return None
+
+        provider.run = fake_run
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = os.path.join(tmp, "out.wav")
+            textutil.synthesize_chunked(provider, "<anger>Stop that!</anger> Calm now.", out_path)
+        # <anger> has a real speed preset for kokoro, so this is two separate calls
+        # (one per segment), each with the plain words and no literal markup in either.
+        self.assertEqual(len(seen), 2)
+        joined_texts = " ".join(cmd[-1] for cmd in seen)
+        self.assertNotIn("<anger>", joined_texts)
+        self.assertNotIn("</anger>", joined_texts)
+        self.assertIn("Stop that!", joined_texts)
+        self.assertIn("Calm now.", joined_texts)
+        self.assertIn("-s", seen[0])   # the <anger>-adjusted segment carries a speed flag
+        self.assertNotIn("-s", seen[1])   # the plain "Calm now." segment does not
+
+    def test_command_strips_tags_by_default(self):
+        provider = CommandProvider({"template": "fake-cmd -w {output} {text}"})
+        self.assertFalse(provider.supports_tone_tags)
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            with open(cmd[cmd.index("-w") + 1], "wb") as fh:
+                fh.write(_wav_bytes(1))
+            return None
+
+        provider.run = fake_run
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = os.path.join(tmp, "out.wav")
+            textutil.synthesize_chunked(provider, "<anger>Stop that!</anger>", out_path)
+        self.assertNotIn("<anger>", seen["cmd"])
+        self.assertIn("Stop that!", seen["cmd"])
+
+    def test_command_tone_tags_pass_through_when_configured(self):
+        provider = CommandProvider({"template": "fake-cmd -w {output} {text}",
+                                    "tone_tags": "pass"})
+        self.assertTrue(provider.supports_tone_tags)
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            with open(cmd[cmd.index("-w") + 1], "wb") as fh:
+                fh.write(_wav_bytes(1))
+            return None
+
+        provider.run = fake_run
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = os.path.join(tmp, "out.wav")
+            textutil.synthesize_chunked(provider, "<anger>Stop that!</anger>", out_path)
+        self.assertIn("<anger>Stop that!</anger>", seen["cmd"])
+
+    def test_command_default_tone_tags_setting_is_strip(self):
+        self.assertEqual(config.DEFAULTS["providers"]["command"]["tone_tags"], "strip")
+
+
 class CommandProviderTest(unittest.TestCase):
     def test_text_cannot_inject_extra_arguments(self):
         provider = CommandProvider({"template": "espeak-ng -w {output} {text}"})
@@ -692,6 +906,94 @@ class MarkdownTest(unittest.TestCase):
     def test_markdown_detection_by_suffix(self):
         self.assertTrue(textutil.looks_like_markdown("/tmp/notes.MD"))
         self.assertFalse(textutil.looks_like_markdown("/tmp/notes.txt"))
+
+
+class ToneSegmentsTest(unittest.TestCase):
+    def profile(self, name):
+        return textutil.tag_profile(name)
+
+    def test_plain_text_is_a_single_untagged_segment(self):
+        self.assertEqual(textutil.resolve_tone_segments("Hello there."), [("Hello there.", None)])
+
+    def test_explicit_tag_isolates_its_span(self):
+        segments = textutil.resolve_tone_segments("<anger>Stop that!</anger> Then I calmed down.")
+        self.assertEqual(segments, [
+            ("Stop that!", self.profile("anger")),
+            ("Then I calmed down.", None),
+        ])
+
+    def test_unknown_tag_gets_a_generic_instructions_only_profile(self):
+        segments = textutil.resolve_tone_segments("<zorbaxian>Odd word.</zorbaxian>")
+        self.assertEqual(segments, [
+            ("Odd word.", {"instructions": "Speak in a tone that conveys zorbaxian.",
+                          "speed": 1.0, "volume": 1.0}),
+        ])
+
+    def test_nested_tags_combine_phrases_and_multiply_speed_volume(self):
+        segments = textutil.resolve_tone_segments("<serious><question>Are you sure?</question></serious>")
+        self.assertEqual(len(segments), 1)
+        chunk, profile = segments[0]
+        self.assertEqual(chunk, "Are you sure?")
+        serious, question = self.profile("serious"), self.profile("question")
+        self.assertEqual(profile["instructions"], serious["instructions"] + " " + question["instructions"])
+        self.assertAlmostEqual(profile["speed"], serious["speed"] * question["speed"])
+        self.assertAlmostEqual(profile["volume"], serious["volume"] * question["volume"])
+
+    def test_auto_tone_classifies_by_trailing_punctuation(self):
+        segments = textutil.resolve_tone_segments(
+            "This is a statement. Is this a question? Wow, exciting!", auto_tone=True)
+        self.assertEqual(segments, [
+            ("This is a statement.", None),   # "assertion" is the built-in neutral profile
+            ("Is this a question?", self.profile("question")),
+            ("Wow, exciting!", self.profile("exclamation")),
+        ])
+
+    def test_auto_tone_off_by_default_leaves_punctuation_alone(self):
+        segments = textutil.resolve_tone_segments("This is a statement. Is this a question?")
+        self.assertEqual(segments, [("This is a statement. Is this a question?", None)])
+
+    def test_explicit_tag_wins_over_auto_tone_inside_its_span(self):
+        segments = textutil.resolve_tone_segments(
+            "<whisper>Is this quiet? So quiet!</whisper> Loud now.", auto_tone=True)
+        self.assertEqual(segments, [
+            ("Is this quiet? So quiet!", self.profile("whisper")),
+            ("Loud now.", None),
+        ])
+
+    def test_tag_name_matching_an_auto_tone_category_reuses_its_phrase(self):
+        segments = textutil.resolve_tone_segments("<question>Are you sure?</question>")
+        self.assertEqual(segments, [("Are you sure?", self.profile("question"))])
+
+    def test_escaped_angle_brackets_are_taken_literally(self):
+        segments = textutil.resolve_tone_segments(r"Please use \<anger\> like this.")
+        self.assertEqual(segments, [("Please use <anger> like this.", None)])
+
+    def test_escaped_backslash(self):
+        segments = textutil.resolve_tone_segments(r"A literal backslash: \\ there.")
+        self.assertEqual(segments, [("A literal backslash: \\ there.", None)])
+
+    def test_unclosed_tag_raises(self):
+        with self.assertRaises(textutil.ToneTagError):
+            textutil.resolve_tone_segments("<anger>oops")
+
+    def test_mismatched_close_tag_raises(self):
+        with self.assertRaises(textutil.ToneTagError):
+            textutil.resolve_tone_segments("<anger>oops</question>")
+
+    def test_tone_tag_error_is_a_tts_error(self):
+        self.assertTrue(issubclass(textutil.ToneTagError, TTSError))
+
+    def test_strip_tone_tags_keeps_words_drops_markup(self):
+        out = textutil.strip_tone_tags("<anger>Stop that!</anger> Then I calmed down.")
+        self.assertEqual(out, "Stop that! Then I calmed down.")
+
+    def test_strip_tone_tags_unescapes_literal_brackets(self):
+        out = textutil.strip_tone_tags(r"Please use \<anger\> like this.")
+        self.assertEqual(out, "Please use <anger> like this.")
+
+    def test_strip_tone_tags_also_raises_on_malformed_markup(self):
+        with self.assertRaises(textutil.ToneTagError):
+            textutil.strip_tone_tags("<anger>oops")
 
 
 class ChunkTest(unittest.TestCase):

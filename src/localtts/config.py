@@ -63,11 +63,31 @@ DEFAULTS = {
             "voice": "alloy",
             "speed": 1.0,
             "timeout": 120,
+            # Free-text voice-style control -- the "instructions" field of the create-speech
+            # API. Real, but only for model=gpt-4o-mini-tts (or its dated alias); tts-1 and
+            # tts-1-hd reject it. Verified against OpenAI's own API reference, 2026-08. Sent
+            # with every call when set and no <tag> is active in the text (see
+            # text.resolve_tone_segments(), text.TAG_PROFILES).
+            "tone": "",
+            # Derive tone from sentence-ending punctuation for any stretch of text with no
+            # explicit <tag>. Off by default -- it changes what gets said, not just how the
+            # audio is produced, so it's opt-in. Shared, hand-written phrases for every
+            # <tag> name (built-in ones like <anger>/<whisper>, and the punctuation-derived
+            # question/exclamation/assertion categories) live in text.TAG_PROFILES, not
+            # here -- one table, not one setting per tag per provider.
+            "auto_tone": False,
         },
         "piper": {
             "binary": "piper",
             "model": "",           # path to a .onnx voice
             "speaker": None,       # speaker id for multi-speaker voices
+            # Real piper flags (verified via `piper --help`) -- inverse-of-rate and
+            # loudness. None => piper's own default (1.0 either way), flag omitted. A
+            # <tag>'s speed/volume multiplies onto whatever is configured here, it doesn't
+            # replace it -- see PiperProvider._prosody_overrides().
+            "length_scale": None,
+            "volume": None,
+            "auto_tone": False,    # see openai.auto_tone above for what this means
             "extra_args": [],
         },
         "kokoro": {
@@ -78,6 +98,8 @@ DEFAULTS = {
             "voice": "",    # empty => the binary's own default
             "lang": "",     # empty => the binary's own default
             "speed": 1.0,
+            "auto_tone": False,    # see openai.auto_tone above -- kokoro has no volume
+                                   # knob at all, so only a <tag>'s speed is realized here
             "extra_args": [],
             # Optional: talk to a persistent server that keeps the model loaded, instead
             # of paying model-load cost on every call. Not installed or run by this tool
@@ -119,6 +141,12 @@ DEFAULTS = {
             # Escape hatch: any CLI that writes a wav file.
             # {text} and {output} are substituted as single argv items.
             "template": "espeak-ng -w {output} {text}",
+            # local-tts can't know whether an arbitrary command understands <tag> markup,
+            # so this is a plain user choice, not an auto-detected capability (see
+            # CommandProvider.supports_tone_tags): "strip" (default) removes <tag>s before
+            # {text} is filled in, same as every provider with no real tone hook; "pass"
+            # leaves them in verbatim, for a custom script written to parse them itself.
+            "tone_tags": "strip",
         },
     },
 }

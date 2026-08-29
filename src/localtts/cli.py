@@ -199,17 +199,26 @@ def speak(argv):
 
     args.voice = voice
     if args.dry_run:
-        pieces = textutil.chunks(text, provider.max_words)
+        # A provider that can't act on <tag> tone tags (text.tone_segments()) never sees
+        # them at runtime either -- synthesize_chunked() strips them first. Mirror that
+        # here so --dry-run shows the words that actually get spoken/passed, not literal
+        # markup that's really about to be stripped. rvc composes another provider, so
+        # what matters is whether *that one* supports tags, not rvc itself (rvc never
+        # touches text -- see RvcProvider.synthesize()).
+        dry_base = provider.base_provider_instance() if provider.name == "rvc" else None
+        tag_aware = dry_base.supports_tone_tags if dry_base else provider.supports_tone_tags
+        chunk_text = text if tag_aware else textutil.strip_tone_tags(text)
+        pieces = textutil.chunks(chunk_text, provider.max_words)
         if len(pieces) > 1:
             print("# %d words -> %d chunks of <=%d words, joined into one file"
-                  % (len(text.split()), len(pieces), provider.max_words))
+                  % (len(chunk_text.split()), len(pieces), provider.max_words))
         server_url = provider.settings.get("server_url")
         if provider.name == "rvc":
             # rvc has no single command: it synthesizes with another provider first,
             # then converts the result. build_command(wav_in, out_path) only covers the
             # second half -- showing that alone against a positional text arg would
             # silently pass the text itself as if it were an input wav path.
-            base = provider.base_provider_instance()
+            base = dry_base
             print("# step 1: synthesize the base voice with %s" % base.name)
             base_builder = getattr(base, "build_command", None)
             if base_builder is None:
@@ -230,6 +239,41 @@ def speak(argv):
         elif server_url:
             print("# %s: POST %s/synthesize (auto-starts via %s.server_start if not "
                   "already running)" % (provider.name, server_url, provider.name))
+        elif provider.name in ("openai", "piper", "kokoro"):
+            # Each of these can realize a <tag>/auto_tone-driven segment in its own way
+            # (openai: the "instructions" field [+ speed]; piper/kokoro: speed, and piper
+            # also volume -- see their own supports_tone_tags docstrings) -- so unlike the
+            # generic branch below, more than one segment means more than one call.
+            def _describe(profile):
+                if not profile:
+                    return "(none)"
+                bits = [repr(profile["instructions"])] if profile.get("instructions") else []
+                if profile["speed"] != 1.0:
+                    bits.append("speed x%.2f" % profile["speed"])
+                if profile.get("volume", 1.0) != 1.0:
+                    bits.append("volume x%.2f" % profile["volume"])
+                return ", ".join(bits) or "(none)"
+
+            if provider.name == "openai":
+                segments = provider.resolved_segments(text)
+            else:
+                segments = textutil.resolve_tone_segments(
+                    text, auto_tone=bool(provider.settings.get("auto_tone")))
+
+            if len(segments) == 1 and segments[0][1] is None:
+                chunk = segments[0][0]
+                if provider.name == "openai":
+                    print("# POSTs to %s" % provider.settings.get("base_url"))
+                else:
+                    print(" ".join(provider.build_command(chunk, out_path, args.voice)))
+                    if provider.name == "piper":
+                        print("# (the text is piped to stdin, not passed as an argument)")
+            else:
+                print("# %d tone segments -> %d calls, joined%s:"
+                      % (len(segments), len(segments), " as wav" if provider.name == "openai" else ""))
+                for chunk, profile in segments:
+                    label = chunk if len(chunk) <= 60 else chunk[:57] + "..."
+                    print("#   [%s] %s" % (_describe(profile), label))
         else:
             builder = getattr(provider, "build_command", None)
             if builder is None:
