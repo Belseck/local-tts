@@ -14,7 +14,8 @@ import unittest.mock
 import wave
 from pathlib import Path
 
-from localtts import audio, audiofx, config, hooks, providers, skills, text as textutil
+from localtts import (audio, audiofx, config, hooks, providers, servers, skills,
+                      text as textutil)
 from localtts.cli import _resolve_session, _synthesize, main
 from localtts.errors import TTSError
 from localtts.providers.base import Provider
@@ -2812,3 +2813,102 @@ class PhoneticsOnTheWireTest(unittest.TestCase):
 
         cfg["providers"]["rvc"]["base_provider"] = "piper"
         self.assertFalse(RvcProvider(cfg["providers"]["rvc"], cfg=cfg).supports_phonetics)
+
+
+class ServerScriptTest(unittest.TestCase):
+    """`tts servers`: the one part of an install a `git pull` cannot reach.
+
+    The script kokoro and rvc run is a copy in the backend's own venv, so the failure
+    being tested for is a silent one -- an old copy answers /health and drops what it
+    never learned to read.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.script = os.path.join(self.tmp.name, "kokoro_server.py")
+
+    def cfg(self, start=None):
+        if start is None:
+            start = "/venv/bin/python %s --port 8765" % self.script
+        return {"providers": {"kokoro": dict(config.DEFAULTS["providers"]["kokoro"],
+                                             server_url="http://127.0.0.1:8765",
+                                             server_start=start)}}
+
+    def write(self, text):
+        with open(self.script, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_both_templates_extract_and_are_valid_python(self):
+        """They are written to disk and executed, so a broken block is a broken install
+        that nothing else here would catch."""
+        for provider in ("kokoro", "rvc"):
+            text = servers.template(provider)
+            compile(text, "%s_server.py" % provider, "exec")
+            self.assertIn("/shutdown", text)
+
+    def test_a_script_matching_the_template_is_current(self):
+        self.write(servers.template("kokoro"))
+        self.assertEqual(servers.entries(self.cfg())[0]["state"], servers.CURRENT)
+
+    def test_an_older_script_is_stale(self):
+        self.write("print('a copy from an earlier version')\n")
+        self.assertEqual(servers.entries(self.cfg())[0]["state"], servers.STALE)
+
+    def test_a_script_that_is_not_there_is_missing(self):
+        self.assertEqual(servers.entries(self.cfg())[0]["state"], servers.MISSING)
+
+    def test_a_server_start_naming_no_script_cannot_be_checked(self):
+        record = servers.entries(self.cfg(start="/venv/bin/kokoro-server --port 8765"))[0]
+        self.assertEqual(record["state"], servers.UNCONFIGURED)
+
+    def test_the_script_path_comes_from_server_start_not_from_the_skill(self):
+        """Where that venv lives is the user's choice; the skill only suggests one."""
+        settings = {"server_start": "~/elsewhere/bin/python ~/elsewhere/kokoro_server.py -p 1"}
+        self.assertEqual(servers.script_path(settings),
+                         os.path.expanduser("~/elsewhere/kokoro_server.py"))
+
+    def test_a_provider_with_no_server_url_is_not_listed(self):
+        cfg = {"providers": {"kokoro": dict(config.DEFAULTS["providers"]["kokoro"])}}
+        self.assertEqual(servers.entries(cfg), [])
+
+    def test_refresh_installs_the_template_and_keeps_the_previous_copy(self):
+        """`stale` cannot tell rot from a deliberate edit -- a different model directory,
+        an extra flag -- so the old file has to survive the rewrite."""
+        self.write("MODELS = '/somewhere/else'\n")
+        backup = servers.refresh(servers.entries(self.cfg())[0])
+        with open(self.script, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), servers.template("kokoro"))
+        with open(backup, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "MODELS = '/somewhere/else'\n")
+        self.assertEqual(servers.entries(self.cfg())[0]["state"], servers.CURRENT)
+
+    def test_refresh_of_a_missing_script_leaves_no_backup(self):
+        self.assertEqual(servers.refresh(servers.entries(self.cfg())[0]), "")
+        self.assertEqual(servers.entries(self.cfg())[0]["state"], servers.CURRENT)
+
+    def test_a_current_server_accepts_shutdown(self):
+        server = _FakeAudioServer("/shutdown", audio_bytes=b"")
+        self.addCleanup(server.stop)
+        self.assertTrue(servers.shutdown(server.url))
+
+    def test_a_server_predating_shutdown_says_so_instead_of_looking_stopped(self):
+        """It answers 404 and keeps running. Reporting that honestly is the difference
+        between "the new script is live" and "it will be, in five idle minutes"."""
+        server = _FakeAudioServer("/convert", audio_bytes=b"")
+        self.addCleanup(server.stop)
+        self.assertFalse(servers.shutdown(server.url))
+
+    def test_the_subcommand_reports_a_stale_script(self):
+        import contextlib, io as _io
+        self.write("print('old')\n")
+        path = os.path.join(self.tmp.name, "config.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(self.cfg(), handle)
+        os.environ["LOCALTTS_CONFIG"] = path
+        self.addCleanup(os.environ.pop, "LOCALTTS_CONFIG", None)
+        captured = _io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            self.assertEqual(main(["servers"]), 0)
+        self.assertIn("STALE", captured.getvalue())
+        self.assertIn("--refresh", captured.getvalue())

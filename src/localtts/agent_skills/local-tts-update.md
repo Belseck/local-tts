@@ -135,21 +135,28 @@ once by an agent following the configure skill. **`git pull` never touches it**,
 the single most likely thing to be stale after an update: the script is *not* installed by
 `tts skills --install` either, so nothing refreshes it automatically.
 
-**Compare it against the current template and rewrite it if they differ**, rather than
-assuming it is fine:
+`tts servers` does the comparison for you — it reads the script out of the freshly
+pulled skill and diffs it against what is actually on disk, wherever `server_start`
+points:
 
 ```bash
-tts skills --print local-tts-configure | grep -n "rvc_server.py\|kokoro_server.py"
-diff <(tts skills --print local-tts-configure | sed -n '/^cat > .*rvc_server.py/,/^EOF$/p' \
-        | sed '1d;$d') ~/.local/share/rvc-venv/rvc_server.py
+tts servers              # what is installed, and whether it matches this version
+tts servers --refresh    # rewrite the stale ones and stop the running server
 ```
 
-Any difference means the running server is missing whatever the update added. Rewrite the
-script from the block in the freshly-printed configure skill, then **kill the running
-process** — the next `tts` call auto-starts a fresh one from the new file. Do this
-whenever the diff is non-empty, not only when the commit list happens to mention servers;
-a server script silently missing a flag is exactly the kind of thing that looks like a
-voice-quality problem instead of a stale file.
+Run this after **every** update, not only when the commit list happens to mention
+servers: a server script silently missing a flag looks like a voice-quality problem, not
+like a stale file, and that is a bad afternoon.
+
+`--refresh` keeps the previous script as `<name>.bak` — `stale` only means "differs from
+this version's template", which includes a script somebody edited on purpose (a different
+model directory, an extra flag). If the backup shows an edit worth keeping, re-apply it
+on top of the new file and say so; do not silently discard someone's change.
+
+It also stops a server that is running, so the next `tts` call starts the new script
+instead of talking to the old code for another five minutes. A server installed before
+`/shutdown` existed cannot be stopped that way — `tts servers --refresh` says so plainly
+when it happens, and that one has to age out on its own idle timeout or be killed.
 
 Capabilities added to these scripts over time that an older copy will not have — check for
 each, since a missing one fails silently rather than erroring:

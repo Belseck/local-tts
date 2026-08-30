@@ -7,12 +7,13 @@ import shutil
 import sys
 import tempfile
 
-from localtts import __version__, audio, config, hooks, providers, skills, text as textutil
+from localtts import (__version__, audio, config, hooks, providers, servers, skills,
+                      text as textutil)
 from localtts.errors import TTSError
 
 PROG = "tts"
 SUBCOMMANDS = ("config", "providers", "check", "languages", "skills", "hooks",
-               "playback", "stop", "pause", "resume")
+               "servers", "playback", "stop", "pause", "resume")
 
 #: Environment variables known to hold a stable per-run session id, checked in order.
 #: Verified against a live capture: Claude Code's own status-line JSON payload carries
@@ -58,6 +59,7 @@ def _speak_parser():
             "  %(prog)s languages            show which backend speaks which language\n"
             "  %(prog)s skills               install agent skills for this CLI\n"
             "  %(prog)s hooks                install a status-bar hook (fewer chat messages)\n"
+            "  %(prog)s servers             persistent server scripts: current or stale\n"
             "  %(prog)s stop | pause | resume control background playback\n"
             "  %(prog)s check                verify backends and audio players\n"
             "  %(prog)s config --show        print the effective configuration\n"
@@ -729,6 +731,66 @@ def hooks_command(argv):
     return 0
 
 
+def _short(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home) else path
+
+
+def servers_command(argv):
+    parser = argparse.ArgumentParser(
+        prog="%s servers" % PROG,
+        description="Whether each persistent server is running this version's script.",
+        epilog=("The script a server runs lives in that backend's own venv, not in this\n"
+                "package, so updating local-tts never touches it -- an older copy answers\n"
+                "/health perfectly well and silently drops what it does not understand.\n"
+                "--refresh is what brings it forward.\n"),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--refresh", action="store_true",
+                        help="rewrite a stale script from the bundled template, keeping the "
+                             "old one as .bak, and stop the running server so the next call "
+                             "starts the new one")
+    args = parser.parse_args(argv)
+    cfg = config.load()
+    records = servers.entries(cfg)
+    if not records:
+        print("no persistent server is configured. kokoro and rvc are the two that can run "
+              "one -- see the local-tts-configure skill")
+        return 0
+
+    outdated = 0
+    for record in records:
+        provider, state, path = record["provider"], record["state"], record["path"]
+        alive = providers.build(provider, cfg).server_alive(record["url"])
+        running = "running" if alive else "not running"
+        if state == servers.CURRENT:
+            print("[ok] %-7s script is current -- %s (%s)" % (provider, _short(path), running))
+            continue
+        if state == servers.UNCONFIGURED:
+            print("[--] %-7s server_start names no .py, so its script cannot be checked "
+                  "(%s)" % (provider, running))
+            continue
+        outdated += 1
+        label = "missing" if state == servers.MISSING else "STALE"
+        print("[!!] %-7s script is %s -- %s (%s)" % (provider, label, _short(path), running))
+        if not args.refresh:
+            continue
+        backup = servers.refresh(record)
+        print("     wrote the current script%s" % ("; previous kept as %s" % _short(backup)
+                                                   if backup else ""))
+        if alive:
+            if servers.shutdown(record["url"]):
+                print("     stopped the running server; the next call starts the new one")
+            else:
+                print("     the running server predates /shutdown, so it is still the old "
+                      "code -- it exits on its own idle timeout, or kill it to swap sooner")
+
+    if outdated and not args.refresh:
+        print("")
+        print("`%s servers --refresh` rewrites %s from the bundled template."
+              % (PROG, "them" if outdated > 1 else "it"))
+    return 0
+
+
 def skills_command(argv):
     parser = argparse.ArgumentParser(
         prog="%s skills" % PROG,
@@ -902,6 +964,7 @@ def main(argv=None):
                 "languages": languages,
                 "skills": skills_command,
                 "hooks": hooks_command,
+                "servers": servers_command,
                 "playback": playback_command,
             }.get(argv[0])
             if handler is None:      # stop / pause / resume are shortcuts

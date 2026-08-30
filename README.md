@@ -257,15 +257,21 @@ pip install -e .
 pipx install . --force
 ```
 
-Two more things are **snapshots taken at install time**, not symlinks into the repo, so
+Three more things are **snapshots taken at install time**, not symlinks into the repo, so
 pulling doesn't update them on its own:
 
 ```bash
-tts skills --install    # refreshes the skill copies every detected agent is reading
+tts skills --install     # refreshes the skill copies every detected agent is reading
 tts hooks --install      # only if `tts hooks --status` shows one is active
+tts servers --refresh    # the kokoro/rvc server scripts, which live in their own venvs
 ```
 
 Then `tts --version` and `tts check` to confirm it landed.
+
+The server script is the one that goes stale in silence: it is a copy in the backend's
+venv, an older one answers `/health` perfectly well, and it drops any request key it never
+learned to read — so a new capability just quietly does nothing. `tts servers` compares
+what is installed against this version and says which is which.
 
 If you use a coding agent, the whole thing — including finding the repo behind whatever
 install method you used — is the **`local-tts-update`** skill from
@@ -945,6 +951,26 @@ For `rvc`, one server can hold **several** models at once: start it with a repea
 `rvc.language_models` picks it per language, with `rvc.server_model` as the flat default.
 A server started with a single `--model` and no names still works; it just answers every
 request with the one voice it loaded.
+
+**Keeping the script current.** Neither server script is part of this package — each is a
+copy written into that backend's venv, so `git pull` and `pip install -e .` never touch
+one. `tts servers` reads the script out of the bundled `local-tts-configure` skill and
+compares it with what is actually on disk, wherever `server_start` points:
+
+```console
+$ tts servers
+[ok] kokoro  script is current -- ~/.local/share/kokoro-venv/kokoro_server.py (running)
+[!!] rvc     script is STALE -- ~/.local/share/rvc-venv/rvc_server.py (not running)
+
+`tts servers --refresh` rewrites it from the bundled template.
+```
+
+`--refresh` writes the current script, keeps the previous one as `<name>.bak`, and asks a
+running server to exit so the next call starts the new one. `STALE` only means *differs
+from this version's template* — a script you edited on purpose reads the same way, which
+is why the old copy is kept rather than replaced outright. A server installed before
+`/shutdown` existed cannot be stopped this way; `--refresh` says so, and that one ages out
+on its own idle timeout.
 
 ### Tone and emotion tags
 

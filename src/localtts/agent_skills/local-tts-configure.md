@@ -226,6 +226,12 @@ So treat this as the second half of installing kokoro, not an extra. **Still ask
 leaves a background process running — but ask with a recommendation, and say what they
 lose by declining:
 
+> The script below is a **copy**, not a link into the package: once written, nothing
+> updates it on its own. After any `local-tts` update, `tts servers` says whether it still
+> matches this version and `tts servers --refresh` rewrites it (keeping the old one as
+> `.bak`) and stops the running server so the new one takes over. If you are writing this
+> file by hand today, you never need to diff it yourself again.
+
 ```bash
 cat > ~/.local/share/kokoro-venv/kokoro_server.py <<'EOF'
 #!/usr/bin/env python3
@@ -431,7 +437,8 @@ def make_handler(kokoro, last_activity):
                 # so that `tts check` can tell a server that understands the
                 # pronunciation dictionary's IPA entries from an older copy that
                 # would accept them and drop them without a word.
-                body = json.dumps({"ok": True, "phonetics": True}).encode("utf-8")
+                body = json.dumps({"ok": True, "phonetics": True,
+                                   "shutdown": True}).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -442,6 +449,17 @@ def make_handler(kokoro, last_activity):
                 self.end_headers()
 
         def do_POST(self):
+            if self.path == "/shutdown":
+                # `tts servers --refresh` rewrites this file, but the process already
+                # running is still the old code -- and it would keep answering for up
+                # to a whole idle timeout. Exiting hands the port back; the next call
+                # auto-starts the new file.
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                self.wfile.flush()
+                threading.Thread(target=_exit_soon, daemon=True).start()
+                return
             if self.path != "/synthesize":
                 self.send_response(404)
                 self.end_headers()
@@ -508,6 +526,14 @@ def make_handler(kokoro, last_activity):
             self.wfile.write(buf.getvalue())
 
     return Handler
+
+
+def _exit_soon():
+    """Let the 200 reach the client first, then go. os._exit for the same reason
+    watch_idle uses it: a loaded model has threads that will not unwind politely."""
+    time.sleep(0.2)
+    print("shutdown requested, exiting", file=sys.stderr)
+    os._exit(0)
 
 
 def watch_idle(last_activity, idle_timeout):
@@ -637,13 +663,22 @@ def make_handler(models, default_name, last_activity, lock):
             # Neither of these counts as activity: polling must not keep a GPU
             # model resident forever.
             if self.path == "/health":
-                self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+                # JSON rather than a bare "ok": a client reads this to tell a current
+                # server from an older copy that would ignore what it cannot parse.
+                self._json(200, {"ok": True, "shutdown": True})
             elif self.path == "/models":
                 self._json(200, {"models": sorted(models), "default": default_name})
             else:
                 self.send_response(404); self.end_headers()
 
         def do_POST(self):
+            if self.path == "/shutdown":
+                # See kokoro's server: a refreshed script only takes over once the
+                # process running the old one lets go of the port.
+                self.send_response(200); self.send_header("Content-Length", "0")
+                self.end_headers(); self.wfile.flush()
+                threading.Thread(target=_exit_soon, daemon=True).start()
+                return
             if self.path != "/convert":
                 self.send_response(404); self.end_headers(); return
             length = int(self.headers.get("Content-Length", 0))
@@ -682,6 +717,13 @@ def make_handler(models, default_name, last_activity, lock):
             self.end_headers()
             self.wfile.write(data)
     return Handler
+
+def _exit_soon():
+    """Let the 200 reach the client first, then go -- torch will not unwind politely."""
+    time.sleep(0.2)
+    print("shutdown requested, exiting", file=sys.stderr)
+    os._exit(0)
+
 
 def watch_idle(last_activity, idle_timeout):
     if idle_timeout <= 0:
