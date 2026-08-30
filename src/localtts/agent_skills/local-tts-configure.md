@@ -46,7 +46,7 @@ anything** — it usually names the exact problem.
 | --- | --- | --- | --- |
 | `llamacpp` | yes | **English, Chinese, Japanese, Korean only** | `llama-tts` binary |
 | `piper` | yes | ~40 languages, fast | `piper` binary + a `.onnx` voice |
-| `kokoro` (default) | yes | ~40 languages, small model | a `kokoro-tts` wrapper (set up below) |
+| `kokoro` (default) | yes | 8 languages, small model | a `kokoro-tts` wrapper (set up below) |
 | `openai` | no | whatever the endpoint offers | a URL, and a key only for api.openai.com |
 | `rvc` | yes | inherits its base provider's | **not installed automatically** — see below |
 | `command` | yes | whatever the tool offers | any binary that writes a WAV |

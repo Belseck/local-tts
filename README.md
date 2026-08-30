@@ -16,7 +16,7 @@
 Make your coding agent talk to you!
 
 A tiny command-line text-to-speech tool. It shells out to **Kokoro-82M** by default —
-~40 languages from one small model — so speech is generated locally and offline.
+eight languages from one small model — so speech is generated locally and offline.
 
 ```console
 $ tts "Hello from my terminal."
@@ -107,12 +107,12 @@ See [Providers → `rvc`](#rvc--voice-conversion-not-installed-automatically) fo
 
 `local-tts` does not bundle, build or ship any speech model. It drives a backend you
 install separately, and **the default provider is `kokoro`** — small, fully offline, and
-good for ~40 languages. Its setup lives with the provider itself:
+good for eight languages. Its setup lives with the provider itself:
 
 | Backend | Install | Good for |
 | --- | --- | --- |
-| **`kokoro`** *(default)* | [kokoro section](#kokoro--the-default-small-fast-offline-many-languages) | ~40 languages, small and fast — start here |
-| `piper` | [piper section](#piper--small-fast-offline-many-languages) | ~40 languages, ~7× realtime on CPU |
+| **`kokoro`** *(default)* | [kokoro section](#kokoro--the-default-small-fast-offline-eight-languages) | 8 languages, small and fast — start here |
+| `piper` | [piper section](#piper--small-fast-offline-many-languages) | ~40 languages, ~7× realtime on CPU — the one for a language kokoro does not speak |
 | `llamacpp` | [llamacpp section](#llamacpp--local-offline-four-languages) | English, Chinese, Japanese, Korean only |
 | `openai` | [openai section](#openai--any-openai-compatible-endpoint) | any OpenAI-compatible endpoint, not offline |
 | `rvc` | [rvc section](#rvc--voice-conversion-not-installed-automatically) | converting another backend's output to a trained voice |
@@ -130,7 +130,7 @@ does the whole thing, asking before each step.
 
 Model weights are the backend's business, not this tool's: `kokoro` needs
 `kokoro-v1.0.onnx` plus `voices-v1.0.bin` (fetched once — see the
-[kokoro section](#kokoro--the-default-small-fast-offline-many-languages)), piper needs a
+[kokoro section](#kokoro--the-default-small-fast-offline-eight-languages)), piper needs a
 `.onnx` voice per language (~60 MB each), and `llamacpp` downloads its default OuteTTS
 weights on first use. Every one of them works fully offline afterwards.
 
@@ -218,12 +218,20 @@ default     : kokoro
 [ok] llamacpp  /usr/local/bin/llama-tts -> default OuteTTS (downloaded on first run)
 [--] openai    https://api.openai.com/v1 (no api_key and $OPENAI_API_KEY is unset)
 [--] piper     piper: 'piper' not found on PATH. ...
+[ok] kokoro    /home/you/.local/bin/kokoro-tts
+[--] rvc       rvc needs the python interpreter from the venv rvc-python is installed in: ...
 [ok] command   espeak-ng -w {output} {text}
 
-players     : ffplay, paplay
+players     : ffplay, paplay  -> using ffplay
+tone shaping: ffmpeg atempo (best quality)
+phonetics   : no /IPA/ entries in `pronunciations` (plain respellings work everywhere)
+streaming   : on -- each fragment plays as it is synthesized
 ```
 
-Only the line matching your default provider has to say `[ok]`.
+Only the line matching your default provider has to say `[ok]`. The last three lines
+report what shapes the audio: `tone shaping` says whether ffmpeg is doing the retiming or
+the slower built-in fallback is, and `phonetics` says which backends can accept the
+`/IPA/` entries in your dictionary — see [Pronunciation dictionary](#pronunciation-dictionary).
 
 ---
 
@@ -628,7 +636,7 @@ about **640 MB**). Later runs use the cache and work offline.
 
 Output is 24 kHz mono WAV. The default OuteTTS weights speak **English, Chinese,
 Japanese and Korean**; other languages come out with English phonetics, so use the
-default [`kokoro`](#kokoro--the-default-small-fast-offline-many-languages) or
+default [`kokoro`](#kokoro--the-default-small-fast-offline-eight-languages) or
 [`piper`](#piper--small-fast-offline-many-languages) for those. Quality also
 drops on long prompts, which is why `max_words` splits them — raise or lower it to trade
 continuity against reliability.
@@ -692,9 +700,10 @@ extension picks the format (`wav`, `mp3`, `opus`, `aac`, `flac`, `pcm`).
 ### `piper` — small, fast, offline, many languages
 
 [Piper](https://github.com/OHF-Voice/piper1-gpl) runs neural ONNX voices on the CPU at
-roughly 7x realtime, with good models for ~40 languages. Reach for it when the default
-`kokoro` does not have a voice you like for your language, or when you want one flat
-`.onnx` file per voice instead of kokoro's wrapper script.
+roughly 7x realtime, with good models for ~40 languages. Reach for it when your language
+is not one of kokoro's eight — German, Dutch, Polish, Russian, Turkish and the rest live
+here, not there — when you want a different voice for a language kokoro does cover, or
+when you want one flat `.onnx` file per voice instead of kokoro's wrapper script.
 
 Piper is distributed as a Python wheel (`piper-tts`, GPL-3.0). Install it in its **own**
 virtualenv so its ~200 MB of dependencies (onnxruntime, numpy) stay out of this project,
@@ -734,10 +743,13 @@ tts -p piper -f article.md -o article.wav
 | `auto_tone` | `false` | Derive tone from `?`/`!`/`.` where no `<tag>` is active — see [Tone and emotion tags](#tone-and-emotion-tags). |
 | `extra_args` | `[]` | Extra flags appended verbatim. |
 
-### `kokoro` — the default: small, fast, offline, many languages
+### `kokoro` — the default: small, fast, offline, eight languages
 
-**This is the provider you get with no configuration at all.** Kokoro-82M covers ~40
-languages in a footprint comparable to piper's. There is no single official CLI, so the
+**This is the provider you get with no configuration at all.** Kokoro-82M covers eight
+languages in a footprint comparable to piper's: English (US and UK), Spanish, French,
+Italian, Portuguese (Brazil), Hindi, Japanese and Mandarin — the set is fixed by the
+model's own voice prefixes (`VOICE_LANGS` in `src/localtts/providers/kokoro.py`). For
+anything outside it, use [piper](#piper--small-fast-offline-many-languages). There is no single official CLI, so the
 straightforward path is a minimal wrapper around the `kokoro`/`kokoro-onnx` Python
 package, in its own venv:
 
@@ -882,6 +894,9 @@ tts -p rvc "Test of the converted voice."
 | `extra_args` | `[]` | Extra flags appended verbatim. |
 | `server_url` | *(empty)* | **Recommended.** See [Recommended: a persistent server](#recommended-a-persistent-server-kokoro--rvc) below. |
 | `server_start`, `server_timeout` | *(empty)*, `60` | Command to auto-start the server, and how long to wait for it (a torch load is slower than kokoro's). |
+| `server_model` | *(empty)* | Which resident model a request asks for when no language-specific one applies. Empty means "whatever the server loaded first". |
+| `language_models` | `{}` | Model name per language, e.g. `{"en": "jarvis", "es": "cortana-es"}`. An exact tag beats its base language (`es-MX` before `es`). |
+| `server_models` | `{}` | The models the server has resident, as `name: path`. Reporting only — `tts check` lists them; the server's own `--model` flags are what load them. |
 
 There is no `rvc.voice` — the voice comes entirely from which `.pth` model is configured.
 
@@ -924,9 +939,11 @@ itself. **It exits on its own after 5 minutes idle** to release the model (a rea
 rvc's torch model in particular) — configurable via `--idle-timeout SECONDS` in
 `server_start` (`0` disables it); the next call after it exits just starts a fresh one.
 
-For `rvc`, the model is fixed at server startup (`--model`/`--index` in `server_start`),
-not per request — that's inherent to keeping one loaded; switching voices means changing
-those and restarting the server.
+For `rvc`, one server can hold **several** models at once: start it with a repeatable
+`--model NAME=PATH` per voice, and each request names the one it wants —
+`rvc.language_models` picks it per language, with `rvc.server_model` as the flat default.
+A server started with a single `--model` and no names still works; it just answers every
+request with the one voice it loaded.
 
 ### Tone and emotion tags
 

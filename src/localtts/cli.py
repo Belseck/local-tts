@@ -51,7 +51,7 @@ def _resolve_session(explicit, stdin_json=None):
 def _speak_parser():
     parser = argparse.ArgumentParser(
         prog=PROG,
-        description="Speak text with a local TTS model (llama.cpp by default).",
+        description="Speak text with a local TTS model (kokoro by default).",
         epilog=(
             "subcommands:\n"
             "  %(prog)s providers            list available backends\n"
@@ -81,7 +81,7 @@ def _speak_parser():
     parser.add_argument("-p", "--provider", choices=providers.names(), help="backend to use")
     parser.add_argument("-l", "--lang", metavar="CODE",
                         help="use the backend and voice remembered for this language (see `tts languages`)")
-    parser.add_argument("-v", "--voice", help="voice: speaker file (llamacpp), .onnx (piper) or name (openai)")
+    parser.add_argument("-v", "--voice", help="voice: name (kokoro, openai), .onnx file (piper) or speaker file (llamacpp)")
     parser.add_argument("-m", "--model", help="override the provider's model for this run")
     parser.add_argument("-s", "--set", dest="overrides", action="append", default=[],
                         metavar="KEY=VALUE", help="override a provider setting for this run (repeatable)")

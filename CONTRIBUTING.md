@@ -64,7 +64,7 @@ the subprocess and HTTP layers. You *do* need one to check that audio actually c
 python -m unittest discover -s tests -v
 ```
 
-277 tests, no test dependencies, no network, no audio device. They must all pass before
+276 tests, no test dependencies, no network, no audio device. They must all pass before
 you open a pull request, and they should stay fast — if a test needs a real model, a real
 player or a real API, it does not belong in this suite; fake the boundary instead. The
 existing tests show the patterns: a stub binary on `PATH`, a local HTTP server, a

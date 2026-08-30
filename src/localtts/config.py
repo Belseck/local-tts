@@ -12,9 +12,9 @@ APP_NAME = "local-tts"
 ENV_PREFIX = "LOCALTTS_"
 
 DEFAULTS = {
-    # Provider used when --provider is not given. Kokoro speaks ~40 languages from a
-    # single 82M model, where llama.cpp's OuteTTS covers only English, Chinese, Japanese
-    # and Korean -- so the old default silently mispronounced most of the world with
+    # Provider used when --provider is not given. Kokoro speaks eight languages from a
+    # single 82M model (VOICE_LANGS in providers/kokoro.py is the list), where llama.cpp's
+    # OuteTTS covers only English, Chinese, Japanese and Korean -- so the old default silently mispronounced most of the world with
     # English phonetics. llamacpp is still a provider, just not the one you get by
     # accident.
     "provider": "kokoro",
