@@ -28,18 +28,6 @@ DELIVERY_DEFAULTS = {
     "pause_tone_ms": 130,       # when the tone changes -- the breath
     "emphasis_lengthen": 0,     # IPA length marks on the stressed vowel (kokoro only)
     "trim_ms": 10,              # silence left at each fragment edge before the pause
-    # Which resident rvc model converts a *borrowed* language, e.g. {"en": "cortana-en"}
-    # under "es". Without one, a borrowed span converts with the host language's model --
-    # the same character, but a model trained on one language rendering another's
-    # phonemes, which is where an English word inside Spanish can lose its edges.
-    "foreign_models": {},
-    "language_tags": True,      # honor <en>...</en> inside this language's text
-    # Which base voice speaks a *borrowed* language while this language is the host, e.g.
-    # {"en": "bm_lewis"} under "es". Separate from the global per-language voice because
-    # the best voice for a quoted English phrase inside Spanish is not always the one you
-    # would pick to narrate a whole English paragraph -- a closer timbre matters more
-    # when it sits mid-sentence.
-    "foreign_voices": {},
 }
 
 
@@ -95,28 +83,14 @@ class RvcProvider(Provider):
     def _base_name(self):
         return self.settings.get("base_provider") or (self.cfg or {}).get("provider") or "piper"
 
-    def language_tags_enabled(self):
-        """rvc scopes this per language, through delivery, rather than one flag for the
-        whole provider: whether a borrowed word should switch voice depends on which
-        language is doing the borrowing."""
-        return bool(self.delivery()["language_tags"])
-
-    def _base_for(self, lang):
-        """The base provider as it would be built for `lang` -- the call's own language
-        unchanged, or a borrowed one, optionally with this host language's own choice of
-        voice for it (delivery.foreign_voices)."""
-        if not lang or lang == self.lang:
-            return self.base_provider_instance()
-        base = self.base_provider_instance(lang=lang)
-        voice = (self.delivery()["foreign_voices"] or {}).get(lang)
-        if not voice:
-            return base
-        # Override the per-language map rather than the flat `voice`, so whatever the
-        # base derives from its voice (kokoro takes the phonemizer language from it)
-        # still lines up with the voice actually being used.
-        existing = dict(getattr(base, "settings", {}).get("language_voices") or {})
-        existing[lang] = voice
-        return base.with_settings({"language_voices": existing})
+    @property
+    def supports_phonetics(self):
+        """Inherited from whatever speaks underneath: rvc converts a voice, it does not
+        read text, so the dictionary's IPA is the base provider's business."""
+        try:
+            return bool(getattr(self.base_provider_instance(), "supports_phonetics", False))
+        except Exception:
+            return False
 
     def base_provider_instance(self, lang=None):
         base_name = self._base_name()
@@ -166,19 +140,11 @@ class RvcProvider(Provider):
         base = self.base_provider_instance()
         auto_tone = bool(base.settings.get("auto_tone")) if hasattr(base, "settings") else False
 
-        # Language first, tone within it: a borrowed word keeps its own phonetics, and
-        # the tone markup around it survives the cut (see split_language_spans).
-        if self.language_tags_enabled():
-            language_spans = textutil.split_language_spans(
-                text, self.lang, self.known_languages())
-        else:
-            language_spans = [(text, self.lang)]
-
-        segments = []
-        for span_text, span_lang in language_spans:
-            span_base = base if span_lang == self.lang else self._base_for(span_lang)
-            for chunk, profile in textutil.resolve_tone_segments(span_text, auto_tone=auto_tone):
-                segments.append((chunk, profile, span_base))
+        # A borrowed word keeps its own sound through the pronunciation dictionary's
+        # IPA entries, which the base provider applies while it speaks -- so there is
+        # nothing to cut here for language, and tone is the only thing that segments.
+        segments = [(chunk, profile, base) for chunk, profile
+                    in textutil.resolve_tone_segments(text, auto_tone=auto_tone)]
 
         if len(segments) == 1 and segments[0][1] is None:
             self._synthesize_one(segments[0][2], segments[0][0], out_path, voice, profile=None)
@@ -192,14 +158,8 @@ class RvcProvider(Provider):
         work = tempfile.mkdtemp(prefix="local-tts-rvc-tone-")
         parts = [os.path.join(work, "%04d.wav" % index) for index in range(len(segments))]
         try:
-            foreign_models = delivery["foreign_models"] or {}
             for index, ((chunk, profile, span_base), part) in enumerate(zip(segments, parts)):
-                # A borrowed span may convert with its own model; without one it keeps
-                # the host language's, which is still the same character.
-                # getattr: the base is duck-typed here, as elsewhere in this file.
-                span_lang = getattr(span_base, "lang", self.lang)
-                model = foreign_models.get(span_lang) if span_lang != self.lang else None
-                self._synthesize_one(span_base, chunk, part, voice, profile, model=model)
+                self._synthesize_one(span_base, chunk, part, voice, profile)
                 # Before padding: otherwise the real gap is this fragment's own dead air
                 # plus the configured pause, and the setting controls neither.
                 audiofx.trim_silence(part, delivery["trim_ms"] / 1000.0)
@@ -236,7 +196,7 @@ class RvcProvider(Provider):
             merged.update({k: v for k, v in chosen.items() if k in DELIVERY_DEFAULTS})
         return merged
 
-    def _synthesize_one(self, base, chunk, out_path, voice, profile, model=None):
+    def _synthesize_one(self, base, chunk, out_path, voice, profile):
         """Base synthesis -> conversion -> whatever tone is still unrealized.
 
         Speed is pushed down to the base provider whenever it has a real rate control
@@ -277,7 +237,7 @@ class RvcProvider(Provider):
             textutil.synthesize_chunked(base, chunk, base_wav, voice=voice)
             server_url = self.settings.get("server_url")
             if server_url:
-                self._convert_via_server(server_url, base_wav, out_path, model=model)
+                self._convert_via_server(server_url, base_wav, out_path)
             else:
                 self.run(self.build_command(base_wav, out_path))
         finally:

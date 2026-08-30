@@ -30,12 +30,19 @@ DEFAULTS = {
     # Inserted just before the file argument. Audio stacks differ per box (WSL's pulse
     # bridge, a resampling ALSA default, a device that wants a bigger buffer), and the
     # fix is nearly always a flag rather than a code change -- so it is configuration.
-    # Say these words this way. Keys are matched whole-word and case-insensitively;
-    # the value is a respelling used exactly as written, e.g.
-    #   {"jarvis": "JAR-viss", "es:jarvis": "yarvis", "kubectl": "cube cuddle"}
+    # Say these words this way. Keys are matched whole-word and case-insensitively, and
+    # a value takes one of two forms:
+    #   {"jarvis": "JAR-viss"}            a respelling, used exactly as written and
+    #                                     rewritten into the text, so it works on every
+    #                                     backend
+    #   {"pull request": "/pˈʊl ɹᵻkwˈɛst/"}  IPA between slashes, handed to the model as
+    #                                     phonemes so a borrowed word keeps its own sound
+    #                                     without the sentence being cut into pieces
+    # IPA needs a backend with a phonemizer of its own -- `tts check` prints which, and
+    # an entry a backend cannot use is ignored rather than mangled.
     # A bare key applies to every language; `<lang>:<word>` applies to that one only, so
-    # a word said differently in two languages needs no nested structure. Applied before
-    # synthesis, on every backend; <tag> markup is left untouched.
+    # a word said differently in two languages needs no nested structure. <tag> markup is
+    # left untouched either way.
     "pronunciations": {},
     "player_args": {},
     # Environment applied to the player process only, e.g.
@@ -120,11 +127,6 @@ DEFAULTS = {
             # A piper voice *is* a language, so speaking two means having two files. An
             # exact tag beats its base language.
             "language_models": {},
-            # Honor <en>...</en> spans inside another language's text, so a borrowed word
-            # keeps its own phonetics. On by default, and inert until a second language
-            # is configured: only languages with a voice of their own count as tags, so
-            # with one voice installed there is nothing to switch to and nothing changes.
-            "language_tags": True,
             "speaker": None,       # speaker id for multi-speaker voices
             # Real piper flags (verified via `piper --help`) -- inverse-of-rate and
             # loudness. None => piper's own default (1.0 either way), flag omitted. A
@@ -150,9 +152,6 @@ DEFAULTS = {
             # language is then taken from the chosen voice rather than from `lang`, which
             # would otherwise stay stale and read one language with another's phonetics.
             "language_voices": {},
-            # Honor <en>...</en> spans inside another language's text (see
-            # piper.language_tags). On by default, inert with a single language.
-            "language_tags": True,
             "speed": 1.0,
             # Emphasis as a phonetician writes it: N IPA length marks on the vowel
             # carrying primary stress (kˈasa -> kˈaːsa). Kokoro has the length mark in
@@ -217,18 +216,12 @@ DEFAULTS = {
             #                  takes when the delivery shifts
             # Spanish runs faster with shorter gaps than English, which is why this is
             # per-language rather than one number.
-            #   language_tags  honor <en>...</en> inside this language's text, so a
-            #                  borrowed word keeps its own phonetics
             #   trim_ms        silence left at each fragment edge before the pause is
             #                  applied, so pause_ms actually controls the rhythm rather
             #                  than being added on top of each fragment's own dead air
-            #   foreign_voices which base voice speaks a borrowed language while this one
-            #                  is the host, e.g. {"en": "bm_lewis"} under "es"
             "delivery": {
-                "es": {"speed": 1.0, "pause_ms": 45, "pause_tone_ms": 130,
-                       "language_tags": True},
-                "en": {"speed": 1.0, "pause_ms": 60, "pause_tone_ms": 160,
-                       "language_tags": True},
+                "es": {"speed": 1.0, "pause_ms": 45, "pause_tone_ms": 130},
+                "en": {"speed": 1.0, "pause_ms": 60, "pause_tone_ms": 160},
             },
             "server_models": {},       # {"jarvis": {"model": "...pth", "index": "...index"}}
             # Which of those names to ask for. `language_models` wins when the call has

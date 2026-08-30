@@ -374,6 +374,31 @@ default provider, which may have the wrong phonetics for that language.
 
 Tell the human that skills only take effect after restarting their agent.
 
+## Step 6c — Phonetics for borrowed words — **ASK**
+
+Technical Spanish is full of English words, and vice versa. Read with the host
+language's phonetics they sound wrong -- "pull request" as *pull rekest*. The
+pronunciation dictionary fixes that: a value between slashes is IPA rather than a
+respelling.
+
+```bash
+tts config --set 'pronunciations.pull request=/pˈʊl ɹᵻkwˈɛst/'
+tts config --set pronunciations.kubectl="kube control"       # a plain respelling
+tts check                                                     # the `phonetics:` line
+```
+
+Both kinds live in one table. A respelling is rewritten into the text and works on every
+backend; IPA is handed to the model as phonemes and needs a backend with a phonemizer --
+`kokoro` with `server_url` set, or `rvc` over a kokoro base. `tts check` prints which,
+and an entry a backend ignores is not an error: the word is still said, just its own way.
+
+**Say this rather than letting them find out:** if they are on piper or llamacpp, IPA
+entries will do nothing until they set up the kokoro server (Step 6 in
+`local-tts-configure`). Respellings still work.
+
+Get the transcription from Wiktionary, or from `espeak-ng --ipa -q -v en "<word>"`. Use
+the language the word comes *from* -- that is the whole point.
+
 ## Step 7 — Validate
 
 Run all of these and show the real output:

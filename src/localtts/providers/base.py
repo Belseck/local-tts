@@ -25,6 +25,14 @@ class Provider:
     #: synthesize_chunked() strips the tags before a provider that can't use them ever
     #: sees the literal brackets, rather than have it try to pronounce them.
     supports_tone_tags = False
+
+    #: Whether this backend can be handed IPA for individual words, which is what makes
+    #: the pronunciation dictionary's `/…/` entries reach the model. Only a backend with
+    #: a phonemizer in the loop can: local-tts has no runtime dependencies and cannot
+    #: transcribe anything itself, so it passes the table along rather than applying it.
+    #: A backend that says False here simply says the word its own way, and `tts check`
+    #: reports that rather than leaving the user guessing why an entry did nothing.
+    supports_phonetics = False
     #: Which dimensions of a tone profile this backend applies *itself*. Anything left
     #: False is realized after synthesis instead (audiofx.apply_profile), so an emotion
     #: still sounds different on a backend with no such flag. A provider that varies
@@ -91,40 +99,6 @@ class Provider:
         sink = self.on_part
         if sink:
             sink(path)
-
-    def known_languages(self):
-        """Language codes a `<xx>` tag may name: the ones the user has actually recorded
-        or given a voice to. Restricting it to these is what keeps a tone tag nobody
-        anticipated from silently becoming a language switch."""
-        cfg = self.cfg or {}
-        codes = set(cfg.get("languages") or {})
-        for provider in (cfg.get("providers") or {}).values():
-            if isinstance(provider, dict):
-                for key in ("language_voices", "language_models"):
-                    codes.update(provider.get(key) or {})
-        return codes
-
-    def language_tags_enabled(self):
-        """Whether `<en>...</en>` inside this call's text should switch language.
-
-        On by default, and inert until a second language is configured: only languages
-        that have a voice of their own count as tags (see known_languages), so on a
-        single-language setup there is nothing to switch to and nothing changes.
-        """
-        return bool(self.settings.get("language_tags", True))
-
-    def for_language_instance(self, lang):
-        """A copy of this provider bound to `lang`, so its own per-language resolution
-        (kokoro's voice, piper's model) applies to a borrowed span.
-
-        A copy rather than a mutation because the original is still mid-utterance, and
-        the copy must not publish stream fragments -- whoever owns the outer loop owns
-        the ordering, and so owns the sink.
-        """
-        clone = type(self)(dict(self.settings), verbose=self.verbose, cfg=self.cfg,
-                           lang=lang)
-        clone.on_part = None
-        return clone
 
     def for_language(self, mapping, default=""):
         """This call's entry from a {language tag: value} map, or `default`.
@@ -225,6 +199,34 @@ class Provider:
                 return 200 <= response.status < 300
         except (urllib.error.URLError, OSError, ValueError):
             return False
+
+    def server_capabilities(self, url, health_path="/health"):
+        """What a persistent server says it can do, from its own health endpoint.
+
+        Three outcomes, and the difference matters: `None` means nothing answered,
+        `{}` means something answered but did not say (an older server whose health
+        check predates this, and which would drop a capability it never learned to
+        read), and a dict is what it claims.
+
+        Asking is the only way to tell. A configured `server_url` says a URL was
+        written down, not that a process is listening, and a running process does not
+        say whether it is the script this version of the skill installs -- a copy from
+        an earlier version answers /health perfectly well and silently ignores what it
+        does not understand, which is exactly the failure this reporting exists to
+        make loud.
+        """
+        try:
+            with urllib.request.urlopen(url.rstrip("/") + health_path, timeout=2) as response:
+                if not 200 <= response.status < 300:
+                    return None
+                body = response.read(4096)
+        except (urllib.error.URLError, OSError, ValueError):
+            return None
+        try:
+            claimed = json.loads(body)
+        except (ValueError, TypeError):
+            return {}                       # answering, but with a plain-text "ok"
+        return claimed if isinstance(claimed, dict) else {}
 
     def ensure_server(self, url, start_command, timeout, health_path="/health"):
         """If `url` isn't already answering `health_path`, launch `start_command` in the

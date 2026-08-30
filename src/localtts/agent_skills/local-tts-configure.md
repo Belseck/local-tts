@@ -1,6 +1,6 @@
 ---
 name: local-tts-configure
-description: Install, diagnose, and configure the local `tts` CLI (local-tts) — backends (kokoro by default, piper, RVC, llama.cpp, OpenAI-compatible), a voice per language, mixed-language text (`<en>…</en>` spans reading a borrowed word with its own phonetics, and which voice or RVC model handles it), pronunciation dictionaries, persistent model servers, streamed playback, player selection and per-machine player tuning, and the per-language provider memory. TRIGGER whenever the user asks to install, add, set up, enable or switch to ANY speech backend, provider, TTS engine or voice model — named ("install piper", "add kokoro", "set up rvc", "use OpenAI for speech") or not ("install a TTS backend", "add another voice engine", "I want a better/second/offline TTS", "instala un backend de voz") — that request means follow this skill's install steps, not improvise your own, and it applies to a backend this skill does not list too: the answer there is `command` or a new provider, never an ad-hoc install. kokoro and rvc are meant to run as a persistent server, and setting that up is part of installing them. Also use when text-to-speech is missing or broken, when the user wants a different or better voice, when they need a new language, when speech is slow and could use a persistent server, or when they ask to change any speech setting — including adding a second language for pronunciation, mapping a voice to a language, or asking what a setting does. Contains a complete reference of every setting local-tts has. For speech that already works but *sounds* wrong (robotic, noisy, too fast, choppy), use local-tts-tune instead.
+description: Install, diagnose, and configure the local `tts` CLI (local-tts) — backends (kokoro by default, piper, RVC, llama.cpp, OpenAI-compatible), a voice per language, mixed-language text (a borrowed word keeps its own sound through the pronunciation dictionary's `/IPA/` entries, said by the same voice inside the same sentence), pronunciation dictionaries, persistent model servers, streamed playback, player selection and per-machine player tuning, and the per-language provider memory. TRIGGER whenever the user asks to install, add, set up, enable or switch to ANY speech backend, provider, TTS engine or voice model — named ("install piper", "add kokoro", "set up rvc", "use OpenAI for speech") or not ("install a TTS backend", "add another voice engine", "I want a better/second/offline TTS", "instala un backend de voz") — that request means follow this skill's install steps, not improvise your own, and it applies to a backend this skill does not list too: the answer there is `command` or a new provider, never an ad-hoc install. kokoro and rvc are meant to run as a persistent server, and setting that up is part of installing them. Also use when text-to-speech is missing or broken, when the user wants a different or better voice, when they need a new language, when speech is slow and could use a persistent server, or when they ask to change any speech setting — including adding a second language for pronunciation, mapping a voice to a language, or asking what a setting does. Contains a complete reference of every setting local-tts has. For speech that already works but *sounds* wrong (robotic, noisy, too fast, choppy), use local-tts-tune instead.
 ---
 
 # Configuring `local-tts`
@@ -255,16 +255,27 @@ _BACKENDS = {}
 
 
 def phonemes(text, lang):
-    """IPA for `text`, with stress marks. The backend is built once per language: it
-    loads espeak's data, which is not something to redo per request."""
+    """IPA for `text`, with stress marks.
+
+    Uses kokoro-onnx's own Tokenizer rather than reaching around it to phonemizer.
+    Three reasons, in order of how much they bite:
+
+    - It is what the model itself uses, so a transcription made here tokenizes to
+      exactly what `create(text)` would have produced -- verified: same tokens, and the
+      audio differs only by the runtime's own float noise.
+    - It is not an extra dependency. kokoro-onnx already requires phonemizer and
+      espeakng-loader; importing them directly only looked free because they were
+      already installed for it.
+    - Raw EspeakBackend with preserve_punctuation keeps characters the model has no
+      token for -- Spanish "¿" among them -- which are then silently dropped.
+
+    Built once per language: it loads espeak's data, which is not something to redo per
+    request.
+    """
     if lang not in _BACKENDS:
-        import espeakng_loader
-        from phonemizer.backend import EspeakBackend
-        from phonemizer.backend.espeak.wrapper import EspeakWrapper
-        EspeakWrapper.set_library(espeakng_loader.get_library_path())
-        EspeakWrapper.set_data_path(espeakng_loader.get_data_path())
-        _BACKENDS[lang] = EspeakBackend(lang, preserve_punctuation=True, with_stress=True)
-    return _BACKENDS[lang].phonemize([text])[0].strip()
+        from kokoro_onnx.tokenizer import Tokenizer
+        _BACKENDS[lang] = Tokenizer()
+    return _BACKENDS[lang].phonemize(text.strip(), lang=lang).strip()
 
 
 def lengthen_stressed(ipa, marks):
@@ -291,6 +302,122 @@ def lengthen_stressed(ipa, marks):
     return "".join(out)
 
 
+#: Entries already reported, so a warning is printed once and not per call.
+_WARNED = set()
+
+
+def _warn_unsayable(table, lang):
+    """Say out loud when an entry asks for phonemes this model has no token for.
+
+    They are dropped silently otherwise, which is the worst failure to debug: the word
+    still comes out, just mangled, and nothing anywhere says why. Usually a typo -- an
+    ASCII "r" where IPA wants "ɹ", or a stress mark copied as an apostrophe.
+    """
+    try:
+        vocab = set(_BACKENDS.setdefault(lang, None).vocab) if _BACKENDS.get(lang) else None
+        if vocab is None:
+            phonemes("a", lang)                 # builds the tokenizer for this language
+            vocab = set(_BACKENDS[lang].vocab)
+    except Exception:
+        return
+    for word, ipa in table.items():
+        missing = sorted({c for c in ipa if c not in vocab and not c.isspace()})
+        if missing and (word, lang) not in _WARNED:
+            _WARNED.add((word, lang))
+            print("phonetics: %r asks for %s, which this model has no token for -- "
+                  "dropped" % (word, ", ".join(repr(c) for c in missing)),
+                  file=sys.stderr, flush=True)
+
+
+def substitute_phonetics(text, lang, table):
+    """Transcribe the whole line, then swap in the dictionary's IPA for the words it
+    names.
+
+    This is how a borrowed word keeps its own sound without the sentence being cut into
+    pieces. A word synthesized on its own gets its own end-of-sentence fall, and dropped
+    mid-sentence that reads as an interruption.
+
+    The line is transcribed WHOLE, exactly as Kokoro._prepare does, and only then are
+    phonemes swapped. Transcribing the fragments around each word instead looks
+    equivalent and is not: espeak assigns stress per utterance, so every fragment gets
+    its own citation-form stress and each boundary invents a stressed word.
+
+        whole line   ʝˈa suβˈi  el  pˈuʎ rekˈest al rˌepositˈoɾjo.
+        fragments    ʝˈa suβˈi ˈel  pˈʊl ɹᵻkwˈɛst al rˌepositˈoɾjo.
+                               ^^^ the article should not carry stress
+
+    Where a word lands in the transcription is found by transcribing the line a second
+    time with that word replaced by a nonsense placeholder: everything before and after
+    it comes out identical, so the region that differs is the word. Spans are measured
+    against the same baseline, so several words do not disturb each other, and they are
+    applied right to left so earlier offsets stay valid.
+
+    Any language works -- IPA is not tied to one -- but the model can only say the
+    phonemes its own vocabulary contains, so a sound it was never trained on comes out
+    as the nearest thing it has.
+    """
+    import re as _re
+    if not table:
+        return text, False
+    _warn_unsayable(table, lang)
+
+    #: Nonsense, unlikely to appear, and pronounceable in every language espeak knows,
+    #: so its presence does not disturb the stress of what surrounds it.
+    marker = "Kalakala"
+
+    baseline = phonemes(text, lang)
+    spans = []
+    for word in sorted(table, key=len, reverse=True):
+        # A hyphen counts as part of the word: "pre-build" is not "build", and matching
+        # inside it used to snap the span out to the surrounding spaces and swallow the
+        # prefix -- the audio lost "pre" entirely.
+        pattern = _re.compile(r"(?<![\w-])%s(?![\w-])" % _re.escape(word), _re.IGNORECASE)
+        found = list(pattern.finditer(text))
+        for occurrence, hit in enumerate(found):
+            # One placeholder run per occurrence: replacing them all at once would leave
+            # a single differing region covering everything between the first and last,
+            # and replacing only the first left every later one in the host language.
+            marked_text = text[:hit.start()] + marker + text[hit.end():]
+            marked = phonemes(marked_text, lang)
+            head = 0
+            while head < min(len(baseline), len(marked)) and baseline[head] == marked[head]:
+                head += 1
+            tail = 0
+            while (tail < min(len(baseline), len(marked)) - head
+                   and baseline[-1 - tail] == marked[-1 - tail]):
+                tail += 1
+            start, end = head, len(baseline) - tail
+            # Snap outwards to whitespace. The scan stops at the first character that
+            # differs, so a placeholder sharing a leading letter with the word
+            # ("Kalakala" against "klustˈeɾ") leaves it behind and the swap produces
+            # "kklˈʌstɚ". Phonemes are space separated, so the gaps are the real edges.
+            while start > 0 and not baseline[start - 1].isspace():
+                start -= 1
+            while end < len(baseline) and not baseline[end].isspace():
+                end += 1
+            # A span that is empty, or that swallowed most of the line, means the
+            # second transcription diverged for another reason. Skipping is the safe
+            # answer: the word is still said, just this language's way.
+            if start >= end or (end - start) > len(baseline) * 0.6:
+                continue
+            # Punctuation rides along with the word it follows ("backend?" has no
+            # space before the mark) and the snap would swallow it. Losing it costs the
+            # sentence its intonation, so it is put back after the transcription.
+            carried = ""
+            while (carried != baseline[start:end]
+                   and baseline[end - 1 - len(carried)] in ".,;:!?…"):
+                carried = baseline[end - 1 - len(carried)] + carried
+            spans.append((start, end, table[word] + carried))
+
+    if not spans:
+        return text, False
+
+    out = baseline
+    for start, end, ipa in sorted(spans, reverse=True):
+        out = out[:start] + ipa + out[end:]
+    return out, True
+
+
 def make_handler(kokoro, last_activity):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -300,9 +427,16 @@ def make_handler(kokoro, last_activity):
             # A health check is not "activity" -- it must not keep the process alive
             # forever just because something is polling it.
             if self.path == "/health":
+                # JSON, not "ok": local-tts asks this endpoint what the server can do,
+                # so that `tts check` can tell a server that understands the
+                # pronunciation dictionary's IPA entries from an older copy that
+                # would accept them and drop them without a word.
+                body = json.dumps({"ok": True, "phonetics": True}).encode("utf-8")
                 self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(b"ok")
+                self.wfile.write(body)
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -330,13 +464,17 @@ def make_handler(kokoro, last_activity):
             lang = body.get("lang") or "en-us"
             spoken, is_phonemes = text, False
             marks = int(body.get("emphasis_lengthen") or 0)
-            if marks > 0:
-                try:
-                    spoken, is_phonemes = lengthen_stressed(phonemes(text, lang), marks), True
-                except Exception as exc:      # never lose the audio over a nicety
-                    print("emphasis skipped (%s: %s)" % (type(exc).__name__, exc),
-                          file=sys.stderr, flush=True)
-                    spoken, is_phonemes = text, False
+            table = {k.lower(): v for k, v in (body.get("phonetics") or {}).items()}
+            try:
+                if table:
+                    spoken, is_phonemes = substitute_phonetics(text, lang, table)
+                if marks > 0:
+                    source = spoken if is_phonemes else phonemes(text, lang)
+                    spoken, is_phonemes = lengthen_stressed(source, marks), True
+            except Exception as exc:          # never lose the audio over a nicety
+                print("phonetics skipped (%s: %s)" % (type(exc).__name__, exc),
+                      file=sys.stderr, flush=True)
+                spoken, is_phonemes = text, False
 
             kwargs = {}
             for key in ("sentence_pause", "clause_pause"):
@@ -972,84 +1110,63 @@ Worth trying when a device resamples badly or underruns; **verify by ear rather 
 assuming**, since these are machine-specific and some combinations make things worse.
 `tts check` prints which player is being used and any tuning in effect.
 
-## Language tags: a borrowed word said properly
+## Phonetics: a borrowed word said properly
 
 Real speech mixes languages, and "Ya subí el pull request" read entirely with Spanish
-phonetics sounds wrong. A tagged span is synthesized with that language's voice:
-
-```console
-$ tts --lang es "Ya subí el <en>pull request</en> al repositorio."
-```
-
-With `rvc` every span still converts to the same target voice, so it remains one
-character speaking — only the base pronunciation changes.
-
-Which voice reads a borrowed span is configurable per **host** language via
-`foreign_voices`, falling back to the base provider's own per-language voice:
+phonetics sounds wrong. Give the pronunciation dictionary the word's IPA and the same
+voice says it correctly, inside the same utterance:
 
 ```bash
-tts config --set 'rvc.delivery.es={"language_tags": true, "foreign_voices": {"en": "bm_lewis"}}'
+tts config --set 'pronunciations.pull request=/pˈʊl ɹᵻkwˈɛst/'
+tts --lang es "Ya subí el pull request al repositorio."
 ```
 
-Reach for it when a borrowed phrase sounds like a different person interrupting — a
-closer timbre matters more mid-sentence than it does for a whole paragraph.
+A value between slashes is IPA; a bare value is a respelling, as before. Both live in
+the same `pronunciations` table.
 
-**On by default, and inert until a second language is configured** — only a language with
-a voice of its own counts as a tag, so nothing changes on a single-language setup. Works
-on any backend that can speak more than one language on demand:
+**This replaces the old `<en>…</en>` language spans.** Those synthesized the borrowed
+word separately and spliced it in, which gave it its own end-of-sentence intonation --
+mid-sentence that reads as an interruption -- and left a seam at each edge. Measured on
+a sentence with three English words: 4.651s spliced against 4.020s as one utterance.
+Old markup is recognized and removed rather than read aloud, so existing text is safe.
 
-| Backend | How a language selects a voice |
+**Any language, one caveat.** IPA is not tied to one language, so `/ˈkʁwasɑ̃/` for a
+French word inside Spanish works the same way. The limit is the backend's phoneme
+vocabulary: a model only produces sounds it was trained on, and an unfamiliar one comes
+out as the nearest thing it has.
+
+**Not every backend can use IPA**, and this is worth saying to the user rather than
+letting them discover it. local-tts has no runtime dependencies and cannot transcribe
+text itself, so it passes the table to a backend with its own phonemizer:
+
+| Backend | IPA entries |
 | --- | --- |
-| `kokoro` | `kokoro.language_voices` — one model, a voice per language |
-| `piper` | `piper.language_models` — a piper voice *is* a language, so one `.onnx` each |
-| `rvc` | its base provider's map, scoped per host language |
+| `kokoro` with a **running, current** server | yes -- the server holds the phonemizer |
+| `rvc` over a kokoro base | yes -- inherited from the base |
+| `kokoro` without a server | no -- the CLI wrapper takes text only |
+| `piper`, `llamacpp`, `openai`, `command` | no -- the word is said their own way |
 
-```bash
-tts config --set piper.language_models.en=~/.local/share/piper-voices/en_US-lessac-high.onnx
-tts config --set piper.language_tags=false       # or kokoro.language_tags, per backend
-tts config --set 'rvc.delivery.es={"pause_ms": 45, "language_tags": true}'
+`tts check` prints which, so read it back rather than promising:
+
+```
+phonetics   : 2 /IPA/ entries -> kokoro, rvc; ignored by llamacpp, openai, piper, command
 ```
 
-**Two things decide how a borrowed span sounds**, and they are separate knobs:
+An ignored entry is not an error. If the user needs IPA and their backend cannot take
+it, the fix is the persistent kokoro server (above), not a different dictionary entry.
 
-| | Setting | Answers |
-| --- | --- | --- |
-| phonetics | `foreign_voices` | which *base* voice reads the borrowed words |
-| timbre | `foreign_models` | which resident *rvc model* converts them (rvc only) |
+**`check` asks the server, it does not assume.** A configured `server_url` says a URL was
+written down; a running process says nothing about whether it is this version of the
+script. `/health` reports `{"ok": true, "phonetics": true}`, and a server copied from an
+earlier version answers with a plain `ok` -- so it reads as *ignored* rather than as
+working, and local-tts does not send it a table it would drop. If a user's entries show
+as ignored while their server is up, **re-copy the server script from this skill**: that
+is the upgrade path.
 
-```bash
-tts config --set 'rvc.delivery.es={"language_tags": true, "foreign_voices": {"en": "bm_lewis"}, "foreign_models": {"en": "cortana-en"}}'
-```
+**Where to get the IPA.** Wiktionary prints it for most words; `espeak-ng --ipa -q -v en
+"pull request"` prints it for anything. Use the transcription of the language the word
+comes *from* -- that is the entire point.
 
-Without `foreign_models` a borrowed span converts with the **host** language's model —
-still the same character, but a model trained on one language rendering another's
-phonemes, which is where an English word inside Spanish loses its edges. If the user has a
-model per language, wire it up; if they have one, leave it and say so rather than inventing
-a model name.
-
-rvc scopes it per host language rather than one flag, because whether a borrowed word
-should switch voice depends on which language is doing the borrowing.
-
-Only languages the user has actually configured count as language tags — an unconfigured
-one is left as literal text. So when you finish installing a base model, **ask whether
-they want another language set up for pronunciation**, and say why rather than just
-offering:
-
-> Borrowed words are common — "el *pull request*", "hacer *deploy*". If you add English
-> alongside Spanish, those can be tagged `<en>...</en>` and get English phonetics instead
-> of being read with Spanish vowels. Want me to add it?
-
-Then map whichever they choose:
-
-```bash
-tts config --set kokoro.language_voices.es=ef_dora
-tts config --set kokoro.language_voices.en=bm_george   # only if they said yes
-```
-
-**Do not add a second language on your own.** It is cheap at runtime — kokoro holds one
-model for every language — but it is still their configuration, and the same
-ask-before-installing rule applies here as everywhere else in this skill. Ask which
-languages and which voices; if they only want one, one is correct.
 
 ## Pronunciation dictionary
 
@@ -1154,7 +1271,7 @@ never have to guess whether something is configurable.
 | `player` | `""` | force a player; `windows`/`powershell` names the Windows one |
 | `player_args` | `{}` | extra argv per player, e.g. `{"ffplay": ["-af", "aresample=48000"]}` |
 | `player_env` | `{}` | environment for the player process only |
-| `pronunciations` | `{}` | word → respelling; `<lang>:<word>` scopes it to one language |
+| `pronunciations` | `{}` | word → respelling, or `/IPA/` for phonetics; `<lang>:<word>` scopes it |
 | `terminal_title` | `true` | speaker icon in the terminal tab while playing |
 | `stream` | `true` | play each fragment as it is synthesized |
 | `languages` | `{}` | the language memory — see `tts languages` |
@@ -1167,7 +1284,6 @@ never have to guess whether something is configurable.
 | `model_dir` | `""` | only for a CLI that resolves models by working directory |
 | `voice` / `lang` | `""` | flat fallback when no per-language voice applies |
 | `language_voices` | `{}` | language → voice; the phonemizer language follows the voice |
-| `language_tags` | `true` | honor `<en>…</en>` spans |
 | `speed` | `1.0` | rate multiplier |
 | `emphasis_lengthen` | `0` | IPA length marks on the stressed vowel (server only) |
 | `sentence_pause` / `clause_pause` | `""` | kokoro's own within-utterance pauses, seconds |
@@ -1181,7 +1297,6 @@ never have to guess whether something is configurable.
 | --- | --- | --- |
 | `binary` / `model` | | the executable and the flat `.onnx` voice |
 | `language_models` | `{}` | language → `.onnx`; a piper voice *is* a language |
-| `language_tags` | `true` | honor `<en>…</en>` spans |
 | `speaker` | `null` | speaker id for a multi-speaker voice |
 | `length_scale` / `volume` | `null` | base rate and loudness (a tag multiplies these) |
 | `auto_tone`, `extra_args` | | as kokoro |
@@ -1209,9 +1324,6 @@ never have to guess whether something is configurable.
 | `pause_tone_ms` | `130` | gap where the tone changes — the breath |
 | `trim_ms` | `10` | silence left at each fragment edge *before* the pause |
 | `emphasis_lengthen` | `0` | IPA length marks (needs a kokoro base + server) |
-| `language_tags` | `true` | honor `<en>…</en>` while this language hosts |
-| `foreign_voices` | `{}` | which base voice reads a borrowed language |
-| `foreign_models` | `{}` | which rvc model converts a borrowed language |
 
 **openai** — `base_url`, `api_key`, `model` (`gpt-4o-mini-tts` for tone), `voice`, `speed`,
 `timeout`, `tone` (flat instructions), `auto_tone`.

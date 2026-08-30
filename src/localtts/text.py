@@ -310,6 +310,28 @@ def _fold_unspeakable(segments):
 _MARKUP = re.compile(r"(\\.|</?[A-Za-z][\w.-]*>)")
 
 
+#: A dictionary value written between slashes is IPA, not a respelling:
+#: `/pˈʊl ɹᵻkwˈɛst/` rather than "pull rikwest". Slashes are the phonetician's own
+#: notation for a phonemic transcription, so the file reads the way the reference
+#: material does, and no real respelling starts and ends with one.
+#: Non-greedy, and the body may not contain a slash: "/a/ y /b/" is two transcriptions
+#: written where one was expected, not a single one reading "a/ y /b". Rejecting it is
+#: the honest answer -- so is rejecting "/ /", which would otherwise be an empty
+#: transcription that silently deletes the word.
+_PHONETIC_VALUE = re.compile(r"\A\s*/([^/]*\S[^/]*)/\s*\Z", re.DOTALL)
+
+
+def is_phonetic(value):
+    """True when a dictionary value is IPA rather than a respelling."""
+    return bool(_PHONETIC_VALUE.match(str(value or "")))
+
+
+def phonetic_text(value):
+    """The IPA inside the slashes, or "" when the value is a plain respelling."""
+    match = _PHONETIC_VALUE.match(str(value or ""))
+    return match.group(1).strip() if match else ""
+
+
 def pronunciation_entries(entries, lang=""):
     """The dictionary entries that apply to this call.
 
@@ -334,6 +356,40 @@ def pronunciation_entries(entries, lang=""):
     return general
 
 
+def respelling_entries(entries, lang=""):
+    """The respellings from `pronunciations` -- what this table has always held.
+
+    A filter over `pronunciation_entries()`, not a second table: no new configuration
+    key, and the `<lang>:<word>` scoping and exact-tag-beats-base-language rules are
+    that function's, unchanged. Every backend can use these, because they are rewritten
+    into the text before synthesis.
+    """
+    return {k: v for k, v in pronunciation_entries(entries, lang).items()
+            if not is_phonetic(v)}
+
+
+def phonetic_entries(entries, lang=""):
+    """The IPA entries from `pronunciations`, unwrapped from their slashes.
+
+    The same table the respellings live in, resolved by the same
+    `pronunciation_entries()` -- phonetics were added to the dictionary that already
+    existed rather than beside it, so one place answers "how is this word said" and a
+    user learns one set of scoping rules, not two.
+
+    These are how a borrowed word keeps its own sound: "descarga el pull request" says
+    *pull request* the English way because the dictionary holds its transcription, not
+    because the sentence was cut into pieces and handed to a second voice.
+
+    Any language works, because IPA is not tied to one: `/ˈkʁuasɑ̃/` for a French word
+    inside Spanish is the same mechanism as an English one. What limits it is the
+    backend, not this table -- a model can only say the phonemes its own vocabulary
+    contains, and only a backend that accepts phonemes at all can be handed them.
+    See `Provider.supports_phonetics`.
+    """
+    return {k: phonetic_text(v) for k, v in pronunciation_entries(entries, lang).items()
+            if is_phonetic(v)}
+
+
 def apply_pronunciations(text, entries, lang=""):
     """Rewrite words the user has respelled, so a name or a piece of jargon comes out
     the way they want it said.
@@ -343,8 +399,12 @@ def apply_pronunciations(text, entries, lang=""):
     is not "Em Ai"). Tone-tag markup and escapes are left alone -- a dictionary entry
     for "happy" must not rewrite `<happy>` into something the tag parser no longer
     recognizes.
+
+    IPA entries are deliberately skipped here: `/pˈʊl ɹᵻkwˈɛst/` is not something to
+    splice into text, it is phonemes for a backend that accepts them. They travel
+    separately, through `phonetic_entries()`.
     """
-    applicable = pronunciation_entries(entries, lang)
+    applicable = respelling_entries(entries, lang)
     if not applicable or not text:
         return text
     # Longest first so a multi-word phrase wins over its own first word.
@@ -360,14 +420,8 @@ def apply_pronunciations(text, entries, lang=""):
                    for part in _MARKUP.split(text) if part is not None)
 
 
-#: Any tag, plus escapes so `\\<en\\>` stays literal text. Language tags are recognized
-#: from this by matching against the languages actually configured (see
-#: split_language_spans) rather than any two-letter word, so adding a tone tag can never
-#: silently become a language switch.
-_ANY_TAG = re.compile(r"\\.|<(/?)(?:lang:)?([A-Za-z][\w-]*)>")
 
-
-#: The shape of a language code: "en", "es", "pt-BR", "cmn". Two or three letters, with
+#: The shape of a language code: "en", "es", "pt-BR", "cmn". Two or three letters with
 #: an optional region.
 _LANG_SHAPE = re.compile(r"[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,4})?\Z")
 
@@ -375,94 +429,27 @@ _LANG_SHAPE = re.compile(r"[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,4})?\Z")
 def is_language_tag(name, explicit=False):
     """Whether a tag names a language rather than a tone.
 
-    `<lang:en>` says so outright. Otherwise it has to look like a language code *and* not
-    be a tone tag we know -- `<sad>` and `<joy>` are three letters and would otherwise be
-    mistaken for languages, which is the whole reason this checks TAG_PROFILES first.
+    `<lang:en>` says so outright. Otherwise it has to look like a language code *and*
+    not be a tone tag we know -- `<sad>` and `<joy>` are three letters and would
+    otherwise be mistaken for languages, which is the whole reason this checks
+    TAG_PROFILES first.
 
     Deliberately not "any two-letter word": an unknown *tone* tag is a supported thing
-    (it still carries free-text instructions to a backend that can use them), so the test
-    has to be narrow enough that inventing one never silently makes it a language.
+    (it still carries free-text instructions to a backend that can use them), so the
+    test has to be narrow enough that inventing one never silently makes it a language.
+
+    Kept after language spans were removed, because the markup outlives the feature.
+    Text written for an older version still says `<en>pull request</en>`, and a tag that
+    is not recognized becomes a tone: that would split the audio for nothing and invent
+    "Speak in a tone that conveys en." for a backend with a free-text style hook.
+    Borrowed words are the pronunciation dictionary's job now (see `phonetic_entries`),
+    so the tag has nothing left to do -- drop the markup, keep the words.
     """
     if explicit or name.lower().startswith("lang:"):
         return True
     if name.lower() in TAG_PROFILES:
         return False
     return bool(_LANG_SHAPE.match(name))
-
-
-def _normalize_tag(code):
-    return code.strip().replace("_", "-").lower()
-
-
-def split_language_spans(text, default_lang="", known=()):
-    """Split `text` into (chunk, language) runs on `<en>`-style language tags.
-
-    A borrowed word keeps its own phonetics: "descarga el <en>pull request</en>" should
-    say "pull request" the English way rather than reading it with Spanish vowels. This
-    runs *before* tone segmentation and removes only the language markup, leaving every
-    other tag in the chunk, so tone handling afterwards is unchanged.
-
-    Tone tags that straddle a language boundary are re-balanced across the cut -- closed
-    at the end of one span and reopened at the start of the next -- because each span is
-    parsed on its own afterwards, and half a tag raises rather than guessing.
-
-    Only codes in `known` are treated as languages; anything else stays literal text.
-    Returns a single (text, default_lang) span when nothing matches, which is exactly the
-    untagged path.
-    """
-    # Normalized for matching, but the *configured* spelling is what gets returned: a
-    # span reported as "es-mx" would no longer match an "es-MX" key downstream, quietly
-    # falling back to plain Spanish.
-    allowed = {_normalize_tag(code): code for code in known if code}
-    if not allowed or not text:
-        return [(text, default_lang)]
-
-    spans, lang_stack, tone_stack, buf = [], [], [], []
-    pos = 0
-
-    def flush():
-        chunk = "".join(buf)
-        buf.clear()
-        if chunk.strip():
-            # Close what is still open so this span parses standalone...
-            chunk += "".join("</%s>" % name for name in reversed(tone_stack))
-            spans.append((chunk, lang_stack[-1] if lang_stack else default_lang))
-        # ...and reopen it for whatever comes next.
-        buf.append("".join("<%s>" % name for name in tone_stack))
-
-    for match in _ANY_TAG.finditer(text):
-        if match.group(0).startswith("\\"):
-            continue                              # escaped: not markup at all
-        closing, name = match.group(1), match.group(2)
-        code = allowed.get(_normalize_tag(name))
-        if code is not None:
-            buf.append(text[pos:match.start()])
-            pos = match.end()
-            flush()
-            if closing:
-                if lang_stack and lang_stack[-1] == code:
-                    lang_stack.pop()
-            else:
-                lang_stack.append(code)
-            continue
-        if is_language_tag(name):
-            # A language we cannot act on: drop the markup here rather than leave it for
-            # the tone layer to mistake for a tone tag.
-            buf.append(text[pos:match.start()])
-            pos = match.end()
-            continue
-        # A tone tag: it stays in the text, but we track it so a language cut inside it
-        # can be re-balanced.
-        buf.append(text[pos:match.end()])
-        pos = match.end()
-        if closing:
-            if tone_stack and tone_stack[-1] == name:
-                tone_stack.pop()
-        else:
-            tone_stack.append(name)
-    buf.append(text[pos:])
-    flush()
-    return spans or [(text, default_lang)]
 
 
 def strip_tone_tags(text):
@@ -495,53 +482,6 @@ def _own_the_stream(provider):
         yield sink
     finally:
         provider.on_part = sink
-
-
-def synthesize_language_spans(provider, text, out_path, voice=None):
-    """Render `text` with each `<en>`-tagged span spoken in that language's own voice.
-
-    Returns the output path, or None when there is nothing to do -- no language tags, or
-    the feature is off -- so the caller falls through to its normal path unchanged.
-
-    Every provider that can speak more than one language on demand wants this identically:
-    split, render each span with a copy of itself bound to that language, join. Only *how*
-    a language selects a voice differs, and each provider already answers that through its
-    own per-language resolution, so this stays one implementation rather than one per
-    backend.
-    """
-    from localtts import audio, audiofx
-
-    if not provider.language_tags_enabled():
-        return None
-    spans = split_language_spans(text, provider.lang, provider.known_languages())
-    if len(spans) <= 1:
-        return None
-
-    work = tempfile.mkdtemp(prefix="local-tts-lang-")
-    parts = [os.path.join(work, "%04d.%s" % (index, provider.default_format))
-             for index in range(len(spans))]
-    try:
-        with _own_the_stream(provider) as emit:
-            for (chunk, lang), part in zip(spans, parts):
-                if lang == provider.lang:
-                    # An explicit --voice is about the language actually being spoken;
-                    # forcing it onto a borrowed span is the opposite of the point.
-                    provider.synthesize(chunk, part, voice=voice)
-                else:
-                    provider.for_language_instance(lang).synthesize(chunk, part)
-                # Each fragment carries its own lead-in and tail; joined, they add up
-                # to real dead air between borrowed words.
-                audiofx.trim_silence(part)
-                if emit:
-                    emit(part)
-        audio.concat_wavs(parts, out_path, gap_seconds=0)
-    finally:
-        for part in parts:
-            if os.path.exists(part):
-                os.unlink(part)
-        if os.path.isdir(work):
-            os.rmdir(work)
-    return out_path
 
 
 def _synthesize_with_audiofx(provider, text, out_path, voice, on_progress):

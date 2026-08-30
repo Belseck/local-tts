@@ -496,11 +496,49 @@ def check(argv):
     if tuning:
         print("player tuning: %s" % "; ".join(tuning))
     print("tone shaping: %s" % _tone_shaping_status())
+    print("phonetics   : %s" % _phonetics_status(cfg))
     print("streaming   : %s" % ("on -- each fragment plays as it is synthesized"
                                 if cfg.get("stream", True) else
                                 "off (`%s config --set stream=true` to play as it renders)" % PROG))
     return 0 if ok_default else 1
 
+
+def _phonetics_status(cfg):
+    """Whether the dictionary's IPA entries can actually reach the model.
+
+    Reported rather than left to be discovered, because a `/…/` entry that silently
+    does nothing is the worst kind of setting: the word still gets said, just the wrong
+    way, and nothing anywhere says why. local-tts has no runtime dependencies and cannot
+    transcribe text itself, so it can only pass the table to a backend that has a
+    phonemizer of its own -- and it asks that backend rather than assuming, because a
+    server that is merely configured, or is an older copy of the script, would take the
+    table and drop it.
+    """
+    entries = cfg.get("pronunciations") or {}
+    # Distinct words, not table keys: "pull request" and "es:pull request" are one word
+    # said two ways, and no single call ever sees both -- `check` has no --lang, so it
+    # cannot resolve which, and reporting "2" would match no call that ever runs.
+    phonetic = {str(key).partition(":")[2].strip().lower() or str(key).strip().lower()
+                for key, value in entries.items() if textutil.is_phonetic(value)}
+    if not phonetic:
+        return "no /IPA/ entries in `pronunciations` (plain respellings work everywhere)"
+
+    able, unable = [], []
+    for name in providers.names():
+        try:
+            instance = providers.build(name, cfg)
+        except Exception:
+            continue
+        (able if getattr(instance, "supports_phonetics", False) else unable).append(name)
+    if not able:
+        return ("%d word(s) with /IPA/ in the table, but no backend here accepts "
+                "phonemes right now -- "
+                "they are ignored. kokoro's persistent server is the one that can; if "
+                "it is configured, check it is running and its script is current."
+                % len(phonetic))
+    return "%d word(s) with /IPA/ in the table -> %s%s" % (
+        len(phonetic), ", ".join(able),
+        "; ignored by %s" % ", ".join(unable) if unable else "")
 
 def _tone_shaping_status():
     """Whether a <tag>'s speed change goes through ffmpeg or the built-in fallback.

@@ -1063,74 +1063,91 @@ tts -p openai -s model=tts-1-hd -s speed=1.15 "faster, nicer"
 
 ---
 
-### Language tags — a borrowed word, said properly
+### Phonetics — a borrowed word, said properly
 
 Real speech mixes languages. `"Ya subí el pull request"` read entirely with Spanish
-phonetics sounds wrong, because "pull request" is English. Tag the span and it is
-synthesized with that language's voice:
-
-```console
-$ tts --lang es "Ya subí el <en>pull request</en> al repositorio."
-```
-
-The Spanish parts use the Spanish voice, the tagged span uses the English one — and with
-`rvc` **all of it still converts to the same target voice**, so it stays one character
-speaking, just with the right phonetics for each word.
+phonetics sounds wrong, because "pull request" is English. Give the dictionary its
+transcription and the same voice says it correctly:
 
 ```bash
-tts config --set 'rvc.delivery.es={"pause_ms": 45, "language_tags": true}'
+tts config --set 'pronunciations.pull request=/pˈʊl ɹᵻkwˈɛst/'
+tts --lang es "Ya subí el pull request al repositorio."
 ```
 
-**On by default, and inert until you configure a second language** — only a language that
-has a voice of its own counts as a tag, so with one voice installed there is nothing to
-switch to and nothing changes.
+A value between slashes is IPA rather than a respelling. Slashes are the phonetician's
+own notation for a phonemic transcription, so the file reads the way the reference
+material does, and no real respelling starts and ends with one.
 
-It works on every backend that can speak more than one language on demand:
+**Any language works.** IPA is not tied to one: `/ˈkʁwasɑ̃/` for a French word inside
+Spanish is the same mechanism as an English one. What limits it is the backend, not this
+table — a model can only produce the phonemes its own vocabulary contains, so a sound it
+was never trained on comes out as the nearest thing it has.
 
-| Backend | How a language selects a voice |
-| --- | --- |
-| `kokoro` | `kokoro.language_voices` — one model, a voice per language |
-| `piper` | `piper.language_models` — a piper voice *is* a language, so one `.onnx` each |
-| `rvc` | its base provider's map, per host language (below) |
+**Not every backend can use them.** local-tts has no runtime dependencies and cannot
+transcribe text itself, so it passes the table to backends that have a phonemizer of
+their own. No extra install is involved: `kokoro-onnx` already requires `phonemizer`
+and `espeakng-loader`, and the server uses kokoro's own tokenizer, so a transcription
+matches what the model would have produced from the text itself.
+
+`tts check` asks the server rather than assuming. A `server_url` says a URL was written
+down, not that anything is listening, and a server copied from an earlier version of the
+skill answers `/health` perfectly well while dropping a table it never learned to read.
+Today that is `kokoro` with `server_url` set and a current server script, and `rvc` when
+kokoro is its base. Anything else comes out as *ignored*, which `tts check` says outright
+rather than leaving a silent no-op:
+
+```
+phonetics   : 2 /IPA/ entries -> kokoro, rvc; ignored by llamacpp, openai, piper, command
+```
+
+An ignored entry is not an error — the word is still spoken, just the backend's own way.
+
+**Why this and not one voice per language.** Synthesizing a borrowed word separately and
+splicing it in gives that word its own end-of-sentence intonation, which mid-sentence
+reads as an interruption, and leaves a seam at each edge. Transcribing the whole line and
+swapping in phonemes keeps one utterance, one voice and one intonation curve. Measured on
+a sentence with three English words: 4.651s spliced against 4.020s as one utterance, the
+difference being dead air at six fragment edges.
+
+Older text may still contain `<en>…</en>` markup. It is recognized and removed rather
+than read aloud or mistaken for a tone tag.
+
+#### Migrating from language spans
+
+`piper.language_tags`, `kokoro.language_tags`, `rvc.delivery.*.language_tags`,
+`foreign_voices` and `foreign_models` are gone. An existing config file containing them
+still loads — unknown keys are ignored, nothing crashes — but `tts config --set` no
+longer accepts them, and anyone who had `foreign_voices` set loses that behaviour.
+
+Replace each borrowed word with a dictionary entry:
 
 ```bash
-tts config --set piper.language_models.es=~/.local/share/piper-voices/es_MX-claude-high.onnx
-tts config --set piper.language_models.en=~/.local/share/piper-voices/en_US-lessac-high.onnx
-tts config --set piper.language_tags=false     # to turn it off
+# before: a span, a second voice, and a seam at each edge
+tts --lang es "Ya subí el <en>pull request</en>"
+
+# after: one entry, one voice, one utterance
+tts config --set 'pronunciations.pull request=/pˈʊl ɹᵻkwˈɛst/'
+tts --lang es "Ya subí el pull request"
 ```
 
-For `rvc` it is scoped per host language instead of one flag, since whether a borrowed
-word should switch voice depends on which language is doing the borrowing:
-
-```bash
-tts config --set 'rvc.delivery.es={"language_tags": true}'
-```
-
-Which voice speaks the borrowed span is configurable per **host** language, because the
-best voice for a quoted English phrase inside Spanish is not always the one you would
-pick to narrate a whole English paragraph — a closer timbre matters more mid-sentence:
-
-```bash
-tts config --set 'rvc.delivery.es={"language_tags": true, "foreign_voices": {"en": "bm_lewis"}}'
-```
-
-Without an override it falls back to the base provider's own per-language voice. `<lang:en>` works
-too, as do region tags (`<es-MX>`). Only languages you have actually configured count as
-language tags — otherwise a tone tag nobody anticipated would silently become a language
-switch. Tone tags straddling a language boundary are re-balanced across the cut, so
-`<calm>Hola <en>hello</en> adios</calm>` still reads calmly throughout.
+`language_voices` and `language_models` are **not** affected: they pick the voice for the
+call's own language, which is the language memory (`tts languages`), a separate feature.
 
 ### Pronunciation dictionary
 
-Say these words this way. Applied before synthesis on every backend, so a name or a piece
-of jargon comes out right no matter which voice is speaking:
+Say these words this way. One table, two kinds of entry:
 
 ```bash
-tts config --set pronunciations.jarvis="JAR-viss"
+tts config --set pronunciations.jarvis="JAR-viss"          # respelling: every backend
 tts config --set pronunciations.kubectl="cube cuddle"
-tts config --set pronunciations.es:jarvis="yarvis"   # Spanish only
-tts config --set pronunciations.jarvis=                # empty value removes it
+tts config --set 'pronunciations.pull request=/pˈʊl ɹᵻkwˈɛst/'   # IPA: see Phonetics
+tts config --set pronunciations.es:jarvis="yarvis"         # Spanish only
+tts config --set pronunciations.jarvis=                     # empty value removes it
 ```
+
+A plain value is a **respelling**, rewritten into the text before synthesis, so it works
+on every backend. A value between slashes is **IPA**, handed to the model as phonemes —
+see [Phonetics](#phonetics--a-borrowed-word-said-properly) for which backends accept it.
 
 Keys match whole words, case-insensitively; the replacement is used exactly as written,
 because a respelling's own capitalization is often load-bearing. A bare key applies to
@@ -1154,8 +1171,6 @@ tts config --set 'rvc.delivery.en={"speed": 1.0, "pause_ms": 60, "pause_tone_ms"
 | `pause_tone_ms` | Silence where the tone changes — the breath a speaker takes |
 | `emphasis_lengthen` | IPA length marks on the stressed vowel (kokoro base only) |
 | `trim_ms` | Silence left at each fragment edge *before* the pause is applied |
-| `foreign_voices` | Which base voice reads a borrowed language while this one hosts |
-| `foreign_models` | Which resident rvc model converts a borrowed language (rvc only) |
 
 `"*"` applies to any language not named. Spanish runs faster with shorter gaps than
 English, which is why this is per-language rather than one number — and why the previous
@@ -1171,14 +1186,9 @@ Joined, eight fragments carry eight lots of it, so the real gap would be that de
 configured pause back in charge of the rhythm. On one mixed-language sentence this cut
 7.24s to 5.79s without changing a word.
 
-`foreign_models` is the rvc counterpart to `foreign_voices`: without it a borrowed span
-converts with the *host* language's model — still the same character, but a model trained
-on one language rendering another's phonemes, which is where an English word inside
-Spanish loses its edges.
-
-```bash
-tts config --set 'rvc.delivery.es={"language_tags": true, "foreign_models": {"en": "cortana-en"}}'
-```
+Fragments come from **tone** changes now, not from language: a borrowed word is handled
+by the pronunciation dictionary's IPA entries, inside the same utterance, so there is no
+edge to trim there at all. See [Phonetics](#phonetics--a-borrowed-word-said-properly).
 
 ## Audio playback
 
