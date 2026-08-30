@@ -193,6 +193,12 @@ class Provider:
     # venv (the same pattern as its subprocess CLI wrapper) -- but any provider can reuse
     # this client-side plumbing to reach one and auto-start it if it isn't already up.
 
+    def phonemizer_provider(self):
+        """Whichever provider actually holds the phonemizer -- itself, for anything
+        that synthesizes its own audio. Only rvc differs, and only because it does
+        not read text at all."""
+        return self
+
     def phonetics_table(self, text):
         """The `/IPA/` entries this call should carry, after the user's hooks.
 

@@ -28,6 +28,8 @@ import json
 import os
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 from localtts import text as textutil
 
@@ -119,3 +121,28 @@ def run_hooks(table, text, lang, provider, cfg=None, timeout=None):
             continue
         current = _normalize(answer.get("phonetics", current))
     return current
+
+
+def unsupported_phonemes(provider, ipa):
+    """Characters in `ipa` this model has no token for, or None when it cannot be asked.
+
+    A phoneme outside the model's vocabulary is dropped in silence: the word still comes
+    out, just mangled, and nothing anywhere says why. It is nearly always a typo -- an
+    ASCII "r" where IPA wants "ɹ", an apostrophe where the stress mark belongs -- so the
+    character itself is the whole answer. Only a loaded model knows its vocabulary, so
+    this asks the server; None means "no server to ask", which is not the same as "fine".
+    """
+    speaker = provider.phonemizer_provider() if hasattr(provider, "phonemizer_provider") \
+        else provider
+    url = (getattr(speaker, "settings", None) or {}).get("server_url")
+    if not url:
+        return None
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/vocab", timeout=2) as response:
+            body = json.loads(response.read(65536) or b"{}")
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    vocab = body.get("vocab") if isinstance(body, dict) else None
+    if not isinstance(vocab, str) or not vocab:
+        return None                     # a server older than /vocab, or one that failed
+    return sorted({char for char in ipa if char not in vocab and not char.isspace()})

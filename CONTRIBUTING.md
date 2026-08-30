@@ -64,7 +64,7 @@ the subprocess and HTTP layers. You *do* need one to check that audio actually c
 python -m unittest discover -s tests -v
 ```
 
-276 tests, no test dependencies, no network, no audio device. They must all pass before
+311 tests, no test dependencies, no network, no audio device. They must all pass before
 you open a pull request, and they should stay fast — if a test needs a real model, a real
 player or a real API, it does not belong in this suite; fake the boundary instead. The
 existing tests show the patterns: a stub binary on `PATH`, a local HTTP server, a
@@ -123,6 +123,7 @@ incomplete, and any of these may need updating in the same pull request:
 | `src/localtts/agent_skills/local-tts-speak.md` | How an agent decides to speak. |
 | `src/localtts/agent_skills/local-tts-configure.md` | Every setting, and the install steps per backend. |
 | `src/localtts/agent_skills/local-tts-tune.md` | Diagnosing how speech *sounds*. |
+| `src/localtts/agent_skills/local-tts-phonetics.md` | Getting one word pronounced right. |
 | `src/localtts/agent_skills/local-tts-update.md` | Updating an existing install. |
 
 Two things to check specifically, because they go stale quietly:

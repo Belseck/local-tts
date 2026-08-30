@@ -6,14 +6,15 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
-from localtts import (__version__, audio, config, hooks, providers, servers, skills,
-                      text as textutil)
+from localtts import (__version__, audio, config, hooks, phonetics, providers,
+                      servers, skills, text as textutil)
 from localtts.errors import TTSError
 
 PROG = "tts"
 SUBCOMMANDS = ("config", "providers", "check", "languages", "skills", "hooks",
-               "servers", "playback", "stop", "pause", "resume")
+               "servers", "pronounce", "playback", "stop", "pause", "resume")
 
 #: Environment variables known to hold a stable per-run session id, checked in order.
 #: Verified against a live capture: Claude Code's own status-line JSON payload carries
@@ -60,6 +61,7 @@ def _speak_parser():
             "  %(prog)s skills               install agent skills for this CLI\n"
             "  %(prog)s hooks                install a status-bar hook (fewer chat messages)\n"
             "  %(prog)s servers             persistent server scripts: current or stale\n"
+            "  %(prog)s pronounce WORD      try a transcription for one word, by ear\n"
             "  %(prog)s stop | pause | resume control background playback\n"
             "  %(prog)s check                verify backends and audio players\n"
             "  %(prog)s config --show        print the effective configuration\n"
@@ -747,6 +749,132 @@ def _short(path):
     return "~" + path[len(home):] if path.startswith(home) else path
 
 
+def pronounce_command(argv):
+    parser = argparse.ArgumentParser(
+        prog="%s pronounce" % PROG,
+        description="Hear a word as it is said now, and as a candidate /IPA/ would say it.",
+        epilog=("Finding a transcription is a loop -- look one up, hear it, adjust -- and\n"
+                "nothing about it is guessable from the text alone. This renders both\n"
+                "versions back to back, says whether the model has a token for every\n"
+                "phoneme you asked for, and prints the command that keeps the winner.\n"
+                "\nexamples:\n"
+                "  tts pronounce \"pull request\" --lang es --ipa \"/p\u02c8\u028al \u0279\u1d7bkw\u02c8\u025bst/\"\n"
+                "  tts pronounce croissant --lang es --sentence \"quiero un croissant\"\n"),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("word", help="the word or phrase being pronounced")
+    parser.add_argument("--ipa", default="",
+                        help="candidate transcription, /between slashes/ or bare")
+    parser.add_argument("-l", "--lang", default="", metavar="CODE",
+                        help="use the backend and voice remembered for this language")
+    parser.add_argument("-p", "--provider", choices=providers.names())
+    parser.add_argument("--sentence", default="",
+                        help="say the word inside this sentence instead of on its own")
+    parser.add_argument("--no-play", dest="play", action="store_false",
+                        help="render without playing (the paths are printed)")
+    parser.add_argument("--keep", action="store_true", help="keep the rendered wav files")
+    args = parser.parse_args(argv)
+
+    cfg = config.load()
+    word = args.word.strip()
+    if not word:
+        raise TTSError("nothing to pronounce")
+    sentence = args.sentence.strip() or word
+    if args.sentence and word.lower() not in args.sentence.lower():
+        raise TTSError("%r does not appear in --sentence %r, so there would be nothing "
+                       "to hear the difference in" % (word, args.sentence))
+
+    candidate = args.ipa.strip()
+    if candidate:
+        if not textutil.is_phonetic(candidate):
+            candidate = "/%s/" % candidate.strip("/").strip()
+        if not textutil.is_phonetic(candidate):
+            raise TTSError("--ipa %r is not a transcription: it should read like "
+                           "/p\u02c8\u028al/, and may not contain a slash of its own"
+                           % args.ipa)
+
+    name, voice = _resolve_language(
+        cfg, argparse.Namespace(provider=args.provider, voice=None, lang=args.lang or ""))
+    provider = providers.build(name, cfg, lang=args.lang or "")
+
+    print("word       : %s" % word)
+    if args.lang:
+        print("language   : %s" % args.lang)
+    print("provider   : %s" % name)
+    existing = textutil.pronunciation_entries(cfg.get("pronunciations") or {},
+                                              args.lang or "").get(word.lower())
+    if existing:
+        print("dictionary : %s (in effect now)" % existing)
+
+    work = tempfile.mkdtemp(prefix="local-tts-pronounce-")
+    keep = args.keep
+    try:
+        # The baseline goes first for a reason beyond ordering: rendering it starts a
+        # persistent server if one is configured, and `supports_phonetics` asks a server
+        # that is running rather than one that would be. Asking before this would report
+        # "cannot take phonemes" for a backend that can, every time the server happened
+        # to be cold.
+        rendered = [("as it is now",
+                     _render_once("now", name, cfg, sentence, args, voice,
+                                  os.path.join(work, "0.wav")))]
+
+        if candidate:
+            print("candidate  : %s" % candidate)
+            provider = providers.build(name, cfg, lang=args.lang or "")
+            if not provider.supports_phonetics:
+                print("phonemes   : %s cannot take phonemes here, so the candidate cannot "
+                      "be tried -- `%s check` says why (usually kokoro's server is not "
+                      "running, or its script is stale: `%s servers`)"
+                      % (name, PROG, PROG))
+                return 1
+            missing = phonetics.unsupported_phonemes(
+                provider, textutil.phonetic_text(candidate))
+            if missing is None:
+                print("phonemes   : this backend cannot say which it has a token for")
+            elif missing:
+                print("phonemes   : no token for %s -- %s dropped, and the word comes out "
+                      "mangled rather than wrong-but-whole. Usually a typo: an ASCII "
+                      "letter where IPA wants its own symbol."
+                      % (", ".join(repr(char) for char in missing),
+                         "they are" if len(missing) > 1 else "it is"))
+            else:
+                print("phonemes   : every one is in this model's vocabulary")
+            trial = json.loads(json.dumps(cfg))
+            trial.setdefault("pronunciations", {})[word] = candidate
+            rendered.append(("with the candidate",
+                             _render_once("with IPA", name, trial, sentence,
+                                          args, voice, os.path.join(work, "1.wav"))))
+
+        if args.play:
+            for label, path in rendered:
+                print("  playing %s" % label)
+                if not audio.play(path, cfg.get("player") or "", title=False):
+                    print("no audio player found, so nothing played -- keeping the files")
+                    keep = True
+                    break
+        if candidate:
+            print("keep it    : %s config --set 'pronunciations.%s%s=%s'"
+                  % (PROG, "%s:" % args.lang if args.lang else "", word, candidate))
+    finally:
+        if keep:
+            print("files      : %s" % work)
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+    return 0
+
+
+def _render_once(label, name, cfg, sentence, args, voice, out_path):
+    """One rendering of the sentence under `cfg`, timed and announced. Respellings are
+    applied here exactly as `speak` applies them, so the only thing that differs between
+    the two takes is the transcription being tried."""
+    spoken = textutil.apply_pronunciations(sentence, cfg.get("pronunciations"),
+                                           args.lang or "")
+    instance = providers.build(name, cfg, lang=args.lang or "")
+    started = time.time()
+    instance.synthesize(spoken, out_path, voice=voice)
+    print("%-11s: %.2fs" % (label, time.time() - started))
+    return out_path
+
+
 def servers_command(argv):
     parser = argparse.ArgumentParser(
         prog="%s servers" % PROG,
@@ -976,6 +1104,7 @@ def main(argv=None):
                 "skills": skills_command,
                 "hooks": hooks_command,
                 "servers": servers_command,
+                "pronounce": pronounce_command,
                 "playback": playback_command,
             }.get(argv[0])
             if handler is None:      # stop / pause / resume are shortcuts

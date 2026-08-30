@@ -13,7 +13,8 @@ from pathlib import Path
 from localtts import config
 from localtts.errors import TTSError
 
-SKILLS = ("local-tts-speak", "local-tts-configure", "local-tts-update", "local-tts-tune")
+SKILLS = ("local-tts-speak", "local-tts-configure", "local-tts-update",
+          "local-tts-tune", "local-tts-phonetics")
 
 BEGIN = "<!-- BEGIN local-tts skills -->"
 END = "<!-- END local-tts skills -->"

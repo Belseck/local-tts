@@ -401,6 +401,11 @@ whichever agents it finds on your machine:
   emphasis, which voice reads a borrowed word, and the noise or robotic artifacts that
   come from the wrong player or a missing ffmpeg. Diagnoses by measurement first, changes
   one setting at a time, and asks for your ears only where a measurement cannot decide.
+- **`local-tts-phonetics`** — get one *word* said properly: a name, a brand, an acronym,
+  a borrowed term inside another language. Looks the transcription up rather than deriving
+  it from spelling, tries it by ear with [`tts pronounce`](#hearing-a-transcription-before-you-keep-it),
+  reads back which phonemes the model actually has a token for, and keeps the winner in the
+  dictionary — or wires a `phonetics_hooks` script when there are too many words to type.
 - **`local-tts-update`** — update an already-installed CLI to the latest version. Locates
   the repo behind the running `tts` command, pulls it, reinstalls only if that's actually
   needed, and refreshes the skill/hook files that are copies rather than live links to the
@@ -1198,6 +1203,46 @@ because a respelling's own capitalization is often load-bearing. A bare key appl
 every language, and `<lang>:<word>` applies to that one only — so a word said differently
 in two languages needs no nested structure. Tone-tag markup is left untouched: an entry
 for `happy` will not rewrite `<happy>`.
+
+### Hearing a transcription before you keep it
+
+An IPA entry is not guessable from spelling, and a wrong one fails in the way that is
+hardest to notice: the word still comes out, just mangled. `tts pronounce` renders the
+word as it is said now and as a candidate would say it, plays both back to back, and says
+whether the model has a token for every phoneme you asked for:
+
+```console
+$ tts pronounce "pull request" --lang es --ipa "/pˈʊl ɹᵻkwˈɛst/"
+word       : pull request
+language   : es
+provider   : rvc
+now        : 0.88s
+candidate  : /pˈʊl ɹᵻkwˈɛst/
+phonemes   : every one is in this model's vocabulary
+with IPA   : 0.73s
+  playing as it is now
+  playing with the candidate
+keep it    : tts config --set 'pronunciations.es:pull request=/pˈʊl ɹᵻkwˈɛst/'
+```
+
+The `phonemes` line is the part that saves time. A character the model has no token for is
+dropped in silence, so it is reported before you listen:
+
+```console
+$ tts pronounce croissant --lang es --ipa "/kr'wasɑ̃/"
+phonemes   : no token for "'" -- it is dropped, and the word comes out mangled rather
+             than wrong-but-whole. Usually a typo: an ASCII letter where IPA wants its
+             own symbol.
+```
+
+That is nearly always a real typo — `'` for `ˈ`, `r` for `ɹ`, `:` for `ː`. Add `--sentence
+"quiero un croissant"` to hear the word in context, `--no-play` to render without playing,
+and `--keep` to hold on to both wav files. Asking which phonemes exist needs a current
+kokoro server (`tts servers`); without one you still get both renders, with a line saying
+the vocabulary could not be checked.
+
+If you use a coding agent, the whole loop — look it up, hear it, keep it — is the
+**`local-tts-phonetics`** skill: just say "it's saying my name wrong."
 
 ### Phonetics hooks — transcriptions nobody wrote down
 

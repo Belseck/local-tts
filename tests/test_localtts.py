@@ -173,7 +173,7 @@ class _FakeAudioServer:
     request/response wire format is exercised, not just the call site."""
 
     def __init__(self, route, audio_bytes=b"RIFF....WAVEfake", status=200, healthy=True,
-                 capabilities=None):
+                 capabilities=None, vocab=None):
         self.route = route
         self.audio_bytes = audio_bytes
         self.status = status
@@ -181,6 +181,8 @@ class _FakeAudioServer:
         #: What /health claims. None keeps the plain-text "ok" an older server sends,
         #: which is the case worth testing: it answers, and understands nothing new.
         self.capabilities = capabilities
+        #: What GET /vocab answers with, or None for a server that has no such route.
+        self.vocab = vocab
         self.requests = []
         outer = self
 
@@ -189,7 +191,12 @@ class _FakeAudioServer:
                 pass
 
             def do_GET(self):
-                if self.path == "/health" and outer.healthy:
+                if self.path == "/vocab" and outer.vocab is not None:
+                    body = json.dumps({"vocab": outer.vocab}).encode("utf-8")
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path == "/health" and outer.healthy:
                     body = (json.dumps(outer.capabilities).encode("utf-8")
                             if outer.capabilities is not None else b"ok")
                     self.send_response(200)
@@ -3039,3 +3046,128 @@ class PhoneticsHookTest(unittest.TestCase):
     def test_no_hooks_configured_changes_nothing(self):
         table = self.run_hooks({"pronunciations": dict(self.ENTRIES)})
         self.assertEqual(table, textutil.phonetic_entries(self.ENTRIES, "es"))
+
+
+class PronounceTest(unittest.TestCase):
+    """`tts pronounce`: hearing a candidate transcription instead of guessing at it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "config.json")
+        os.environ["LOCALTTS_CONFIG"] = self.path
+        self.addCleanup(os.environ.pop, "LOCALTTS_CONFIG", None)
+
+    def configure(self, server=None, **top):
+        kokoro = dict(config.DEFAULTS["providers"]["kokoro"])
+        if server is not None:
+            kokoro["server_url"] = server.url
+        cfg = {"provider": "kokoro", "play": False, "providers": {"kokoro": kokoro}}
+        cfg.update(top)
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump(cfg, handle)
+        return cfg
+
+    def run_cli(self, argv):
+        import contextlib, io as _io
+        captured = _io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            code = main(argv)
+        return code, captured.getvalue()
+
+    def run_failing(self, argv):
+        """main() turns a TTSError into `tts: error: ...` on stderr and exit 1, which is
+        the contract a user or an agent actually sees."""
+        import contextlib, io as _io
+        captured = _io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            code = main(argv)
+        return code, captured.getvalue()
+
+    def test_a_value_that_is_not_a_transcription_is_refused(self):
+        self.configure()
+        code, printed = self.run_failing(["pronounce", "x", "--ipa", "/a/ y /b/"])
+        self.assertEqual(code, 1)
+        self.assertIn("not a transcription", printed)
+
+    def test_bare_ipa_is_accepted_and_wrapped(self):
+        server = _FakeAudioServer("/synthesize", audio_bytes=_wav_bytes(1),
+                                  capabilities={"ok": True, "phonetics": True},
+                                  vocab="pl\u02c8\u028a\u0279\u1d7bkwst\u025b")
+        self.addCleanup(server.stop)
+        self.configure(server)
+        code, printed = self.run_cli(["pronounce", "pull request", "--no-play",
+                                      "--ipa", "p\u02c8\u028al"])
+        self.assertEqual(code, 0)
+        self.assertIn("candidate  : /p\u02c8\u028al/", printed)
+
+    def test_it_renders_twice_and_only_the_second_carries_the_candidate(self):
+        server = _FakeAudioServer("/synthesize", audio_bytes=_wav_bytes(1),
+                                  capabilities={"ok": True, "phonetics": True},
+                                  vocab="pl\u02c8\u028a\u0279\u1d7bkwst\u025b")
+        self.addCleanup(server.stop)
+        self.configure(server)
+        code, printed = self.run_cli(["pronounce", "pull request", "--no-play",
+                                      "--ipa", "/p\u02c8\u028al/"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(server.requests), 2)
+        self.assertNotIn("phonetics", server.requests[0])
+        self.assertEqual(server.requests[1]["phonetics"], {"pull request": "p\u02c8\u028al"})
+        self.assertIn("keep it", printed)
+
+    def test_a_phoneme_the_model_lacks_is_named_before_it_is_heard(self):
+        """Dropped in silence otherwise: the word still comes out, just mangled."""
+        server = _FakeAudioServer("/synthesize", audio_bytes=_wav_bytes(1),
+                                  capabilities={"ok": True, "phonetics": True},
+                                  vocab="abcdefg")
+        self.addCleanup(server.stop)
+        self.configure(server)
+        code, printed = self.run_cli(["pronounce", "x", "--no-play", "--ipa", "/abZ/"])
+        self.assertEqual(code, 0)
+        self.assertIn("no token for 'Z'", printed)
+
+    def test_a_server_without_vocab_says_it_cannot_answer(self):
+        server = _FakeAudioServer("/synthesize", audio_bytes=_wav_bytes(1),
+                                  capabilities={"ok": True, "phonetics": True})
+        self.addCleanup(server.stop)
+        self.configure(server)
+        code, printed = self.run_cli(["pronounce", "x", "--no-play", "--ipa", "/ab/"])
+        self.assertEqual(code, 0)
+        self.assertIn("cannot say which", printed)
+
+    def test_a_backend_that_cannot_take_phonemes_says_so_and_fails(self):
+        """Rendering the same audio twice and calling it a comparison would be a lie."""
+        self.configure()                       # kokoro with no server: no phonemizer
+        with unittest.mock.patch.object(KokoroProvider, "synthesize",
+                                        lambda self, text, out, voice=None: out):
+            code, printed = self.run_cli(["pronounce", "x", "--no-play", "--ipa", "/ab/"])
+        self.assertEqual(code, 1)
+        self.assertIn("cannot take phonemes", printed)
+
+    def test_a_word_missing_from_the_sentence_is_refused(self):
+        self.configure()
+        code, printed = self.run_failing(["pronounce", "croissant",
+                                          "--sentence", "quiero un pastel"])
+        self.assertEqual(code, 1)
+        self.assertIn("does not appear", printed)
+
+    def test_rvc_asks_its_base_provider_about_the_vocabulary(self):
+        """rvc converts audio and never sees a word, so its own server cannot answer."""
+        server = _FakeAudioServer("/synthesize", audio_bytes=_wav_bytes(1),
+                                  capabilities={"ok": True, "phonetics": True},
+                                  vocab="abc")
+        self.addCleanup(server.stop)
+        cfg = {"providers": {
+            "rvc": dict(config.DEFAULTS["providers"]["rvc"], base_provider="kokoro",
+                        server_url="http://127.0.0.1:1"),
+            "kokoro": dict(config.DEFAULTS["providers"]["kokoro"], server_url=server.url),
+        }}
+        from localtts import phonetics
+        provider = RvcProvider(cfg["providers"]["rvc"], cfg=cfg)
+        self.assertEqual(phonetics.unsupported_phonemes(provider, "abZ"), ["Z"])
+
+    def test_without_a_server_the_vocabulary_is_unknown_not_empty(self):
+        """"No token for anything" and "nobody to ask" are different answers."""
+        from localtts import phonetics
+        provider = KokoroProvider(dict(config.DEFAULTS["providers"]["kokoro"]))
+        self.assertIsNone(phonetics.unsupported_phonemes(provider, "abc"))

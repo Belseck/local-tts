@@ -437,8 +437,24 @@ def make_handler(kokoro, last_activity):
                 # so that `tts check` can tell a server that understands the
                 # pronunciation dictionary's IPA entries from an older copy that
                 # would accept them and drop them without a word.
-                body = json.dumps({"ok": True, "phonetics": True,
-                                   "shutdown": True}).encode("utf-8")
+                body = json.dumps({"ok": True, "phonetics": True, "shutdown": True,
+                                   "vocab": True}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/vocab":
+                # Which phonemes this model has a token for. A transcription asking for
+                # one it does not have loses that character silently -- the word still
+                # comes out, just mangled -- so `tts pronounce` reads this and says which
+                # character is the problem instead of leaving it to be heard.
+                try:
+                    phonemes("a", "en-us")          # builds the tokenizer if it is not yet
+                    vocab = "".join(sorted(_BACKENDS["en-us"].vocab))
+                    body = json.dumps({"vocab": vocab}).encode("utf-8")
+                except Exception as exc:            # an older kokoro-onnx, or no espeak data
+                    body = json.dumps({"error": str(exc)}).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
