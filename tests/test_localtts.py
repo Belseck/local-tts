@@ -15,7 +15,8 @@ import unittest.mock
 import wave
 from pathlib import Path
 
-from localtts import audio, audiofx, config, g2p_es, hooks, providers, skills, text as textutil
+from localtts import audio, audiofx, config, g2p, hooks, providers, skills, text as textutil
+from localtts.g2p import en as g2p_en, es as g2p_es
 from localtts.cli import _resolve_session, _synthesize, main
 from localtts.errors import TTSError
 from localtts.providers.base import Provider
@@ -2880,3 +2881,43 @@ class SpanishG2PTest(unittest.TestCase):
         imports = re.findall(r"^\s*(?:import|from)\s+([\w.]+)", source, re.MULTILINE)
         self.assertEqual([m for m in imports if m.split(".")[0] not in
                           sys.stdlib_module_names], [])
+
+
+class EnglishG2PTest(unittest.TestCase):
+    """English is not phonemic, and the split between rules and lexicon is the point.
+
+    Rules alone reach about a quarter of running text -- "through" and "thought" share
+    four letters and sound nothing alike, and no rule recovers "colonel". The frozen
+    lexicon carries those, and together they reach every word in the shipped corpus.
+    """
+
+    def test_rules_handle_the_regular_cases(self):
+        for word, expected in {"cat": "kˈæt", "ship": "ʃˈɪp", "king": "kˈɪŋ"}.items():
+            self.assertEqual(g2p_en.phonemes_for(word), expected, word)
+
+    def test_the_lexicon_carries_what_rules_cannot(self):
+        """These are the words the whole two-part design exists for."""
+        for word in ("colonel", "wednesday", "through", "island"):
+            said = g2p.phonemes_for(word, "en-us")
+            self.assertNotEqual(said, g2p_en.phonemes_for(word), word)
+            self.assertTrue(said, word)
+
+    def test_a_sentence_is_not_its_words_joined(self):
+        """"to" is tuː alone and tə in running speech."""
+        self.assertEqual(g2p.phonemes_for("to", "en-us"), "tuː")
+        self.assertIn("tə", g2p.phonemes("go to work", "en-us"))
+
+    def test_an_unknown_language_says_so(self):
+        """None, not a guess: a caller that gets a string sends it to the model as
+        phonemes, and a wrong transcription is worse than falling back to text."""
+        self.assertIsNone(g2p.phonemes("bonjour", "fr-fr"))
+        self.assertIsNone(g2p.phonemes_for("bonjour", "fr-fr"))
+
+    def test_both_languages_are_shipped(self):
+        self.assertIn("es", g2p.supported())
+        self.assertIn("en", g2p.supported())
+
+    def test_the_lexicon_is_data_not_code(self):
+        table = g2p.lexicon_for("en-us")
+        self.assertGreater(len(table), 100)
+        self.assertTrue(all(isinstance(v, str) and v for v in table.values()))

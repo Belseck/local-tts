@@ -326,7 +326,7 @@ def _demote(fon):
     return fon.replace("ˈ", "ˌ").replace("ɛ", "e")
 
 
-def phonemes(texto):
+def phonemes(text, lexicon=None):
     """Transcribe una phonemes entera, no palabra a palabra.
 
     La diferencia no es cosmetica. En una phonemes las palabras funcion pierden su acento
@@ -334,7 +334,8 @@ def phonemes(texto):
     vocal ("zorro veloz" -> sˈoro βelˈos). Un conversor que trabaje palabra por palabra
     acierta cada una y aun asi suena distinto, que es exactamente lo que pasaba.
     """
-    pieces = re.findall(r"[a-záéíóúüñA-ZÁÉÍÓÚÜÑ]+|[^a-záéíóúüñA-ZÁÉÍÓÚÜÑ]+", texto)
+    lexicon = lexicon or {}
+    pieces = re.findall(r"[a-záéíóúüñA-ZÁÉÍÓÚÜÑ]+|[^a-záéíóúüñA-ZÁÉÍÓÚÜÑ]+", text)
     out_words = []
     prev_phoneme = ""                       # ultimo fonema emitido, para el enlace
     for piece in pieces:
@@ -344,7 +345,7 @@ def phonemes(texto):
                 prev_phoneme = ""                       # la puntuacion corta el enlace
             continue
         lower = piece.lower()
-        fon = phonemes_for(piece)
+        fon = lexicon.get(lower) or phonemes_for(piece)
         if lower in UNSTRESSED_WORDS:
             fon = _unstress(fon)
         elif lower in DEMOTED_WORDS:
