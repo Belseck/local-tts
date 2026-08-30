@@ -3,6 +3,7 @@
 import http.server
 import json
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -14,7 +15,7 @@ import unittest.mock
 import wave
 from pathlib import Path
 
-from localtts import audio, audiofx, config, hooks, providers, skills, text as textutil
+from localtts import audio, audiofx, config, g2p_es, hooks, providers, skills, text as textutil
 from localtts.cli import _resolve_session, _synthesize, main
 from localtts.errors import TTSError
 from localtts.providers.base import Provider
@@ -2812,3 +2813,70 @@ class PhoneticsOnTheWireTest(unittest.TestCase):
 
         cfg["providers"]["rvc"]["base_provider"] = "piper"
         self.assertFalse(RvcProvider(cfg["providers"]["rvc"], cfg=cfg).supports_phonetics)
+
+
+class SpanishG2PTest(unittest.TestCase):
+    """Grapheme to phoneme in pure Python, checked against espeak's output.
+
+    The expected strings were produced by espeak (through kokoro-onnx's tokenizer) and
+    frozen here: the point of this module is to reproduce them *without* it, so the test
+    must not import it either -- a test that needs the dependency proves nothing about
+    code written to avoid it.
+    """
+
+    #: word -> what espeak says. One per rule, plus the cases each rule was written for.
+    WORDS = {
+        # seseo: es-419 has no θ
+        "zapato": "sapˈato", "cinco": "sˈinko", "cerveza": "seɾβˈesa",
+        # occlusive after a pause or nasal, fricative elsewhere
+        "bambú": "bambˈu", "sobre": "sˈoβɾe", "hidrógeno": "iðɾˈoxeno",
+        "admitir": "ˌadmitˈiɾ", "devuelvas": "deβwˈelβas",
+        # rising vs falling diphthongs
+        "cuando": "kwˈando", "treinta": "tɾˈeɪnta", "cualquier": "kwalkjˈeɾ",
+        "canción": "kansjˈon",
+        # hiatus: after a liquid cluster, after a dieresis, two strong vowels
+        "luego": "luˈeɣo", "gruesa": "ɡɾuˈesa", "cigüeña": "sˌiɣuˈeɲa",
+        "paella": "paˈejja", "día": "dˈia",
+        # the silent u of que/gui, which used to shift the stress
+        "químico": "kˈimiko", "aquella": "akˈejja", "guillermo": "ɡijjˈeɾmo",
+        # stress from spelling, and the secondary espeak adds when the primary is far in
+        "antes": "ˈantes", "cantidad": "kˌantiðˈad", "azulejos": "ˌasulˈexos",
+        "configuración": "kˌonfiɣˌuɾasjˈon",
+        # -mente is a compound: two primaries, and the base keeps its open e
+        "solamente": "sˈolamˈente", "lentamente": "lˈɛntamˈente",
+        "absolutamente": "ˌaβsolˈutamˈente",
+        # assorted single rules
+        "chaleco": "tʃalˈeko", "llegaron": "ʝeɣˈaɾon", "ingenieros": "ˌiŋxenjˈeɾos",
+        "convincentes": "kˌombinsˈɛntes", "captura": "kapːtˈuɾa",
+        "psicóloga": "sikˈoloɣa", "xochimilco": "sˌotʃimˈilko", "zinc": "sˈink",
+        "cuarenta": "kwaɾˈɛnta", "energía": "ˌeneɾxˈia", "valiosos": "baljˈosos",
+    }
+
+    #: Sentence-level behaviour, which word-by-word transcription cannot reach.
+    SENTENCES = {
+        "El zorro veloz salta sobre el perro perezoso.":
+            "el sˈoro βelˈos sˈalta sˌoβɾe el pˈero pˌeɾesˈoso.",
+        "La ingeniería aeroespacial exige cálculos precisos.":
+            "la ˌiŋxenjeɾˈia ˌaeɾˌoespasjˈal eksˈixe kˈalkulos pɾesˈisos.",
+    }
+
+    def test_every_word(self):
+        for word, expected in self.WORDS.items():
+            self.assertEqual(g2p_es.phonemes_for(word), expected, word)
+
+    def test_sentences_are_not_words_joined(self):
+        """Function words lose their stress, and a b/d/g relaxes across the boundary:
+        "zorro veloz" is βelˈos though "veloz" alone starts with an occlusive."""
+        for sentence, expected in self.SENTENCES.items():
+            self.assertEqual(g2p_es.phonemes(sentence).strip(), expected, sentence)
+
+    def test_a_word_alone_keeps_the_stress_it_loses_in_a_sentence(self):
+        self.assertEqual(g2p_es.phonemes_for("el"), "ˈel")
+        self.assertEqual(g2p_es.phonemes("el perro").strip(), "el pˈero")
+
+    def test_no_third_party_import(self):
+        """The whole point: this runs where local-tts runs, which is stdlib only."""
+        source = Path(g2p_es.__file__).read_text(encoding="utf-8")
+        imports = re.findall(r"^\s*(?:import|from)\s+([\w.]+)", source, re.MULTILINE)
+        self.assertEqual([m for m in imports if m.split(".")[0] not in
+                          sys.stdlib_module_names], [])
