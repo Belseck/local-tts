@@ -1191,7 +1191,7 @@ text itself, so it passes the table to a backend with its own phonemizer:
 `tts check` prints which, so read it back rather than promising:
 
 ```
-phonetics   : 2 /IPA/ entries -> kokoro, rvc; ignored by llamacpp, openai, piper, command
+phonetics   : 2 word(s) with /IPA/ in the table -> kokoro, rvc; ignored by llamacpp, openai, piper, command
 ```
 
 An ignored entry is not an error. If the user needs IPA and their backend cannot take
@@ -1202,12 +1202,55 @@ written down; a running process says nothing about whether it is this version of
 script. `/health` reports `{"ok": true, "phonetics": true}`, and a server copied from an
 earlier version answers with a plain `ok` -- so it reads as *ignored* rather than as
 working, and local-tts does not send it a table it would drop. If a user's entries show
-as ignored while their server is up, **re-copy the server script from this skill**: that
-is the upgrade path.
+as ignored while their server is up, their script predates this: `tts servers` says so,
+and `tts servers --refresh` rewrites it and stops the old process. That is the upgrade
+path -- no hand-copying, and the previous file is kept as `.bak`.
 
 **Where to get the IPA.** Wiktionary prints it for most words; `espeak-ng --ipa -q -v en
 "pull request"` prints it for anything. Use the transcription of the language the word
-comes *from* -- that is the entire point.
+comes *from* -- that is the entire point. To pick between candidates by ear, and to be
+told when a transcription asks for phonemes the model has no token for, use
+`tts pronounce` and the **local-tts-phonetics** skill rather than guessing.
+
+### Transcriptions nobody typed in: `phonetics_hooks`
+
+The dictionary is for words a person wrote down. When the answers are *generated* -- a
+lexicon, a team glossary, a real grapheme-to-phoneme transcriber -- they belong in a
+hook instead, because local-tts has no runtime dependencies and cannot grow a
+transcriber of its own.
+
+A hook is any executable named in `phonetics_hooks`. It gets one utterance's resolved
+table on stdin as JSON and prints the table to use:
+
+```bash
+tts config --set phonetics_hooks='["~/bin/lexicon.py"]'
+tts config --set phonetics_hook_timeout=5     # seconds, per hook
+```
+
+```python
+#!/usr/bin/env python3
+import json, sys
+call = json.load(sys.stdin)
+#  {"text": ..., "lang": "es", "provider": "kokoro", "phonetics": {word: ipa}}
+table = call["phonetics"]
+table["croissant"] = "k\u0281was\u0251\u0303"      # bare IPA, or /between slashes/
+print(json.dumps({"phonetics": table}))
+```
+
+What to tell a user setting one up:
+
+- They run **in order**, each seeing what the last returned, and may add, rewrite or
+  drop entries.
+- They **cannot change the text**. A hook can only change how a word is transcribed,
+  never what is said.
+- A non-zero exit, output that is not JSON, or a script slower than the timeout leaves
+  the table alone and prints one line to stderr. Speech that is slightly wrong beats
+  speech that does not happen.
+- A `.py` without `chmod +x` is run with the current interpreter rather than refused.
+- It is the user's own program running with the user's privileges -- the same trust as
+  `server_start`. Say so when you set one up for them.
+- Unrelated to `tts hooks`, which is the status-bar hook. Do not conflate them in what
+  you tell the user.
 
 
 ## Pronunciation dictionary
@@ -1316,6 +1359,8 @@ never have to guess whether something is configurable.
 | `pronunciations` | `{}` | word → respelling, or `/IPA/` for phonetics; `<lang>:<word>` scopes it |
 | `terminal_title` | `true` | speaker icon in the terminal tab while playing |
 | `stream` | `true` | play each fragment as it is synthesized |
+| `phonetics_hooks` | `[]` | executables that shape the `/IPA/` table per utterance (see above) |
+| `phonetics_hook_timeout` | `5` | seconds one hook may take before the call goes on without it |
 | `languages` | `{}` | the language memory — see `tts languages` |
 
 **kokoro** (the default backend)

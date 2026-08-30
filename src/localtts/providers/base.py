@@ -193,6 +193,20 @@ class Provider:
     # venv (the same pattern as its subprocess CLI wrapper) -- but any provider can reuse
     # this client-side plumbing to reach one and auto-start it if it isn't already up.
 
+    def phonetics_table(self, text):
+        """The `/IPA/` entries this call should carry, after the user's hooks.
+
+        Resolved here rather than in each provider so a backend that accepts phonemes
+        gets the same table, and so hooks run once per request no matter who asks. Hooks
+        run even when the dictionary is empty: adding a transcription for a word nobody
+        wrote down is the interesting half of what they are for.
+        """
+        from localtts import phonetics, text as textutil
+        table = textutil.phonetic_entries((self.cfg or {}).get("pronunciations") or {},
+                                          self.lang)
+        return phonetics.run_hooks(table, text=text, lang=self.lang, provider=self.name,
+                                   cfg=self.cfg or {})
+
     def server_alive(self, url, health_path="/health"):
         try:
             with urllib.request.urlopen(url.rstrip("/") + health_path, timeout=2) as response:

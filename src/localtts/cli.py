@@ -522,7 +522,10 @@ def _phonetics_status(cfg):
     # cannot resolve which, and reporting "2" would match no call that ever runs.
     phonetic = {str(key).partition(":")[2].strip().lower() or str(key).strip().lower()
                 for key, value in entries.items() if textutil.is_phonetic(value)}
-    if not phonetic:
+    # A hook can add a transcription for a word nobody wrote down, so an empty table is
+    # not the same as nothing to report once one is configured.
+    hooks = cfg.get("phonetics_hooks") or []
+    if not phonetic and not hooks:
         return "no /IPA/ entries in `pronunciations` (plain respellings work everywhere)"
 
     able, unable = [], []
@@ -532,15 +535,23 @@ def _phonetics_status(cfg):
         except Exception:
             continue
         (able if getattr(instance, "supports_phonetics", False) else unable).append(name)
+
+    plural = "" if len(hooks) == 1 else "s"
+    if phonetic and hooks:
+        source = "%d word(s) with /IPA/ in the table, plus %d hook%s" % (
+            len(phonetic), len(hooks), plural)
+    elif hooks:
+        source = "nothing written down, but %d phonetics hook%s can add entries" % (
+            len(hooks), plural)
+    else:
+        source = "%d word(s) with /IPA/ in the table" % len(phonetic)
+
     if not able:
-        return ("%d word(s) with /IPA/ in the table, but no backend here accepts "
-                "phonemes right now -- "
-                "they are ignored. kokoro's persistent server is the one that can; if "
-                "it is configured, check it is running and its script is current."
-                % len(phonetic))
-    return "%d word(s) with /IPA/ in the table -> %s%s" % (
-        len(phonetic), ", ".join(able),
-        "; ignored by %s" % ", ".join(unable) if unable else "")
+        return ("%s, but no backend here accepts phonemes right now -- they are ignored. "
+                "kokoro's persistent server is the one that can; if it is configured, "
+                "check it is running and its script is current." % source)
+    return "%s -> %s%s" % (source, ", ".join(able),
+                           "; ignored by %s" % ", ".join(unable) if unable else "")
 
 def _tone_shaping_status():
     """Whether a <tag>'s speed change goes through ffmpeg or the built-in fallback.

@@ -1199,6 +1199,50 @@ every language, and `<lang>:<word>` applies to that one only — so a word said 
 in two languages needs no nested structure. Tone-tag markup is left untouched: an entry
 for `happy` will not rewrite `<happy>`.
 
+### Phonetics hooks — transcriptions nobody wrote down
+
+The dictionary is the right place for a handful of names and borrowed terms someone typed
+in by hand, and the wrong place for anything *generated*: a lexicon, a team's glossary, a
+real grapheme-to-phoneme transcriber. Those want to run at synthesis time, and they want to
+be somebody else's code — this package has no runtime dependencies and is not going to grow
+a transcriber of its own.
+
+So a hook is any executable you name. It receives the resolved table for one utterance on
+stdin as JSON and prints the table to use:
+
+```bash
+tts config --set phonetics_hooks='["~/bin/lexicon.py"]'
+tts config --set phonetics_hook_timeout=5
+```
+
+```python
+#!/usr/bin/env python3
+import json, sys
+call = json.load(sys.stdin)
+#   {"text": "ya subí el pull request", "lang": "es", "provider": "kokoro",
+#    "phonetics": {"pull request": "pˈʊl ɹᵻkwˈɛst"}}
+table = call["phonetics"]
+for word in ("croissant", "déjà vu"):
+    if word in call["text"].lower():
+        table[word] = my_lexicon[word]          # bare IPA, or /between slashes/
+print(json.dumps({"phonetics": table}))
+```
+
+Hooks run in the order listed, each seeing what the previous one returned, and may add,
+rewrite or drop entries. They **cannot change the text** — a misbehaving hook can never
+alter *what* gets said, only how a word in it is transcribed, and words it does not name
+come out exactly as they would with no hook at all.
+
+Everything that can go wrong — a non-zero exit, output that is not JSON, a script that
+hangs past `phonetics_hook_timeout` — leaves the table as the previous hook left it and
+prints one line to stderr. Speech that is slightly wrong beats speech that does not happen.
+A `.py` without the executable bit is run with the current interpreter rather than
+refused. `tts check`'s `phonetics` line counts the hooks it will run.
+
+Two things worth being clear about: a hook is a program **you** name in **your** config, so
+it runs with your privileges — the same trust you extend to `server_start`. And it is
+unrelated to [`tts hooks`](#status-bar-hook), which installs the status-bar hook.
+
 ### Delivery: pacing and pauses
 
 How each language is delivered, on top of whatever a tone tag asks for:

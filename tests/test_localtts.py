@@ -2912,3 +2912,130 @@ class ServerScriptTest(unittest.TestCase):
             self.assertEqual(main(["servers"]), 0)
         self.assertIn("STALE", captured.getvalue())
         self.assertIn("--refresh", captured.getvalue())
+
+
+class PhoneticsHookTest(unittest.TestCase):
+    """Scripts named in `phonetics_hooks` shape the /IPA/ table for one utterance.
+
+    The dictionary is for words a person wrote down; a hook is for the ones generated --
+    a lexicon, a house glossary, a real transcriber -- which is work this package has no
+    dependency to do itself.
+    """
+
+    ENTRIES = {"pull request": "/p\u02c8\u028al \u0279\u1d7bkw\u02c8\u025bst/",
+               "kubectl": "kube control"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        from localtts import phonetics
+        phonetics._REPORTED.clear()          # warnings are once-per-process by design
+
+    def hook(self, body, name="hook.py", executable=True):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("#!/usr/bin/env python3\nimport json, sys\n"
+                         "payload = json.load(sys.stdin)\n" + body)
+        if executable:
+            os.chmod(path, 0o755)
+        return path
+
+    def cfg(self, *scripts, **kwargs):
+        cfg = {"pronunciations": dict(self.ENTRIES), "phonetics_hooks": list(scripts)}
+        cfg.update(kwargs)
+        return cfg
+
+    def run_hooks(self, cfg, table=None, text="ya subi el pull request", lang="es"):
+        from localtts import phonetics
+        if table is None:
+            table = textutil.phonetic_entries(cfg.get("pronunciations") or {}, lang)
+        return phonetics.run_hooks(table, text=text, lang=lang, provider="kokoro", cfg=cfg)
+
+    def test_a_hook_can_add_a_word_nobody_wrote_down(self):
+        script = self.hook("payload['phonetics']['croissant'] = 'k\u0281wasa'\n"
+                           "print(json.dumps({'phonetics': payload['phonetics']}))\n")
+        table = self.run_hooks(self.cfg(script))
+        self.assertEqual(table["croissant"], "k\u0281wasa")
+        self.assertIn("pull request", table)          # and leaves the rest alone
+
+    def test_a_hook_runs_even_with_an_empty_dictionary(self):
+        """The interesting half: transcribing words no one has written down."""
+        script = self.hook("print(json.dumps({'phonetics': {'croissant': 'k\u0281wasa'}}))\n")
+        cfg = {"pronunciations": {}, "phonetics_hooks": [script]}
+        self.assertEqual(self.run_hooks(cfg), {"croissant": "k\u0281wasa"})
+
+    def test_a_hook_sees_the_text_language_and_provider(self):
+        script = self.hook("print(json.dumps({'phonetics': {'seen': '%s|%s|%s' % ("
+                           "payload['text'], payload['lang'], payload['provider'])}}))\n")
+        table = self.run_hooks(self.cfg(script), text="hola", lang="es")
+        self.assertEqual(table["seen"], "hola|es|kokoro")
+
+    def test_hooks_run_in_order_each_seeing_the_last_one(self):
+        first = self.hook("payload['phonetics']['w'] = 'one'\n"
+                          "print(json.dumps({'phonetics': payload['phonetics']}))\n",
+                          name="first.py")
+        second = self.hook("t = payload['phonetics']\n"
+                           "t['w'] = t['w'] + '-two'\n"
+                           "print(json.dumps({'phonetics': t}))\n", name="second.py")
+        self.assertEqual(self.run_hooks(self.cfg(first, second))["w"], "one-two")
+
+    def test_a_hook_may_drop_entries(self):
+        script = self.hook("print(json.dumps({'phonetics': {}}))\n")
+        self.assertEqual(self.run_hooks(self.cfg(script)), {})
+
+    def test_slashes_and_capitals_from_a_hook_are_normalized(self):
+        """A script author writes /IPA/ the way the dictionary does, and cases a word
+        however it appeared in their source -- both have to land where lookups look."""
+        script = self.hook("print(json.dumps({'phonetics': {'Croissant': '/k\u0281wasa/'}}))\n")
+        self.assertEqual(self.run_hooks(self.cfg(script)), {"croissant": "k\u0281wasa"})
+
+    def test_a_failing_hook_leaves_the_table_alone(self):
+        script = self.hook("sys.stderr.write('no lexicon here\\n')\nsys.exit(3)\n")
+        table = self.run_hooks(self.cfg(script))
+        self.assertEqual(table, textutil.phonetic_entries(self.ENTRIES, "es"))
+
+    def test_output_that_is_not_json_is_ignored(self):
+        script = self.hook("print('croissant = krwasa')\n")
+        self.assertIn("pull request", self.run_hooks(self.cfg(script)))
+
+    def test_output_without_a_phonetics_object_is_ignored(self):
+        script = self.hook("print(json.dumps({'words': {'croissant': 'k'}}))\n")
+        self.assertIn("pull request", self.run_hooks(self.cfg(script)))
+
+    def test_a_hook_that_hangs_does_not_hang_the_speech(self):
+        script = self.hook("import time\ntime.sleep(30)\n")
+        cfg = self.cfg(script, phonetics_hook_timeout=0.3)
+        started = time.time()
+        table = self.run_hooks(cfg)
+        self.assertLess(time.time() - started, 10)
+        self.assertIn("pull request", table)
+
+    def test_a_python_hook_without_the_executable_bit_still_runs(self):
+        """The overwhelmingly common way to get this wrong; "permission denied" for a
+        file the user just wrote is a worse answer than simply running it."""
+        script = self.hook("print(json.dumps({'phonetics': {'x': 'eks'}}))\n",
+                           name="plain.py", executable=False)
+        self.assertEqual(self.run_hooks(self.cfg(script)), {"x": "eks"})
+
+    def test_a_hook_that_is_not_there_is_reported_not_raised(self):
+        table = self.run_hooks(self.cfg(os.path.join(self.tmp.name, "nope.sh")))
+        self.assertIn("pull request", table)
+
+    def test_the_hooks_output_is_what_reaches_the_server(self):
+        """The half that makes the feature real: a hook that changes nothing on the wire
+        is a hook that does nothing."""
+        script = self.hook("print(json.dumps({'phonetics': {'croissant': 'k\u0281wasa'}}))\n")
+        server = _FakeAudioServer("/synthesize", audio_bytes=b"audio",
+                                  capabilities={"ok": True, "phonetics": True})
+        self.addCleanup(server.stop)
+        cfg = {"pronunciations": dict(self.ENTRIES), "phonetics_hooks": [script],
+               "providers": {"kokoro": dict(config.DEFAULTS["providers"]["kokoro"],
+                                            server_url=server.url)}}
+        provider = KokoroProvider(cfg["providers"]["kokoro"], cfg=cfg, lang="es")
+        with tempfile.TemporaryDirectory() as tmp:
+            provider.synthesize("un croissant", os.path.join(tmp, "out.wav"))
+        self.assertEqual(server.requests[0]["phonetics"], {"croissant": "k\u0281wasa"})
+
+    def test_no_hooks_configured_changes_nothing(self):
+        table = self.run_hooks({"pronunciations": dict(self.ENTRIES)})
+        self.assertEqual(table, textutil.phonetic_entries(self.ENTRIES, "es"))
