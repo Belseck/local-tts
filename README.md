@@ -91,6 +91,7 @@ See [Providers → `rvc`](#rvc--voice-conversion-not-installed-automatically) fo
 - [Audio playback](#audio-playback)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
+- [Thanks](#thanks)
 
 ---
 
@@ -1339,6 +1340,17 @@ and `check()`, register it in `providers/__init__.py`, and add its defaults to
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request — in particular the
 no-runtime-dependencies rule, which is not negotiable.
+
+## Thanks
+
+- **[@Belseck](https://github.com/Belseck)** — *phonetics in the pronunciation dictionary*
+  ([#2](https://github.com/rperez93/local-tts/pull/2)). A `/IPA/` value in `pronunciations`
+  now travels to kokoro's server as phonemes, so a borrowed word keeps its own sound inside
+  a sentence in another language — *"ya subí el pull request"* — said by the same voice,
+  with no fragment boundary. It replaced the old `<en>…</en>` language spans, which cut the
+  line up and handed the pieces to a second voice. The server is asked whether it
+  understands phonemes rather than assumed to, so an older copy of the script is never
+  silently sent a table it would drop.
 
 ## License
 
