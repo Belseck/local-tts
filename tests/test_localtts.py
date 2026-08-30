@@ -2728,14 +2728,17 @@ class PhoneticDictionaryTest(unittest.TestCase):
         self.assertNotIn("jarvis", spanish)          # scoped to en
         self.assertIn("jarvis", textutil.phonetic_entries(self.ENTRIES, "en"))
 
-    def test_kokoro_declares_phonetics_only_with_a_server(self):
+    def test_kokoro_without_a_server_cannot_take_phonemes(self):
         """The per-call CLI wrapper takes text and has nowhere to put a transcription;
-        the phonemizer lives in the persistent server."""
+        the phonemizer lives in the persistent server.
+
+        Only the no-server half belongs here, because it needs no boundary: with a
+        `server_url` set, `supports_phonetics` really connects, and asserting it here
+        would pass or fail on whatever happens to be listening on the developer's
+        machine. PhoneticsOnTheWireTest covers the served halves against a fake server.
+        """
         plain = KokoroProvider(dict(config.DEFAULTS["providers"]["kokoro"]))
         self.assertFalse(plain.supports_phonetics)
-        served = KokoroProvider(dict(config.DEFAULTS["providers"]["kokoro"],
-                                     server_url="http://127.0.0.1:8765"))
-        self.assertTrue(served.supports_phonetics)
 
     def test_a_backend_without_a_phonemizer_says_so(self):
         self.assertFalse(PiperProvider(dict(config.DEFAULTS["providers"]["piper"])).supports_phonetics)

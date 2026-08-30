@@ -515,7 +515,11 @@ def _phonetics_status(cfg):
     table and drop it.
     """
     entries = cfg.get("pronunciations") or {}
-    phonetic = [key for key, value in entries.items() if textutil.is_phonetic(value)]
+    # Distinct words, not table keys: "pull request" and "es:pull request" are one word
+    # said two ways, and no single call ever sees both -- `check` has no --lang, so it
+    # cannot resolve which, and reporting "2" would match no call that ever runs.
+    phonetic = {str(key).partition(":")[2].strip().lower() or str(key).strip().lower()
+                for key, value in entries.items() if textutil.is_phonetic(value)}
     if not phonetic:
         return "no /IPA/ entries in `pronunciations` (plain respellings work everywhere)"
 
@@ -527,11 +531,12 @@ def _phonetics_status(cfg):
             continue
         (able if getattr(instance, "supports_phonetics", False) else unable).append(name)
     if not able:
-        return ("%d /IPA/ entries, but no backend here accepts phonemes right now -- "
+        return ("%d word(s) with /IPA/ in the table, but no backend here accepts "
+                "phonemes right now -- "
                 "they are ignored. kokoro's persistent server is the one that can; if "
                 "it is configured, check it is running and its script is current."
                 % len(phonetic))
-    return "%d /IPA/ entries -> %s%s" % (
+    return "%d word(s) with /IPA/ in the table -> %s%s" % (
         len(phonetic), ", ".join(able),
         "; ignored by %s" % ", ".join(unable) if unable else "")
 

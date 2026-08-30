@@ -43,6 +43,9 @@ class KokoroProvider(Provider):
     realizes_speed = True    # -s is real; volume is applied to the rendered
     realizes_volume = False  # segment in synthesize(), since nothing else will
 
+    #: Cached answer from the server's own health endpoint. None means "not asked yet".
+    _phonetics_claim = None
+
     @property
     def supports_phonetics(self):
         """Only through the persistent server, which is where the phonemizer lives --
@@ -57,8 +60,14 @@ class KokoroProvider(Provider):
         url = self.settings.get("server_url")
         if not url:
             return False
-        claimed = self.server_capabilities(url)
-        return bool(claimed and claimed.get("phonetics"))
+        # Asked once per instance. The answer cannot change mid-utterance, and this is
+        # read once per fragment while building the payload -- an uncached round trip
+        # there would put a call that blocks for up to 2s on the hot path of the very
+        # feature that exists to remove per-call overhead.
+        if self._phonetics_claim is None:
+            claimed = self.server_capabilities(url)
+            self._phonetics_claim = bool(claimed and claimed.get("phonetics"))
+        return self._phonetics_claim
 
     def _model_dir(self):
         model_dir = os.path.expanduser(self.settings.get("model_dir") or "")
