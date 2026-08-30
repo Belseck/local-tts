@@ -22,6 +22,8 @@ transcribe this" rather than as a bad transcription.
 import json
 import os
 
+from localtts.g2p import backend
+
 #: Rule modules, by the base of the language tag.
 _RULES = {}
 
@@ -79,7 +81,8 @@ def supported():
             found.add(name[:-5].split("_")[0])
     here = os.path.dirname(os.path.abspath(__file__))
     for name in os.listdir(here):
-        if name.endswith(".py") and not name.startswith("_"):
+        # backend.py is the optional phonemizer, not a language.
+        if name.endswith(".py") and not name.startswith("_") and name != "backend.py":
             found.add(name[:-3])
     return sorted(found)
 
@@ -87,10 +90,18 @@ def supported():
 def phonemes(text, lang):
     """IPA for `text`, or None when this language cannot be transcribed here.
 
+    A real phonemizer wins when the install has one: it is what the model was trained
+    against, it covers every language espeak knows, and it does not need a rule module
+    written for each. The rules are the fallback, which is what upstream always uses --
+    they exist because local-tts itself may not depend on anything.
+
     None rather than a guess: a caller that gets a string will send it to the model as
     phonemes, and a wrong transcription is worse than falling back to the text, which
     the backend's own phonemizer can still handle.
     """
+    said = backend.phonemes(text, lang)
+    if said is not None:
+        return said
     module = _rules_for(lang)
     if module is None:
         return None
@@ -98,10 +109,23 @@ def phonemes(text, lang):
 
 
 def phonemes_for(word, lang):
-    """IPA for a single word, or None. The lexicon wins over the rules."""
+    """IPA for a single word, or None.
+
+    Order: a real phonemizer, then the frozen lexicon, then the rules. The lexicon sits
+    below the library on purpose -- it was frozen *from* that library, so where both
+    have an answer they agree, and where they differ the library is the newer one.
+    """
+    said = backend.phonemes(word, lang)
+    if said is not None:
+        return said
     table = lexicon_for(lang)
     hit = table.get(word.strip().lower())
     if hit:
         return hit
     module = _rules_for(lang)
     return module.phonemes_for(word) if module else None
+
+
+def using_library():
+    """Whether a real phonemizer is doing the work, for `tts check` to report."""
+    return backend.available()

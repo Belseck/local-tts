@@ -2909,9 +2909,15 @@ class EnglishG2PTest(unittest.TestCase):
 
     def test_an_unknown_language_says_so(self):
         """None, not a guess: a caller that gets a string sends it to the model as
-        phonemes, and a wrong transcription is worse than falling back to text."""
-        self.assertIsNone(g2p.phonemes("bonjour", "fr-fr"))
-        self.assertIsNone(g2p.phonemes_for("bonjour", "fr-fr"))
+        phonemes, and a wrong transcription is worse than falling back to text.
+
+        With the library absent, which is upstream's state and the one this asserts --
+        installed, espeak knows French perfectly well and the answer is a string. The
+        rules are what has gaps, so the rules are what this pins.
+        """
+        with unittest.mock.patch.object(g2p.backend, "available", return_value=False):
+            self.assertIsNone(g2p.phonemes("bonjour", "fr-fr"))
+            self.assertIsNone(g2p.phonemes_for("bonjour", "fr-fr"))
 
     def test_both_languages_are_shipped(self):
         self.assertIn("es", g2p.supported())
@@ -2921,3 +2927,35 @@ class EnglishG2PTest(unittest.TestCase):
         table = g2p.lexicon_for("en-us")
         self.assertGreater(len(table), 100)
         self.assertTrue(all(isinstance(v, str) and v for v in table.values()))
+
+
+class PhonemizerBackendTest(unittest.TestCase):
+    """The optional extra. These must pass whether or not it is installed: upstream has
+    no dependencies, and a test that needs one would fail there for the wrong reason."""
+
+    def test_the_rules_still_answer_when_the_library_is_absent(self):
+        with unittest.mock.patch.object(g2p.backend, "available", return_value=False):
+            self.assertEqual(g2p.phonemes_for("zapato", "es-419"), "sapˈato")
+
+    def test_an_unknown_language_is_none_without_the_library(self):
+        with unittest.mock.patch.object(g2p.backend, "available", return_value=False):
+            self.assertIsNone(g2p.phonemes("bonjour", "fr-fr"))
+
+    def test_the_library_wins_when_present(self):
+        """It is what the model was trained against; the rules exist because upstream
+        cannot depend on it, not because they are better."""
+        with unittest.mock.patch.object(g2p.backend, "phonemes",
+                                        return_value="from-the-library"):
+            self.assertEqual(g2p.phonemes("zapato", "es-419"), "from-the-library")
+            self.assertEqual(g2p.phonemes_for("zapato", "es-419"), "from-the-library")
+
+    def test_the_library_covers_languages_no_rules_exist_for(self):
+        with unittest.mock.patch.object(g2p.backend, "phonemes", return_value="bɔ̃ʒˈuʁ"):
+            self.assertEqual(g2p.phonemes("bonjour", "fr-fr"), "bɔ̃ʒˈuʁ")
+
+    def test_a_failing_library_falls_back_rather_than_raising(self):
+        """A phonemizer that throws must not take synthesis down with it."""
+        with unittest.mock.patch.object(g2p.backend, "available", return_value=True), \
+             unittest.mock.patch.object(g2p.backend, "_backend",
+                                        side_effect=RuntimeError("espeak exploded")):
+            self.assertIsNone(g2p.backend.phonemes("hola", "es-419"))
