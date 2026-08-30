@@ -130,15 +130,39 @@ def phonemes_for(palabra):
     # Una a/e/o inicial de palabra ante otra fuerte cuenta como silaba suelta para la
     # secondary: "absolutamente" no la lleva porque su primary queda cerca.
     secondary = 0 if (primary is not None and primary + extra >= 2) else None
+    #: A verb with enclitic pronouns carries a secondary on them, because the clitics
+    #: add syllables the verb's own stress does not reach: "traemelo" -> tɾˈaemˌelo.
+    enclitic = re.search(r"(?:me|te|se|lo|la|le|nos|os|los|las|les)"
+                         r"(?:me|te|se|lo|la|le|nos|los|las|les)$", p)
     #: A second secondary mid-word when the word is very long and the primary sits far
     #: away: "configuracion" -> kˌonfiɣˌuɾasjˈon.
     secondary2 = 2 if (primary is not None and primary >= 4) else None
+    # A hiatus after an accented strong vowel adds a syllable the nucleus count cannot
+    # see, and in a word long enough the extra beat takes a secondary two nuclei on:
+    # "clausulas" -> klˈausˌulas.
+    if (primary is not None and secondary2 is None
+            and re.search(r"[áéíóú][iu]", p)
+            and len(set(_nucleus_map(p).values())) + extra >= 4):
+        secondary2 = primary + 1
+    if enclitic and primary is not None:
+        nmap_all = _nucleus_map(p)
+        # the nucleus the enclitic run starts on
+        starts = [n for i, n in nmap_all.items() if i >= enclitic.start()]
+        # Only when the clitics fall far enough from the primary to need their own
+        # beat: "traemelo" is tɾˈaemˌelo (two nuclei away), while "dimelo" stays
+        # dˈimelo and "devolvermelo" dˌeβolβˈeɾmelo, both only one away.
+        if starts and min(starts) - primary >= 2:
+            secondary2 = min(starts)
     # "-mente" is a compound: the adjective keeps its stress and the suffix brings
     # another, so espeak marks two primaries ("sˈolamˈente").
     mente_compound = p.endswith("mente") and len(set(_nucleus_map(p).values())) >= 3
     mente_base = None
     if mente_compound:
-        secondary2 = None
+        # The suffix's own primary sits at the end, so it cannot decide this. The
+        # adjective's does: "extraordinariamente" earns a mid-word secondary because
+        # "extraordinaria" is long enough, "absolutamente" does not.
+        base_stress = _stress_index(p[:-5])
+        secondary2 = 2 if (base_stress is not None and base_stress >= 4) else None
         # "absolutamente" does carry one (four-syllable base), "solamente" does not.
         base_len = len(set(_nucleus_map(p[:-5]).values()))
         # The adjective keeps its own stress and the suffix brings its own.
@@ -216,13 +240,14 @@ def phonemes_for(palabra):
                 else:
                     out.append("j" if base0 == "i" else "w")
             else:
-                # /e/ opens to ɛ in a syllable closed by a nasal: "cuarenta" ->
-                # kwaɾˈɛnta
+                # /e/ opens to ɛ before n plus a consonant: "cuarenta" -> kwaɾˈɛnta,
+                # "siento" sjˈɛnto. Not before m: "siempre" is sjˈempɾe and "tiempo"
+                # tjˈempo, with the vowel closed.
                 stressed_here = out and out[-1] == "ˈ"
                 # The e of "-mente" never opens; the base's does ("lentamente").
                 in_mente_suffix = mente_compound and i >= len(p) - 5
                 if (base0 == "e" and stressed_here and not in_mente_suffix
-                        and nxt and nxt in "nm"
+                        and nxt == "n"
                         and i + 2 < len(p) and p[i+2] not in VOWELS):
                     out.append("ɛ")
                 else:
@@ -277,7 +302,10 @@ def phonemes_for(palabra):
                 out.append("r"); i += 1
             else:
                 out.append("ɾ"); i += 1
-        elif c == "n" and nxt and nxt in "ɡgkqx":
+        elif c == "n" and nxt and nxt in "ɡgjx":
+            # Velar before g or j, whichever sound the g ends up making: "tengo" is
+            # tˈɛŋɡo, "angel" aŋxˈel, "ingenieros" ˌiŋxenjˈeɾos. Not before c/k/q --
+            # "cinco" stays sˈinko and "nunca" nˈunka.
             out.append("ŋ"); i += 1
         elif c == "n" and nxt and nxt in "bvpm":
             # A nasal takes the place of articulation of what follows: "convincentes"
@@ -304,16 +332,17 @@ UNSTRESSED_WORDS = {
     "el", "la", "los", "las", "lo",
     "de", "del", "a", "al", "en", "con", "por", "y", "e", "o", "u",
     "que", "se", "me", "te", "le", "les", "nos", "su", "sus", "mi", "mis", "tu", "tus",
+    "sin", "si",
 }
 
-#: Estas bajan a secondary en vez de perderlo del todo.
+#: These drop to a secondary instead of losing the stress outright.
 DEMOTED_WORDS = {"sobre", "entre", "hasta", "desde", "hacia", "segun", "según", "ante",
                "mientras", "porque", "cuando", "como", "donde", "aunque", "pero",
-               "no", "si", "para", "sin",
-               # posesivos tonicos y relativos: se apoyan en el nucleus que introducen
+               "para", "cuanto", "cuanta", "cuantos", "cuantas",
+               # stressed possessives and relatives: they lean on the noun they open
                "nuestro", "nuestra", "nuestros", "nuestras",
                "vuestro", "vuestra", "vuestros", "vuestras",
-               "quien", "quienes", "cual", "cuales", "cuyo", "cuya"}
+               "quien", "quienes", "cual", "cuales"}
 
 
 def _unstress(fon):
@@ -335,6 +364,9 @@ def phonemes(text, lexicon=None):
     acierta cada una y aun asi suena distinto, que es exactamente lo que pasaba.
     """
     lexicon = lexicon or {}
+    # The reference drops the opening marks: they tell a reader what is coming, and the
+    # phonemes carry that in the intonation instead.
+    text = text.replace("¿", "").replace("¡", "")
     pieces = re.findall(r"[a-záéíóúüñA-ZÁÉÍÓÚÜÑ]+|[^a-záéíóúüñA-ZÁÉÍÓÚÜÑ]+", text)
     out_words = []
     prev_phoneme = ""                       # ultimo fonema emitido, para el enlace
@@ -356,6 +388,14 @@ def phonemes(text, lexicon=None):
             fon = {"b": "β", "d": "ð", "ɡ": "ɣ"}[fon[0]] + fon[1:]
         # ...y la nasal word_final toma el punto de la consonante siguiente:
         # "reunion porque" -> reʊnjˈom pˌoɾke.
+        # Only before g or the jota, the same limit as inside a word: "sin gas" is
+        # siŋ ɡˈas, but "un castillo" keeps ˈun and "van con" keeps βˈan.
+        if fon[:1] in "ɡɣx":
+            for k in range(len(out_words) - 1, -1, -1):
+                if out_words[k].strip():
+                    if out_words[k].endswith("n"):
+                        out_words[k] = out_words[k][:-1] + "ŋ"
+                    break
         if fon[:1] in "bpβ":
             for k in range(len(out_words) - 1, -1, -1):
                 if out_words[k].strip():
