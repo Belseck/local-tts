@@ -309,6 +309,11 @@ _BREATH_LOWPASS = 3000.0
 #: Peak the whisper is allowed to reach, just under full scale.
 _CEILING = 32000.0
 
+#: Below this fraction of the loudest frame, a frame is a pause and is left silent.
+#: Fitting an all-pole filter to room tone and exciting it produces a confident,
+#: articulate noise that has nothing to do with the words.
+_BREATH_GATE = 0.02
+
 #: How many poles model the vocal tract. Enough for the three or four formants that
 #: distinguish vowels; more would start fitting the pitch, which is the thing being
 #: thrown away.
@@ -392,6 +397,12 @@ def apply_breath(path, amount):
     hop = frame // 2
     window = [0.5 - 0.5 * math.cos(2.0 * math.pi * i / frame) for i in range(frame)]
 
+    loudest_frame = 0.0
+    for start in range(0, count - frame + 1, hop):
+        loudest_frame = max(loudest_frame,
+                            math.sqrt(sum(v * v for v in mono[start:start + frame]) / frame))
+    gate = loudest_frame * _BREATH_GATE
+
     rand = random.Random(0)                       # same text, same whisper
     noise = [rand.random() * 2.0 - 1.0 for _ in range(count)]
     for _ in range(_BREATH_TILT_STAGES):
@@ -419,7 +430,6 @@ def apply_breath(path, amount):
 
     whispered = [0.0] * count
     weight = [0.0] * count
-    history = [0.0] * _BREATH_ORDER
 
     for start in range(0, count - frame + 1, hop):
         segment = [mono[start + i] * window[i] for i in range(frame)]
@@ -427,9 +437,19 @@ def apply_breath(path, amount):
                     for lag in range(_BREATH_ORDER + 1)]
         if autocorr[0] <= 0.0:
             continue
+        loudness = math.sqrt(autocorr[0] / frame)
+        if loudness < gate:
+            continue                              # a pause stays a pause
         autocorr[0] *= 1.0001                     # a ridge, so near-silence stays solvable
         coeffs = _levinson(autocorr, _BREATH_ORDER)
-
+        # The filter starts each frame from rest. Carrying its state across frames sounds
+        # like the right thing and is not: a sharp fit rings into the frames after it,
+        # whose own gain then divides that ringing out and takes the speech with it. It
+        # scrambled the envelope so thoroughly that the whisper's loudness correlated
+        # with the sentence's at 0.07 -- audibly, noise that had nothing to do with the
+        # words. What continuity is actually needed comes from the overlap-add, whose
+        # window is zero at exactly these edges.
+        history = [0.0] * _BREATH_ORDER
         excited = []
         for offset in range(frame):
             value = noise[start + offset]
@@ -438,11 +458,10 @@ def apply_breath(path, amount):
             history = [value] + history[:-1]
             excited.append(value)
 
-        loudness = math.sqrt(sum(v * v for v in segment) / frame)
         synthetic = math.sqrt(sum(v * v for v in excited) / frame)
         if synthetic <= 0.0:
             continue
-        gain = loudness / synthetic
+        gain = math.sqrt(sum(v * v for v in segment) / frame) / synthetic
         for i in range(frame):
             whispered[start + i] += excited[i] * gain * window[i]
             weight[start + i] += window[i] * window[i]
