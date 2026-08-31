@@ -76,3 +76,7 @@ Thumbs.db
 *.mp3
 *.flac
 *.opus
+
+# Downloaded model weights. Hundreds of megabytes, fetched rather than authored,
+# and several single files are past what GitHub will accept at all.
+models/
