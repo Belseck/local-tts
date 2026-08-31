@@ -132,8 +132,16 @@ If the borrowed words still sound Spanish, check in this order:
    backends accept IPA and which ignore it. Only a backend with a phonemizer can --
    kokoro with `server_url`, and rvc over a kokoro base. If theirs cannot, the fix is
    the persistent server (see `local-tts-configure`), not another entry.
-3. **Is the transcription right?** `espeak-ng --ipa -q -v en "pull request"` prints what
-   the word should be. Use the language the word comes *from*.
+3. **Is the transcription right?** `tts pronounce "pull request" --lang es --ipa "/…/"`
+   plays it as it is said now and as the candidate would say it, and names any phoneme
+   the model has no token for -- one that is dropped in silence otherwise, leaving the
+   word mangled rather than merely wrong. `espeak-ng --ipa -q -v en "pull request"` is a
+   starting point when no dictionary has the word. Use the language the word comes
+   *from*.
+
+If the problem is **one word** rather than how everything sounds, that whole loop --
+looking the transcription up, hearing it, keeping it -- is the `local-tts-phonetics`
+skill; hand it over rather than working through it here.
 
 A sound the model was never trained on comes out as the nearest one it has -- that is a
 limit of the voice, not of the entry, and no dictionary change fixes it.

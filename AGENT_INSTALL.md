@@ -37,8 +37,10 @@ answered:
 | If they said… | Treat as answered |
 | --- | --- |
 | "with the link", "make it global", "on my PATH" | Step 5 (symlink) = **yes** |
-| "with piper", "with kokoro", "with rvc" | that backend's step = **yes** |
-| "for Spanish/French/German/…", "for <language>" | Step 3 (kokoro, with a voice for that language) = **yes** |
+| "with piper", "with kokoro" | that backend's step = **yes** |
+| "with rvc" | there is no rvc step here — finish this install, then follow the `local-tts-configure` skill |
+| "for Spanish/French/Italian/…", for a language kokoro speaks | Step 3 (kokoro, with a voice for that language) = **yes** |
+| "for German/Polish/Russian/…", for any other language | Step 4 (piper — kokoro has no voice for it) = **yes** |
 | "make it fast", "don't wait every time" | the persistent server in Step 3 = **yes** |
 | "just the CLI", "no extras" | Steps 3b, 4 and 5 = **no** |
 | "install everything", "all of it", "don't ask" | All steps = **yes**, but still show the plan before running |
@@ -80,8 +82,9 @@ support, kokoro, piper, llama.cpp, an audio player.
 
 **ASK now**, in one message, only about what is missing or undecided:
 
-- Install kokoro? (**the default provider** — ~40 languages; this is the one to install
-  unless they specifically want something else)
+- Install kokoro? (**the default provider** — English, Spanish, French, Italian,
+  Portuguese, Hindi, Japanese and Mandarin; this is the one to install unless their
+  language is outside that set, or they specifically want something else)
 - Run kokoro as a persistent server? (**recommended** — see Step 3; it is the difference
   between about a second per sentence and several, and IPA phonetics need it)
 - Install piper as well, and for which language/voice?
@@ -140,7 +143,7 @@ The project metadata uses PEP 639 licence fields, which need **pip ≥ 24.2** an
 
 ## Step 3 — kokoro (the default provider) — **ASK**
 
-`kokoro` is what `tts` uses with no configuration at all: Kokoro-82M, fully offline, ~40
+`kokoro` is what `tts` uses with no configuration at all: Kokoro-82M, fully offline, eight
 languages, small. There is no single official CLI, so this installs the `kokoro-onnx`
 package in **its own venv** (never into `.venv` — local-tts has zero runtime dependencies
 and must keep them) plus a small wrapper the `kokoro.binary` default finds on `PATH`.
@@ -155,7 +158,7 @@ mkdir -p ~/.local/share/kokoro-models
 ```
 
 The wrapper script and the `~/.local/bin/kokoro-tts` shim are in the README's
-[kokoro section](https://github.com/rperez93/local-tts#kokoro--the-default-small-fast-offline-many-languages)
+[kokoro section](https://github.com/rperez93/local-tts#kokoro--the-default-small-fast-offline-eight-languages)
 and in the `local-tts-configure` skill — **copy them verbatim**, they are not worth
 improvising. Then pick a voice for the human's language and prove it works:
 
@@ -435,7 +438,9 @@ A non-zero duration means the pipeline works end to end. Optionally run the test
 
 Close with a short summary containing:
 
-- What you installed, and **where** (repo `.venv`, `~/.local/share/piper-venv`, voices dir)
+- What you installed, and **where** — only the ones you actually created: repo `.venv`,
+  `~/.local/share/kokoro-venv` + `~/.local/share/kokoro-models` + the
+  `~/.local/bin/kokoro-tts` shim, `~/.local/share/piper-venv` + `~/.local/share/piper-voices`
 - What you skipped and why
 - Whether the symlink was created, and the exact path
 - The `tts check` result
@@ -443,7 +448,10 @@ Close with a short summary containing:
 - What was recorded in `tts languages`
 - The one command they will use day to day, e.g.
   `tts --lang es -f documento.md -o documento.wav`
-- How to undo it: `rm ~/.local/bin/tts`, `rm -rf .venv ~/.local/share/piper-venv ~/.local/share/piper-voices`
+- How to undo it, naming only what you installed:
+  `rm ~/.local/bin/tts ~/.local/bin/kokoro-tts`,
+  `rm -rf .venv ~/.local/share/kokoro-venv ~/.local/share/kokoro-models`,
+  `rm -rf ~/.local/share/piper-venv ~/.local/share/piper-voices`
 
 ---
 
@@ -456,7 +464,7 @@ Close with a short summary containing:
 | `configuration error: project.license must be string` | pip/setuptools too old for PEP 639 | `pip install --upgrade pip`, then reinstall |
 | pip installs numpy/onnxruntime into the project venv | kokoro or piper installed in the wrong environment | undo; use a separate venv per Step 3 / Step 4 |
 | Speech is in the right words but the wrong accent | a backend used for a language it does not support, e.g. OuteTTS outside EN/ZH/JA/KO | switch to kokoro (Step 3) or piper (Step 4), and record it in `tts languages` |
-| Every call takes several seconds before any audio | kokoro or rvc running per-call instead of as a server | set up the persistent server (Step 3) |
+| Every call takes several seconds before any audio | kokoro or rvc running per-call instead of as a server | set up the persistent server — Step 3 for kokoro, the `local-tts-configure` skill for rvc |
 | An IPA pronunciation entry does nothing | the backend has no phonemizer | it needs kokoro with `server_url` set; `tts check` says which backends honour them |
 | `tts` not found after the symlink | `~/.local/bin` not on `PATH` | report it; ask before editing shell config |
 | `command not found: <binary>` from `tts` | a configured provider binary is missing | `tts check` names it; fix the path with `tts config --set <provider>.binary=…` |

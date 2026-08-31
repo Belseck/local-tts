@@ -50,11 +50,13 @@ tts --lang en "Done — the tests pass."
 If the language you need is **not** recorded, do not guess silently. Pick a sane default,
 say which one you used, and offer to remember it:
 
-- The default is `kokoro`, which speaks ~40 languages. `llamacpp` only speaks
+- The default is `kokoro`, which speaks eight languages: English, Spanish, French,
+  Italian, Portuguese, Hindi, Japanese and Mandarin. `llamacpp` only speaks
   **English, Chinese, Japanese and Korean** -- anything else comes out with English
   phonetics and sounds wrong, so don't reach for it outside those four.
-- For any other language, `piper` or `kokoro` are the right backends — both cover ~40
-  languages, but need a voice installed first. If neither is set up, use the
+- For a language outside kokoro's eight — German, Dutch, Polish, Russian, Turkish and
+  most others — `piper` is the backend that has it (~40 languages), but it needs a voice
+  installed first. If neither is set up, use the
   `local-tts-configure` skill rather than guessing which one to install.
 - `rvc` is different from the other backends: it's a voice *conversion* layer over
   whichever provider it's configured to use underneath, for a specific voice the user

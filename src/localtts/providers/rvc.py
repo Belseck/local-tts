@@ -92,6 +92,15 @@ class RvcProvider(Provider):
         except Exception:
             return False
 
+    def phonemizer_provider(self):
+        """The phonemes are the base provider's business, and so is the vocabulary
+        they have to fit into: asking rvc's own server about them would ask the one
+        process in the chain that never sees a word."""
+        try:
+            return self.base_provider_instance()
+        except Exception:
+            return self
+
     def base_provider_instance(self, lang=None):
         base_name = self._base_name()
         if base_name == self.name:

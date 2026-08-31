@@ -46,7 +46,7 @@ anything** — it usually names the exact problem.
 | --- | --- | --- | --- |
 | `llamacpp` | yes | **English, Chinese, Japanese, Korean only** | `llama-tts` binary |
 | `piper` | yes | ~40 languages, fast | `piper` binary + a `.onnx` voice |
-| `kokoro` (default) | yes | ~40 languages, small model | a `kokoro-tts` wrapper (set up below) |
+| `kokoro` (default) | yes | 8 languages, small model | a `kokoro-tts` wrapper (set up below) |
 | `openai` | no | whatever the endpoint offers | a URL, and a key only for api.openai.com |
 | `rvc` | yes | inherits its base provider's | **not installed automatically** — see below |
 | `command` | yes | whatever the tool offers | any binary that writes a WAV |
@@ -225,6 +225,12 @@ nothing without it: they are not "slower" off the server, they are absent.
 So treat this as the second half of installing kokoro, not an extra. **Still ask** — it
 leaves a background process running — but ask with a recommendation, and say what they
 lose by declining:
+
+> The script below is a **copy**, not a link into the package: once written, nothing
+> updates it on its own. After any `local-tts` update, `tts servers` says whether it still
+> matches this version and `tts servers --refresh` rewrites it (keeping the old one as
+> `.bak`) and stops the running server so the new one takes over. If you are writing this
+> file by hand today, you never need to diff it yourself again.
 
 ```bash
 cat > ~/.local/share/kokoro-venv/kokoro_server.py <<'EOF'
@@ -431,7 +437,24 @@ def make_handler(kokoro, last_activity):
                 # so that `tts check` can tell a server that understands the
                 # pronunciation dictionary's IPA entries from an older copy that
                 # would accept them and drop them without a word.
-                body = json.dumps({"ok": True, "phonetics": True}).encode("utf-8")
+                body = json.dumps({"ok": True, "phonetics": True, "shutdown": True,
+                                   "vocab": True}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/vocab":
+                # Which phonemes this model has a token for. A transcription asking for
+                # one it does not have loses that character silently -- the word still
+                # comes out, just mangled -- so `tts pronounce` reads this and says which
+                # character is the problem instead of leaving it to be heard.
+                try:
+                    phonemes("a", "en-us")          # builds the tokenizer if it is not yet
+                    vocab = "".join(sorted(_BACKENDS["en-us"].vocab))
+                    body = json.dumps({"vocab": vocab}).encode("utf-8")
+                except Exception as exc:            # an older kokoro-onnx, or no espeak data
+                    body = json.dumps({"error": str(exc)}).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -442,6 +465,17 @@ def make_handler(kokoro, last_activity):
                 self.end_headers()
 
         def do_POST(self):
+            if self.path == "/shutdown":
+                # `tts servers --refresh` rewrites this file, but the process already
+                # running is still the old code -- and it would keep answering for up
+                # to a whole idle timeout. Exiting hands the port back; the next call
+                # auto-starts the new file.
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                self.wfile.flush()
+                threading.Thread(target=_exit_soon, daemon=True).start()
+                return
             if self.path != "/synthesize":
                 self.send_response(404)
                 self.end_headers()
@@ -508,6 +542,14 @@ def make_handler(kokoro, last_activity):
             self.wfile.write(buf.getvalue())
 
     return Handler
+
+
+def _exit_soon():
+    """Let the 200 reach the client first, then go. os._exit for the same reason
+    watch_idle uses it: a loaded model has threads that will not unwind politely."""
+    time.sleep(0.2)
+    print("shutdown requested, exiting", file=sys.stderr)
+    os._exit(0)
 
 
 def watch_idle(last_activity, idle_timeout):
@@ -637,13 +679,22 @@ def make_handler(models, default_name, last_activity, lock):
             # Neither of these counts as activity: polling must not keep a GPU
             # model resident forever.
             if self.path == "/health":
-                self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+                # JSON rather than a bare "ok": a client reads this to tell a current
+                # server from an older copy that would ignore what it cannot parse.
+                self._json(200, {"ok": True, "shutdown": True})
             elif self.path == "/models":
                 self._json(200, {"models": sorted(models), "default": default_name})
             else:
                 self.send_response(404); self.end_headers()
 
         def do_POST(self):
+            if self.path == "/shutdown":
+                # See kokoro's server: a refreshed script only takes over once the
+                # process running the old one lets go of the port.
+                self.send_response(200); self.send_header("Content-Length", "0")
+                self.end_headers(); self.wfile.flush()
+                threading.Thread(target=_exit_soon, daemon=True).start()
+                return
             if self.path != "/convert":
                 self.send_response(404); self.end_headers(); return
             length = int(self.headers.get("Content-Length", 0))
@@ -682,6 +733,13 @@ def make_handler(models, default_name, last_activity, lock):
             self.end_headers()
             self.wfile.write(data)
     return Handler
+
+def _exit_soon():
+    """Let the 200 reach the client first, then go -- torch will not unwind politely."""
+    time.sleep(0.2)
+    print("shutdown requested, exiting", file=sys.stderr)
+    os._exit(0)
+
 
 def watch_idle(last_activity, idle_timeout):
     if idle_timeout <= 0:
@@ -1149,7 +1207,7 @@ text itself, so it passes the table to a backend with its own phonemizer:
 `tts check` prints which, so read it back rather than promising:
 
 ```
-phonetics   : 2 /IPA/ entries -> kokoro, rvc; ignored by llamacpp, openai, piper, command
+phonetics   : 2 word(s) with /IPA/ in the table -> kokoro, rvc; ignored by llamacpp, openai, piper, command
 ```
 
 An ignored entry is not an error. If the user needs IPA and their backend cannot take
@@ -1160,12 +1218,55 @@ written down; a running process says nothing about whether it is this version of
 script. `/health` reports `{"ok": true, "phonetics": true}`, and a server copied from an
 earlier version answers with a plain `ok` -- so it reads as *ignored* rather than as
 working, and local-tts does not send it a table it would drop. If a user's entries show
-as ignored while their server is up, **re-copy the server script from this skill**: that
-is the upgrade path.
+as ignored while their server is up, their script predates this: `tts servers` says so,
+and `tts servers --refresh` rewrites it and stops the old process. That is the upgrade
+path -- no hand-copying, and the previous file is kept as `.bak`.
 
 **Where to get the IPA.** Wiktionary prints it for most words; `espeak-ng --ipa -q -v en
 "pull request"` prints it for anything. Use the transcription of the language the word
-comes *from* -- that is the entire point.
+comes *from* -- that is the entire point. To pick between candidates by ear, and to be
+told when a transcription asks for phonemes the model has no token for, use
+`tts pronounce` and the **local-tts-phonetics** skill rather than guessing.
+
+### Transcriptions nobody typed in: `phonetics_hooks`
+
+The dictionary is for words a person wrote down. When the answers are *generated* -- a
+lexicon, a team glossary, a real grapheme-to-phoneme transcriber -- they belong in a
+hook instead, because local-tts has no runtime dependencies and cannot grow a
+transcriber of its own.
+
+A hook is any executable named in `phonetics_hooks`. It gets one utterance's resolved
+table on stdin as JSON and prints the table to use:
+
+```bash
+tts config --set phonetics_hooks='["~/bin/lexicon.py"]'
+tts config --set phonetics_hook_timeout=5     # seconds, per hook
+```
+
+```python
+#!/usr/bin/env python3
+import json, sys
+call = json.load(sys.stdin)
+#  {"text": ..., "lang": "es", "provider": "kokoro", "phonetics": {word: ipa}}
+table = call["phonetics"]
+table["croissant"] = "k\u0281was\u0251\u0303"      # bare IPA, or /between slashes/
+print(json.dumps({"phonetics": table}))
+```
+
+What to tell a user setting one up:
+
+- They run **in order**, each seeing what the last returned, and may add, rewrite or
+  drop entries.
+- They **cannot change the text**. A hook can only change how a word is transcribed,
+  never what is said.
+- A non-zero exit, output that is not JSON, or a script slower than the timeout leaves
+  the table alone and prints one line to stderr. Speech that is slightly wrong beats
+  speech that does not happen.
+- A `.py` without `chmod +x` is run with the current interpreter rather than refused.
+- It is the user's own program running with the user's privileges -- the same trust as
+  `server_start`. Say so when you set one up for them.
+- Unrelated to `tts hooks`, which is the status-bar hook. Do not conflate them in what
+  you tell the user.
 
 
 ## Pronunciation dictionary
@@ -1274,6 +1375,8 @@ never have to guess whether something is configurable.
 | `pronunciations` | `{}` | word → respelling, or `/IPA/` for phonetics; `<lang>:<word>` scopes it |
 | `terminal_title` | `true` | speaker icon in the terminal tab while playing |
 | `stream` | `true` | play each fragment as it is synthesized |
+| `phonetics_hooks` | `[]` | executables that shape the `/IPA/` table per utterance (see above) |
+| `phonetics_hook_timeout` | `5` | seconds one hook may take before the call goes on without it |
 | `languages` | `{}` | the language memory — see `tts languages` |
 
 **kokoro** (the default backend)

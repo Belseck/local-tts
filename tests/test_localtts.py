@@ -17,6 +17,8 @@ from pathlib import Path
 
 from localtts import audio, audiofx, config, g2p, hooks, providers, skills, text as textutil
 from localtts.g2p import en as g2p_en, es as g2p_es
+from localtts import (audio, audiofx, config, hooks, providers, servers, skills,
+                      text as textutil)
 from localtts.cli import _resolve_session, _synthesize, main
 from localtts.errors import TTSError
 from localtts.providers.base import Provider
@@ -174,7 +176,7 @@ class _FakeAudioServer:
     request/response wire format is exercised, not just the call site."""
 
     def __init__(self, route, audio_bytes=b"RIFF....WAVEfake", status=200, healthy=True,
-                 capabilities=None):
+                 capabilities=None, vocab=None):
         self.route = route
         self.audio_bytes = audio_bytes
         self.status = status
@@ -182,6 +184,8 @@ class _FakeAudioServer:
         #: What /health claims. None keeps the plain-text "ok" an older server sends,
         #: which is the case worth testing: it answers, and understands nothing new.
         self.capabilities = capabilities
+        #: What GET /vocab answers with, or None for a server that has no such route.
+        self.vocab = vocab
         self.requests = []
         outer = self
 
@@ -190,7 +194,12 @@ class _FakeAudioServer:
                 pass
 
             def do_GET(self):
-                if self.path == "/health" and outer.healthy:
+                if self.path == "/vocab" and outer.vocab is not None:
+                    body = json.dumps({"vocab": outer.vocab}).encode("utf-8")
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path == "/health" and outer.healthy:
                     body = (json.dumps(outer.capabilities).encode("utf-8")
                             if outer.capabilities is not None else b"ok")
                     self.send_response(200)
@@ -2959,3 +2968,352 @@ class PhonemizerBackendTest(unittest.TestCase):
              unittest.mock.patch.object(g2p.backend, "_backend",
                                         side_effect=RuntimeError("espeak exploded")):
             self.assertIsNone(g2p.backend.phonemes("hola", "es-419"))
+class ServerScriptTest(unittest.TestCase):
+    """`tts servers`: the one part of an install a `git pull` cannot reach.
+
+    The script kokoro and rvc run is a copy in the backend's own venv, so the failure
+    being tested for is a silent one -- an old copy answers /health and drops what it
+    never learned to read.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.script = os.path.join(self.tmp.name, "kokoro_server.py")
+
+    def cfg(self, start=None):
+        if start is None:
+            start = "/venv/bin/python %s --port 8765" % self.script
+        return {"providers": {"kokoro": dict(config.DEFAULTS["providers"]["kokoro"],
+                                             server_url="http://127.0.0.1:8765",
+                                             server_start=start)}}
+
+    def write(self, text):
+        with open(self.script, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_both_templates_extract_and_are_valid_python(self):
+        """They are written to disk and executed, so a broken block is a broken install
+        that nothing else here would catch."""
+        for provider in ("kokoro", "rvc"):
+            text = servers.template(provider)
+            compile(text, "%s_server.py" % provider, "exec")
+            self.assertIn("/shutdown", text)
+
+    def test_a_script_matching_the_template_is_current(self):
+        self.write(servers.template("kokoro"))
+        self.assertEqual(servers.entries(self.cfg())[0]["state"], servers.CURRENT)
+
+    def test_an_older_script_is_stale(self):
+        self.write("print('a copy from an earlier version')\n")
+        self.assertEqual(servers.entries(self.cfg())[0]["state"], servers.STALE)
+
+    def test_a_script_that_is_not_there_is_missing(self):
+        self.assertEqual(servers.entries(self.cfg())[0]["state"], servers.MISSING)
+
+    def test_a_server_start_naming_no_script_cannot_be_checked(self):
+        record = servers.entries(self.cfg(start="/venv/bin/kokoro-server --port 8765"))[0]
+        self.assertEqual(record["state"], servers.UNCONFIGURED)
+
+    def test_the_script_path_comes_from_server_start_not_from_the_skill(self):
+        """Where that venv lives is the user's choice; the skill only suggests one."""
+        settings = {"server_start": "~/elsewhere/bin/python ~/elsewhere/kokoro_server.py -p 1"}
+        self.assertEqual(servers.script_path(settings),
+                         os.path.expanduser("~/elsewhere/kokoro_server.py"))
+
+    def test_a_provider_with_no_server_url_is_not_listed(self):
+        cfg = {"providers": {"kokoro": dict(config.DEFAULTS["providers"]["kokoro"])}}
+        self.assertEqual(servers.entries(cfg), [])
+
+    def test_refresh_installs_the_template_and_keeps_the_previous_copy(self):
+        """`stale` cannot tell rot from a deliberate edit -- a different model directory,
+        an extra flag -- so the old file has to survive the rewrite."""
+        self.write("MODELS = '/somewhere/else'\n")
+        backup = servers.refresh(servers.entries(self.cfg())[0])
+        with open(self.script, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), servers.template("kokoro"))
+        with open(backup, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "MODELS = '/somewhere/else'\n")
+        self.assertEqual(servers.entries(self.cfg())[0]["state"], servers.CURRENT)
+
+    def test_refresh_of_a_missing_script_leaves_no_backup(self):
+        self.assertEqual(servers.refresh(servers.entries(self.cfg())[0]), "")
+        self.assertEqual(servers.entries(self.cfg())[0]["state"], servers.CURRENT)
+
+    def test_a_current_server_accepts_shutdown(self):
+        server = _FakeAudioServer("/shutdown", audio_bytes=b"")
+        self.addCleanup(server.stop)
+        self.assertTrue(servers.shutdown(server.url))
+
+    def test_a_server_predating_shutdown_says_so_instead_of_looking_stopped(self):
+        """It answers 404 and keeps running. Reporting that honestly is the difference
+        between "the new script is live" and "it will be, in five idle minutes"."""
+        server = _FakeAudioServer("/convert", audio_bytes=b"")
+        self.addCleanup(server.stop)
+        self.assertFalse(servers.shutdown(server.url))
+
+    def test_the_subcommand_reports_a_stale_script(self):
+        import contextlib, io as _io
+        self.write("print('old')\n")
+        path = os.path.join(self.tmp.name, "config.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(self.cfg(), handle)
+        os.environ["LOCALTTS_CONFIG"] = path
+        self.addCleanup(os.environ.pop, "LOCALTTS_CONFIG", None)
+        captured = _io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            self.assertEqual(main(["servers"]), 0)
+        self.assertIn("STALE", captured.getvalue())
+        self.assertIn("--refresh", captured.getvalue())
+
+
+class PhoneticsHookTest(unittest.TestCase):
+    """Scripts named in `phonetics_hooks` shape the /IPA/ table for one utterance.
+
+    The dictionary is for words a person wrote down; a hook is for the ones generated --
+    a lexicon, a house glossary, a real transcriber -- which is work this package has no
+    dependency to do itself.
+    """
+
+    ENTRIES = {"pull request": "/p\u02c8\u028al \u0279\u1d7bkw\u02c8\u025bst/",
+               "kubectl": "kube control"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        from localtts import phonetics
+        phonetics._REPORTED.clear()          # warnings are once-per-process by design
+
+    def hook(self, body, name="hook.py", executable=True):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("#!/usr/bin/env python3\nimport json, sys\n"
+                         "payload = json.load(sys.stdin)\n" + body)
+        if executable:
+            os.chmod(path, 0o755)
+        return path
+
+    def cfg(self, *scripts, **kwargs):
+        cfg = {"pronunciations": dict(self.ENTRIES), "phonetics_hooks": list(scripts)}
+        cfg.update(kwargs)
+        return cfg
+
+    def run_hooks(self, cfg, table=None, text="ya subi el pull request", lang="es"):
+        from localtts import phonetics
+        if table is None:
+            table = textutil.phonetic_entries(cfg.get("pronunciations") or {}, lang)
+        return phonetics.run_hooks(table, text=text, lang=lang, provider="kokoro", cfg=cfg)
+
+    def test_a_hook_can_add_a_word_nobody_wrote_down(self):
+        script = self.hook("payload['phonetics']['croissant'] = 'k\u0281wasa'\n"
+                           "print(json.dumps({'phonetics': payload['phonetics']}))\n")
+        table = self.run_hooks(self.cfg(script))
+        self.assertEqual(table["croissant"], "k\u0281wasa")
+        self.assertIn("pull request", table)          # and leaves the rest alone
+
+    def test_a_hook_runs_even_with_an_empty_dictionary(self):
+        """The interesting half: transcribing words no one has written down."""
+        script = self.hook("print(json.dumps({'phonetics': {'croissant': 'k\u0281wasa'}}))\n")
+        cfg = {"pronunciations": {}, "phonetics_hooks": [script]}
+        self.assertEqual(self.run_hooks(cfg), {"croissant": "k\u0281wasa"})
+
+    def test_a_hook_sees_the_text_language_and_provider(self):
+        script = self.hook("print(json.dumps({'phonetics': {'seen': '%s|%s|%s' % ("
+                           "payload['text'], payload['lang'], payload['provider'])}}))\n")
+        table = self.run_hooks(self.cfg(script), text="hola", lang="es")
+        self.assertEqual(table["seen"], "hola|es|kokoro")
+
+    def test_hooks_run_in_order_each_seeing_the_last_one(self):
+        first = self.hook("payload['phonetics']['w'] = 'one'\n"
+                          "print(json.dumps({'phonetics': payload['phonetics']}))\n",
+                          name="first.py")
+        second = self.hook("t = payload['phonetics']\n"
+                           "t['w'] = t['w'] + '-two'\n"
+                           "print(json.dumps({'phonetics': t}))\n", name="second.py")
+        self.assertEqual(self.run_hooks(self.cfg(first, second))["w"], "one-two")
+
+    def test_a_hook_may_drop_entries(self):
+        script = self.hook("print(json.dumps({'phonetics': {}}))\n")
+        self.assertEqual(self.run_hooks(self.cfg(script)), {})
+
+    def test_slashes_and_capitals_from_a_hook_are_normalized(self):
+        """A script author writes /IPA/ the way the dictionary does, and cases a word
+        however it appeared in their source -- both have to land where lookups look."""
+        script = self.hook("print(json.dumps({'phonetics': {'Croissant': '/k\u0281wasa/'}}))\n")
+        self.assertEqual(self.run_hooks(self.cfg(script)), {"croissant": "k\u0281wasa"})
+
+    def test_a_failing_hook_leaves_the_table_alone(self):
+        script = self.hook("sys.stderr.write('no lexicon here\\n')\nsys.exit(3)\n")
+        table = self.run_hooks(self.cfg(script))
+        self.assertEqual(table, textutil.phonetic_entries(self.ENTRIES, "es"))
+
+    def test_output_that_is_not_json_is_ignored(self):
+        script = self.hook("print('croissant = krwasa')\n")
+        self.assertIn("pull request", self.run_hooks(self.cfg(script)))
+
+    def test_output_without_a_phonetics_object_is_ignored(self):
+        script = self.hook("print(json.dumps({'words': {'croissant': 'k'}}))\n")
+        self.assertIn("pull request", self.run_hooks(self.cfg(script)))
+
+    def test_a_hook_that_hangs_does_not_hang_the_speech(self):
+        script = self.hook("import time\ntime.sleep(30)\n")
+        cfg = self.cfg(script, phonetics_hook_timeout=0.3)
+        started = time.time()
+        table = self.run_hooks(cfg)
+        self.assertLess(time.time() - started, 10)
+        self.assertIn("pull request", table)
+
+    def test_a_python_hook_without_the_executable_bit_still_runs(self):
+        """The overwhelmingly common way to get this wrong; "permission denied" for a
+        file the user just wrote is a worse answer than simply running it."""
+        script = self.hook("print(json.dumps({'phonetics': {'x': 'eks'}}))\n",
+                           name="plain.py", executable=False)
+        self.assertEqual(self.run_hooks(self.cfg(script)), {"x": "eks"})
+
+    def test_a_hook_that_is_not_there_is_reported_not_raised(self):
+        table = self.run_hooks(self.cfg(os.path.join(self.tmp.name, "nope.sh")))
+        self.assertIn("pull request", table)
+
+    def test_the_hooks_output_is_what_reaches_the_server(self):
+        """The half that makes the feature real: a hook that changes nothing on the wire
+        is a hook that does nothing."""
+        script = self.hook("print(json.dumps({'phonetics': {'croissant': 'k\u0281wasa'}}))\n")
+        server = _FakeAudioServer("/synthesize", audio_bytes=b"audio",
+                                  capabilities={"ok": True, "phonetics": True})
+        self.addCleanup(server.stop)
+        cfg = {"pronunciations": dict(self.ENTRIES), "phonetics_hooks": [script],
+               "providers": {"kokoro": dict(config.DEFAULTS["providers"]["kokoro"],
+                                            server_url=server.url)}}
+        provider = KokoroProvider(cfg["providers"]["kokoro"], cfg=cfg, lang="es")
+        with tempfile.TemporaryDirectory() as tmp:
+            provider.synthesize("un croissant", os.path.join(tmp, "out.wav"))
+        self.assertEqual(server.requests[0]["phonetics"], {"croissant": "k\u0281wasa"})
+
+    def test_no_hooks_configured_changes_nothing(self):
+        table = self.run_hooks({"pronunciations": dict(self.ENTRIES)})
+        self.assertEqual(table, textutil.phonetic_entries(self.ENTRIES, "es"))
+
+
+class PronounceTest(unittest.TestCase):
+    """`tts pronounce`: hearing a candidate transcription instead of guessing at it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "config.json")
+        os.environ["LOCALTTS_CONFIG"] = self.path
+        self.addCleanup(os.environ.pop, "LOCALTTS_CONFIG", None)
+
+    def configure(self, server=None, **top):
+        kokoro = dict(config.DEFAULTS["providers"]["kokoro"])
+        if server is not None:
+            kokoro["server_url"] = server.url
+        cfg = {"provider": "kokoro", "play": False, "providers": {"kokoro": kokoro}}
+        cfg.update(top)
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump(cfg, handle)
+        return cfg
+
+    def run_cli(self, argv):
+        import contextlib, io as _io
+        captured = _io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            code = main(argv)
+        return code, captured.getvalue()
+
+    def run_failing(self, argv):
+        """main() turns a TTSError into `tts: error: ...` on stderr and exit 1, which is
+        the contract a user or an agent actually sees."""
+        import contextlib, io as _io
+        captured = _io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            code = main(argv)
+        return code, captured.getvalue()
+
+    def test_a_value_that_is_not_a_transcription_is_refused(self):
+        self.configure()
+        code, printed = self.run_failing(["pronounce", "x", "--ipa", "/a/ y /b/"])
+        self.assertEqual(code, 1)
+        self.assertIn("not a transcription", printed)
+
+    def test_bare_ipa_is_accepted_and_wrapped(self):
+        server = _FakeAudioServer("/synthesize", audio_bytes=_wav_bytes(1),
+                                  capabilities={"ok": True, "phonetics": True},
+                                  vocab="pl\u02c8\u028a\u0279\u1d7bkwst\u025b")
+        self.addCleanup(server.stop)
+        self.configure(server)
+        code, printed = self.run_cli(["pronounce", "pull request", "--no-play",
+                                      "--ipa", "p\u02c8\u028al"])
+        self.assertEqual(code, 0)
+        self.assertIn("candidate  : /p\u02c8\u028al/", printed)
+
+    def test_it_renders_twice_and_only_the_second_carries_the_candidate(self):
+        server = _FakeAudioServer("/synthesize", audio_bytes=_wav_bytes(1),
+                                  capabilities={"ok": True, "phonetics": True},
+                                  vocab="pl\u02c8\u028a\u0279\u1d7bkwst\u025b")
+        self.addCleanup(server.stop)
+        self.configure(server)
+        code, printed = self.run_cli(["pronounce", "pull request", "--no-play",
+                                      "--ipa", "/p\u02c8\u028al/"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(server.requests), 2)
+        self.assertNotIn("phonetics", server.requests[0])
+        self.assertEqual(server.requests[1]["phonetics"], {"pull request": "p\u02c8\u028al"})
+        self.assertIn("keep it", printed)
+
+    def test_a_phoneme_the_model_lacks_is_named_before_it_is_heard(self):
+        """Dropped in silence otherwise: the word still comes out, just mangled."""
+        server = _FakeAudioServer("/synthesize", audio_bytes=_wav_bytes(1),
+                                  capabilities={"ok": True, "phonetics": True},
+                                  vocab="abcdefg")
+        self.addCleanup(server.stop)
+        self.configure(server)
+        code, printed = self.run_cli(["pronounce", "x", "--no-play", "--ipa", "/abZ/"])
+        self.assertEqual(code, 0)
+        self.assertIn("no token for 'Z'", printed)
+
+    def test_a_server_without_vocab_says_it_cannot_answer(self):
+        server = _FakeAudioServer("/synthesize", audio_bytes=_wav_bytes(1),
+                                  capabilities={"ok": True, "phonetics": True})
+        self.addCleanup(server.stop)
+        self.configure(server)
+        code, printed = self.run_cli(["pronounce", "x", "--no-play", "--ipa", "/ab/"])
+        self.assertEqual(code, 0)
+        self.assertIn("cannot say which", printed)
+
+    def test_a_backend_that_cannot_take_phonemes_says_so_and_fails(self):
+        """Rendering the same audio twice and calling it a comparison would be a lie."""
+        self.configure()                       # kokoro with no server: no phonemizer
+        with unittest.mock.patch.object(KokoroProvider, "synthesize",
+                                        lambda self, text, out, voice=None: out):
+            code, printed = self.run_cli(["pronounce", "x", "--no-play", "--ipa", "/ab/"])
+        self.assertEqual(code, 1)
+        self.assertIn("cannot take phonemes", printed)
+
+    def test_a_word_missing_from_the_sentence_is_refused(self):
+        self.configure()
+        code, printed = self.run_failing(["pronounce", "croissant",
+                                          "--sentence", "quiero un pastel"])
+        self.assertEqual(code, 1)
+        self.assertIn("does not appear", printed)
+
+    def test_rvc_asks_its_base_provider_about_the_vocabulary(self):
+        """rvc converts audio and never sees a word, so its own server cannot answer."""
+        server = _FakeAudioServer("/synthesize", audio_bytes=_wav_bytes(1),
+                                  capabilities={"ok": True, "phonetics": True},
+                                  vocab="abc")
+        self.addCleanup(server.stop)
+        cfg = {"providers": {
+            "rvc": dict(config.DEFAULTS["providers"]["rvc"], base_provider="kokoro",
+                        server_url="http://127.0.0.1:1"),
+            "kokoro": dict(config.DEFAULTS["providers"]["kokoro"], server_url=server.url),
+        }}
+        from localtts import phonetics
+        provider = RvcProvider(cfg["providers"]["rvc"], cfg=cfg)
+        self.assertEqual(phonetics.unsupported_phonemes(provider, "abZ"), ["Z"])
+
+    def test_without_a_server_the_vocabulary_is_unknown_not_empty(self):
+        """"No token for anything" and "nobody to ask" are different answers."""
+        from localtts import phonetics
+        provider = KokoroProvider(dict(config.DEFAULTS["providers"]["kokoro"]))
+        self.assertIsNone(phonetics.unsupported_phonemes(provider, "abc"))

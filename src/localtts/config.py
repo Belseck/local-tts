@@ -12,9 +12,9 @@ APP_NAME = "local-tts"
 ENV_PREFIX = "LOCALTTS_"
 
 DEFAULTS = {
-    # Provider used when --provider is not given. Kokoro speaks ~40 languages from a
-    # single 82M model, where llama.cpp's OuteTTS covers only English, Chinese, Japanese
-    # and Korean -- so the old default silently mispronounced most of the world with
+    # Provider used when --provider is not given. Kokoro speaks eight languages from a
+    # single 82M model (VOICE_LANGS in providers/kokoro.py is the list), where llama.cpp's
+    # OuteTTS covers only English, Chinese, Japanese and Korean -- so the old default silently mispronounced most of the world with
     # English phonetics. llamacpp is still a provider, just not the one you get by
     # accident.
     "provider": "kokoro",
@@ -60,6 +60,17 @@ DEFAULTS = {
     # minute for a tagged story or a document. The single joined file is still written
     # either way. Set false to go back to synthesize-everything-then-play.
     "stream": True,
+    # Executables that shape the /IPA/ table before it reaches a backend. Each one gets
+    # {"text", "lang", "provider", "phonetics"} on stdin as JSON and prints the table to
+    # use, so a lexicon, a house glossary or a real transcriber can answer "how is this
+    # word said" for words nobody wrote into `pronunciations` by hand -- work this package
+    # cannot do itself and should not grow a dependency for. Run in order, each seeing
+    # what the last returned; a hook that fails leaves the table as it was. Nothing to do
+    # with `tts hooks`, which is the status-bar hook. See localtts/phonetics.py.
+    "phonetics_hooks": [],
+    # How long one hook may take before the call goes on without it. Speech that is
+    # slightly wrong beats speech that does not happen.
+    "phonetics_hook_timeout": 5.0,
     # Which backend speaks which language, e.g.
     #   {"es": {"provider": "piper", "voice": "~/voices/es_MX-claude-high.onnx"}}
     # Shared by every coding agent so the preference is remembered in one place.
@@ -253,7 +264,8 @@ DEFAULTS = {
 
 
 TOP_LEVEL_KEYS = ("provider", "play", "player", "terminal_title", "stream",
-                  "player_args", "player_env", "pronunciations")
+                  "player_args", "player_env", "pronunciations",
+                  "phonetics_hooks", "phonetics_hook_timeout")
 #: Top-level settings that are maps, so `--set` takes one more level:
 #: `player_args.ffplay="-af aresample=48000"`, `player_env.SDL_AUDIODRIVER=pulseaudio`.
 TOP_LEVEL_MAPS = ("player_args", "player_env", "pronunciations")

@@ -16,7 +16,7 @@
 Make your coding agent talk to you!
 
 A tiny command-line text-to-speech tool. It shells out to **Kokoro-82M** by default —
-~40 languages from one small model — so speech is generated locally and offline.
+eight languages from one small model — so speech is generated locally and offline.
 
 ```console
 $ tts "Hello from my terminal."
@@ -91,6 +91,7 @@ See [Providers → `rvc`](#rvc--voice-conversion-not-installed-automatically) fo
 - [Audio playback](#audio-playback)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
+- [Thanks](#thanks)
 
 ---
 
@@ -107,12 +108,12 @@ See [Providers → `rvc`](#rvc--voice-conversion-not-installed-automatically) fo
 
 `local-tts` does not bundle, build or ship any speech model. It drives a backend you
 install separately, and **the default provider is `kokoro`** — small, fully offline, and
-good for ~40 languages. Its setup lives with the provider itself:
+good for eight languages. Its setup lives with the provider itself:
 
 | Backend | Install | Good for |
 | --- | --- | --- |
-| **`kokoro`** *(default)* | [kokoro section](#kokoro--the-default-small-fast-offline-many-languages) | ~40 languages, small and fast — start here |
-| `piper` | [piper section](#piper--small-fast-offline-many-languages) | ~40 languages, ~7× realtime on CPU |
+| **`kokoro`** *(default)* | [kokoro section](#kokoro--the-default-small-fast-offline-eight-languages) | 8 languages, small and fast — start here |
+| `piper` | [piper section](#piper--small-fast-offline-many-languages) | ~40 languages, ~7× realtime on CPU — the one for a language kokoro does not speak |
 | `llamacpp` | [llamacpp section](#llamacpp--local-offline-four-languages) | English, Chinese, Japanese, Korean only |
 | `openai` | [openai section](#openai--any-openai-compatible-endpoint) | any OpenAI-compatible endpoint, not offline |
 | `rvc` | [rvc section](#rvc--voice-conversion-not-installed-automatically) | converting another backend's output to a trained voice |
@@ -130,7 +131,7 @@ does the whole thing, asking before each step.
 
 Model weights are the backend's business, not this tool's: `kokoro` needs
 `kokoro-v1.0.onnx` plus `voices-v1.0.bin` (fetched once — see the
-[kokoro section](#kokoro--the-default-small-fast-offline-many-languages)), piper needs a
+[kokoro section](#kokoro--the-default-small-fast-offline-eight-languages)), piper needs a
 `.onnx` voice per language (~60 MB each), and `llamacpp` downloads its default OuteTTS
 weights on first use. Every one of them works fully offline afterwards.
 
@@ -218,12 +219,20 @@ default     : kokoro
 [ok] llamacpp  /usr/local/bin/llama-tts -> default OuteTTS (downloaded on first run)
 [--] openai    https://api.openai.com/v1 (no api_key and $OPENAI_API_KEY is unset)
 [--] piper     piper: 'piper' not found on PATH. ...
+[ok] kokoro    /home/you/.local/bin/kokoro-tts
+[--] rvc       rvc needs the python interpreter from the venv rvc-python is installed in: ...
 [ok] command   espeak-ng -w {output} {text}
 
-players     : ffplay, paplay
+players     : ffplay, paplay  -> using ffplay
+tone shaping: ffmpeg atempo (best quality)
+phonetics   : no /IPA/ entries in `pronunciations` (plain respellings work everywhere)
+streaming   : on -- each fragment plays as it is synthesized
 ```
 
-Only the line matching your default provider has to say `[ok]`.
+Only the line matching your default provider has to say `[ok]`. The last three lines
+report what shapes the audio: `tone shaping` says whether ffmpeg is doing the retiming or
+the slower built-in fallback is, and `phonetics` says which backends can accept the
+`/IPA/` entries in your dictionary — see [Pronunciation dictionary](#pronunciation-dictionary).
 
 ---
 
@@ -248,15 +257,21 @@ pip install -e .
 pipx install . --force
 ```
 
-Two more things are **snapshots taken at install time**, not symlinks into the repo, so
+Three more things are **snapshots taken at install time**, not symlinks into the repo, so
 pulling doesn't update them on its own:
 
 ```bash
-tts skills --install    # refreshes the skill copies every detected agent is reading
+tts skills --install     # refreshes the skill copies every detected agent is reading
 tts hooks --install      # only if `tts hooks --status` shows one is active
+tts servers --refresh    # the kokoro/rvc server scripts, which live in their own venvs
 ```
 
 Then `tts --version` and `tts check` to confirm it landed.
+
+The server script is the one that goes stale in silence: it is a copy in the backend's
+venv, an older one answers `/health` perfectly well, and it drops any request key it never
+learned to read — so a new capability just quietly does nothing. `tts servers` compares
+what is installed against this version and says which is which.
 
 If you use a coding agent, the whole thing — including finding the repo behind whatever
 install method you used — is the **`local-tts-update`** skill from
@@ -386,6 +401,11 @@ whichever agents it finds on your machine:
   emphasis, which voice reads a borrowed word, and the noise or robotic artifacts that
   come from the wrong player or a missing ffmpeg. Diagnoses by measurement first, changes
   one setting at a time, and asks for your ears only where a measurement cannot decide.
+- **`local-tts-phonetics`** — get one *word* said properly: a name, a brand, an acronym,
+  a borrowed term inside another language. Looks the transcription up rather than deriving
+  it from spelling, tries it by ear with [`tts pronounce`](#hearing-a-transcription-before-you-keep-it),
+  reads back which phonemes the model actually has a token for, and keeps the winner in the
+  dictionary — or wires a `phonetics_hooks` script when there are too many words to type.
 - **`local-tts-update`** — update an already-installed CLI to the latest version. Locates
   the repo behind the running `tts` command, pulls it, reinstalls only if that's actually
   needed, and refreshes the skill/hook files that are copies rather than live links to the
@@ -628,7 +648,7 @@ about **640 MB**). Later runs use the cache and work offline.
 
 Output is 24 kHz mono WAV. The default OuteTTS weights speak **English, Chinese,
 Japanese and Korean**; other languages come out with English phonetics, so use the
-default [`kokoro`](#kokoro--the-default-small-fast-offline-many-languages) or
+default [`kokoro`](#kokoro--the-default-small-fast-offline-eight-languages) or
 [`piper`](#piper--small-fast-offline-many-languages) for those. Quality also
 drops on long prompts, which is why `max_words` splits them — raise or lower it to trade
 continuity against reliability.
@@ -692,9 +712,10 @@ extension picks the format (`wav`, `mp3`, `opus`, `aac`, `flac`, `pcm`).
 ### `piper` — small, fast, offline, many languages
 
 [Piper](https://github.com/OHF-Voice/piper1-gpl) runs neural ONNX voices on the CPU at
-roughly 7x realtime, with good models for ~40 languages. Reach for it when the default
-`kokoro` does not have a voice you like for your language, or when you want one flat
-`.onnx` file per voice instead of kokoro's wrapper script.
+roughly 7x realtime, with good models for ~40 languages. Reach for it when your language
+is not one of kokoro's eight — German, Dutch, Polish, Russian, Turkish and the rest live
+here, not there — when you want a different voice for a language kokoro does cover, or
+when you want one flat `.onnx` file per voice instead of kokoro's wrapper script.
 
 Piper is distributed as a Python wheel (`piper-tts`, GPL-3.0). Install it in its **own**
 virtualenv so its ~200 MB of dependencies (onnxruntime, numpy) stay out of this project,
@@ -734,10 +755,13 @@ tts -p piper -f article.md -o article.wav
 | `auto_tone` | `false` | Derive tone from `?`/`!`/`.` where no `<tag>` is active — see [Tone and emotion tags](#tone-and-emotion-tags). |
 | `extra_args` | `[]` | Extra flags appended verbatim. |
 
-### `kokoro` — the default: small, fast, offline, many languages
+### `kokoro` — the default: small, fast, offline, eight languages
 
-**This is the provider you get with no configuration at all.** Kokoro-82M covers ~40
-languages in a footprint comparable to piper's. There is no single official CLI, so the
+**This is the provider you get with no configuration at all.** Kokoro-82M covers eight
+languages in a footprint comparable to piper's: English (US and UK), Spanish, French,
+Italian, Portuguese (Brazil), Hindi, Japanese and Mandarin — the set is fixed by the
+model's own voice prefixes (`VOICE_LANGS` in `src/localtts/providers/kokoro.py`). For
+anything outside it, use [piper](#piper--small-fast-offline-many-languages). There is no single official CLI, so the
 straightforward path is a minimal wrapper around the `kokoro`/`kokoro-onnx` Python
 package, in its own venv:
 
@@ -882,6 +906,9 @@ tts -p rvc "Test of the converted voice."
 | `extra_args` | `[]` | Extra flags appended verbatim. |
 | `server_url` | *(empty)* | **Recommended.** See [Recommended: a persistent server](#recommended-a-persistent-server-kokoro--rvc) below. |
 | `server_start`, `server_timeout` | *(empty)*, `60` | Command to auto-start the server, and how long to wait for it (a torch load is slower than kokoro's). |
+| `server_model` | *(empty)* | Which resident model a request asks for when no language-specific one applies. Empty means "whatever the server loaded first". |
+| `language_models` | `{}` | Model name per language, e.g. `{"en": "jarvis", "es": "cortana-es"}`. An exact tag beats its base language (`es-MX` before `es`). |
+| `server_models` | `{}` | The models the server has resident, as `name: path`. Reporting only — `tts check` lists them; the server's own `--model` flags are what load them. |
 
 There is no `rvc.voice` — the voice comes entirely from which `.pth` model is configured.
 
@@ -924,9 +951,31 @@ itself. **It exits on its own after 5 minutes idle** to release the model (a rea
 rvc's torch model in particular) — configurable via `--idle-timeout SECONDS` in
 `server_start` (`0` disables it); the next call after it exits just starts a fresh one.
 
-For `rvc`, the model is fixed at server startup (`--model`/`--index` in `server_start`),
-not per request — that's inherent to keeping one loaded; switching voices means changing
-those and restarting the server.
+For `rvc`, one server can hold **several** models at once: start it with a repeatable
+`--model NAME=PATH` per voice, and each request names the one it wants —
+`rvc.language_models` picks it per language, with `rvc.server_model` as the flat default.
+A server started with a single `--model` and no names still works; it just answers every
+request with the one voice it loaded.
+
+**Keeping the script current.** Neither server script is part of this package — each is a
+copy written into that backend's venv, so `git pull` and `pip install -e .` never touch
+one. `tts servers` reads the script out of the bundled `local-tts-configure` skill and
+compares it with what is actually on disk, wherever `server_start` points:
+
+```console
+$ tts servers
+[ok] kokoro  script is current -- ~/.local/share/kokoro-venv/kokoro_server.py (running)
+[!!] rvc     script is STALE -- ~/.local/share/rvc-venv/rvc_server.py (not running)
+
+`tts servers --refresh` rewrites it from the bundled template.
+```
+
+`--refresh` writes the current script, keeps the previous one as `<name>.bak`, and asks a
+running server to exit so the next call starts the new one. `STALE` only means *differs
+from this version's template* — a script you edited on purpose reads the same way, which
+is why the old copy is kept rather than replaced outright. A server installed before
+`/shutdown` existed cannot be stopped this way; `--refresh` says so, and that one ages out
+on its own idle timeout.
 
 ### Tone and emotion tags
 
@@ -1155,6 +1204,90 @@ every language, and `<lang>:<word>` applies to that one only — so a word said 
 in two languages needs no nested structure. Tone-tag markup is left untouched: an entry
 for `happy` will not rewrite `<happy>`.
 
+### Hearing a transcription before you keep it
+
+An IPA entry is not guessable from spelling, and a wrong one fails in the way that is
+hardest to notice: the word still comes out, just mangled. `tts pronounce` renders the
+word as it is said now and as a candidate would say it, plays both back to back, and says
+whether the model has a token for every phoneme you asked for:
+
+```console
+$ tts pronounce "pull request" --lang es --ipa "/pˈʊl ɹᵻkwˈɛst/"
+word       : pull request
+language   : es
+provider   : rvc
+now        : 0.88s
+candidate  : /pˈʊl ɹᵻkwˈɛst/
+phonemes   : every one is in this model's vocabulary
+with IPA   : 0.73s
+  playing as it is now
+  playing with the candidate
+keep it    : tts config --set 'pronunciations.es:pull request=/pˈʊl ɹᵻkwˈɛst/'
+```
+
+The `phonemes` line is the part that saves time. A character the model has no token for is
+dropped in silence, so it is reported before you listen:
+
+```console
+$ tts pronounce croissant --lang es --ipa "/kr'wasɑ̃/"
+phonemes   : no token for "'" -- it is dropped, and the word comes out mangled rather
+             than wrong-but-whole. Usually a typo: an ASCII letter where IPA wants its
+             own symbol.
+```
+
+That is nearly always a real typo — `'` for `ˈ`, `r` for `ɹ`, `:` for `ː`. Add `--sentence
+"quiero un croissant"` to hear the word in context, `--no-play` to render without playing,
+and `--keep` to hold on to both wav files. Asking which phonemes exist needs a current
+kokoro server (`tts servers`); without one you still get both renders, with a line saying
+the vocabulary could not be checked.
+
+If you use a coding agent, the whole loop — look it up, hear it, keep it — is the
+**`local-tts-phonetics`** skill: just say "it's saying my name wrong."
+
+### Phonetics hooks — transcriptions nobody wrote down
+
+The dictionary is the right place for a handful of names and borrowed terms someone typed
+in by hand, and the wrong place for anything *generated*: a lexicon, a team's glossary, a
+real grapheme-to-phoneme transcriber. Those want to run at synthesis time, and they want to
+be somebody else's code — this package has no runtime dependencies and is not going to grow
+a transcriber of its own.
+
+So a hook is any executable you name. It receives the resolved table for one utterance on
+stdin as JSON and prints the table to use:
+
+```bash
+tts config --set phonetics_hooks='["~/bin/lexicon.py"]'
+tts config --set phonetics_hook_timeout=5
+```
+
+```python
+#!/usr/bin/env python3
+import json, sys
+call = json.load(sys.stdin)
+#   {"text": "ya subí el pull request", "lang": "es", "provider": "kokoro",
+#    "phonetics": {"pull request": "pˈʊl ɹᵻkwˈɛst"}}
+table = call["phonetics"]
+for word in ("croissant", "déjà vu"):
+    if word in call["text"].lower():
+        table[word] = my_lexicon[word]          # bare IPA, or /between slashes/
+print(json.dumps({"phonetics": table}))
+```
+
+Hooks run in the order listed, each seeing what the previous one returned, and may add,
+rewrite or drop entries. They **cannot change the text** — a misbehaving hook can never
+alter *what* gets said, only how a word in it is transcribed, and words it does not name
+come out exactly as they would with no hook at all.
+
+Everything that can go wrong — a non-zero exit, output that is not JSON, a script that
+hangs past `phonetics_hook_timeout` — leaves the table as the previous hook left it and
+prints one line to stderr. Speech that is slightly wrong beats speech that does not happen.
+A `.py` without the executable bit is run with the current interpreter rather than
+refused. `tts check`'s `phonetics` line counts the hooks it will run.
+
+Two things worth being clear about: a hook is a program **you** name in **your** config, so
+it runs with your privileges — the same trust you extend to `server_start`. And it is
+unrelated to [`tts hooks`](#status-bar-hook), which installs the status-bar hook.
+
 ### Delivery: pacing and pauses
 
 How each language is delivered, on top of whatever a tone tag asks for:
@@ -1322,6 +1455,17 @@ and `check()`, register it in `providers/__init__.py`, and add its defaults to
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request — in particular the
 no-runtime-dependencies rule, which is not negotiable.
+
+## Thanks
+
+- **[@Belseck](https://github.com/Belseck)** — *phonetics in the pronunciation dictionary*
+  ([#2](https://github.com/rperez93/local-tts/pull/2)). A `/IPA/` value in `pronunciations`
+  now travels to kokoro's server as phonemes, so a borrowed word keeps its own sound inside
+  a sentence in another language — *"ya subí el pull request"* — said by the same voice,
+  with no fragment boundary. It replaced the old `<en>…</en>` language spans, which cut the
+  line up and handed the pieces to a second voice. The server is asked whether it
+  understands phonemes rather than assumed to, so an older copy of the script is never
+  silently sent a table it would drop.
 
 ## License
 

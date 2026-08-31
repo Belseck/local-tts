@@ -197,9 +197,7 @@ class KokoroProvider(Provider):
         # Only to a server that says it understands them. An older copy of the script
         # accepts the key and drops it without a word, and reporting that as working is
         # the exact silent no-op this feature exists to remove.
-        phonetics = (textutil.phonetic_entries(
-            (self.cfg or {}).get("pronunciations") or {}, self.lang)
-            if self.supports_phonetics else {})
+        phonetics = self.phonetics_table(text) if self.supports_phonetics else {}
         if phonetics:
             # The server holds the phonemizer, so it is the one that can transcribe the
             # sentence and drop these in. Sending the table rather than a pre-built
