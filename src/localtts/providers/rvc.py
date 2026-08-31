@@ -257,7 +257,8 @@ class RvcProvider(Provider):
             raise TTSError("rvc-python wrote no audio to %s" % out_path)
 
         if profile:
-            audiofx.apply_profile(out_path, speed=residual_speed, volume=volume)
+            audiofx.apply_profile(out_path, speed=residual_speed, volume=volume,
+                                  breath=(profile or {}).get("breath", 0.0))
         return out_path
 
 

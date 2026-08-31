@@ -15,10 +15,9 @@ import unittest.mock
 import wave
 from pathlib import Path
 
-from localtts import audio, audiofx, config, g2p, hooks, providers, skills, text as textutil
+from localtts import (audio, audiofx, config, g2p, hooks, providers, servers,
+                      skills, text as textutil)
 from localtts.g2p import en as g2p_en, es as g2p_es
-from localtts import (audio, audiofx, config, hooks, providers, servers, skills,
-                      text as textutil)
 from localtts.cli import _resolve_session, _synthesize, main
 from localtts.errors import TTSError
 from localtts.providers.base import Provider
@@ -779,7 +778,8 @@ class RvcProviderTest(unittest.TestCase):
         provider.base_provider_instance = lambda: FakeBase()
         with unittest.mock.patch.object(
                 audiofx, "apply_profile",
-                side_effect=lambda path, speed=1.0, volume=1.0: applied.append(speed)):
+                side_effect=lambda path, speed=1.0, volume=1.0, breath=0.0:
+                    applied.append(speed)):
             with tempfile.TemporaryDirectory() as tmp:
                 textutil.synthesize_chunked(
                     provider, "<tired>Slow.</tired>", os.path.join(tmp, "out.wav"))
@@ -1110,7 +1110,7 @@ class ToneSegmentsTest(unittest.TestCase):
         segments = textutil.resolve_tone_segments("<zorbaxian>Odd word.</zorbaxian>")
         self.assertEqual(segments, [
             ("Odd word.", {"instructions": "Speak in a tone that conveys zorbaxian.",
-                          "speed": 1.0, "volume": 1.0}),
+                          "speed": 1.0, "volume": 1.0, "breath": 0.0}),
         ])
 
     def test_nested_tags_combine_phrases_and_multiply_speed_volume(self):
@@ -2199,6 +2199,108 @@ class AudioFxTest(unittest.TestCase):
             data = array.array("h"); data.frombytes(w.readframes(w.getnframes()))
         return max(abs(x) for x in data)
 
+    def vowel(self, rate=22050, f0=110, formants=(700, 1200, 2600), seconds=1.0):
+        """A synthetic vowel: harmonics of `f0` shaped by formant resonances.
+
+        A plain sine will not do for testing a whisper. In a sine the pitch *is* the
+        spectral envelope, so there is nothing to preserve once the pitch is gone; only
+        a harmonic-rich source shaped by formants can tell the two apart.
+        """
+        import array, math
+        samples = [0.0] * int(rate * seconds)
+        for harmonic in range(1, int(rate / 2 / f0)):
+            freq = f0 * harmonic
+            gain = sum(1.0 / (1.0 + ((freq - c) / 120.0) ** 2) for c in formants)
+            if gain < 0.01:
+                continue
+            for i in range(len(samples)):
+                samples[i] += gain * math.sin(2 * math.pi * freq * i / rate)
+        loudest = max(abs(v) for v in samples)
+        data = array.array("h", [int(8000 * v / loudest) for v in samples])
+        path = os.path.join(tempfile.mkdtemp(), "v.wav")
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+            w.writeframes(data.tobytes())
+        return path
+
+    def band_power(self, path, centre, half=150.0, tones=9, windows=10, width=1024):
+        """Mean power in a band, without a Fourier transform -- these tests run with no
+        third-party packages.
+
+        Averaged over several frequencies and several windows on purpose. A single
+        frequency in a single window estimates one bin, whose variance over noise is as
+        large as its mean, so the naive version measures the estimator, not the signal.
+        """
+        import array, math
+        with wave.open(path, "rb") as w:
+            data = array.array("h"); data.frombytes(w.readframes(w.getnframes()))
+            rate = w.getframerate()
+        total, taken = 0.0, 0
+        first, last = int(len(data) * 0.2), int(len(data) * 0.7)
+        step = (last - first) // max(1, windows - 1)
+        for w_index in range(windows):
+            start = first + w_index * step
+            if start + width > len(data):
+                continue
+            chunk = data[start:start + width]
+            for t in range(tones):
+                freq = centre - half + (2 * half) * t / (tones - 1)
+                real = sum(v * math.cos(2 * math.pi * freq * i / rate)
+                           for i, v in enumerate(chunk))
+                imag = sum(v * math.sin(2 * math.pi * freq * i / rate)
+                           for i, v in enumerate(chunk))
+                total += (real * real + imag * imag) / (width * width)
+                taken += 1
+        return total / taken if taken else 0.0
+
+    def periodicity(self, path, width=2048):
+        """Peak autocorrelation over human pitch lags: ~1 when voiced, ~0 when not."""
+        import array, math
+        with wave.open(path, "rb") as w:
+            data = array.array("h"); data.frombytes(w.readframes(w.getnframes()))
+            rate = w.getframerate()
+        chunk = [float(v) for v in data[len(data) // 3:len(data) // 3 + width * 2]]
+        head = sum(v * v for v in chunk[:width]) or 1.0
+        best = 0.0
+        for lag in range(int(rate / 400), int(rate / 70)):
+            cross = sum(chunk[i] * chunk[i + lag] for i in range(width))
+            tail = sum(chunk[i + lag] ** 2 for i in range(width)) or 1.0
+            best = max(best, cross / math.sqrt(head * tail))
+        return best
+
+    def test_whispering_removes_the_pitch(self):
+        """A whisper has no vocal fold vibration at all, so periodicity has to go."""
+        path = self.vowel()
+        self.assertGreater(self.periodicity(path), 0.8)
+        audiofx.apply_breath(path, 1.0)
+        self.assertLess(self.periodicity(path), 0.4)
+
+    def test_whispering_keeps_the_formants(self):
+        """...but only the pitch goes. The formants are what make a vowel an "a" rather
+        than an "e", so they have to survive, or the words stop being words.
+
+        This is the regression worth guarding: two earlier versions killed the pitch
+        and the formants together, measured as successes, and sounded like static.
+        """
+        import math
+        formants = (700, 1200, 2600)
+        path = self.vowel(formants=formants)
+        before = [self.band_power(path, hz) for hz in formants]
+        audiofx.apply_breath(path, 1.0)
+        after = [self.band_power(path, hz) for hz in formants]
+        loudest_before, loudest_after = max(before), max(after)
+        for hz, was, now in zip(formants, before, after):
+            drift = abs(10 * math.log10(was / loudest_before)
+                        - 10 * math.log10(now / loudest_after))
+            self.assertLess(drift, 3.0, "formant %d Hz moved %.1f dB" % (hz, drift))
+
+    def test_whispering_nothing_is_a_no_op(self):
+        self.assertFalse(audiofx.apply_breath(self.vowel(seconds=0.2), 0.0))
+
+    def test_whispering_something_too_short_to_analyze_is_left_alone(self):
+        path = self.tone(seconds=0.005)
+        self.assertFalse(audiofx.apply_breath(path, 1.0))
+
     def seconds(self, path):
         with wave.open(path, "rb") as w:
             return w.getnframes() / float(w.getframerate())
@@ -2280,6 +2382,18 @@ class ToneRealizationTest(unittest.TestCase):
             data = array.array("h"); data.frombytes(w.readframes(w.getnframes()))
         return max(abs(x) for x in data)
 
+    def rms(self, path):
+        import array, math
+        with wave.open(path, "rb") as w:
+            data = array.array("h"); data.frombytes(w.readframes(w.getnframes()))
+        return math.sqrt(sum(float(v) * v for v in data) / len(data))
+
+    def loud_wav_reference(self):
+        """The same wav loud_wav() hands the provider, to measure a level against."""
+        path = os.path.join(tempfile.mkdtemp(), "ref.wav")
+        self.loud_wav(path)
+        return path
+
     def loud_wav(self, path, amplitude=10000, frames=4000):
         import array
         import math
@@ -2300,8 +2414,17 @@ class ToneRealizationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "out.wav")
             textutil.synthesize_chunked(provider, "<whisper>quiet please</whisper>", out)
-            expected = 10000 * textutil.tag_profile("whisper")["volume"]
-            self.assertAlmostEqual(self.peak(out), expected, delta=120)
+            # Measured as RMS against the same audio carrying <whisper>'s breath but
+            # not its volume. Peak stopped tracking level once breath began replacing
+            # the voiced excitation with noise, which peaks much further above its own
+            # average than a sine does; and comparing against the untouched sine would
+            # fold the breath's own losses into what is meant to be a test of volume.
+            # apply_breath seeds its noise fixed, so this reference is exact.
+            profile = textutil.tag_profile("whisper")
+            reference = self.loud_wav_reference()
+            audiofx.apply_breath(reference, profile["breath"])
+            expected = self.rms(reference) * profile["volume"]
+            self.assertAlmostEqual(self.rms(out), expected, delta=expected * 0.02)
 
     def test_command_output_is_not_reshaped_unless_asked(self):
         """Every other backend's capabilities are known here, so leftovers are safely
@@ -3317,3 +3440,47 @@ class PronounceTest(unittest.TestCase):
         from localtts import phonetics
         provider = KokoroProvider(dict(config.DEFAULTS["providers"]["kokoro"]))
         self.assertIsNone(phonetics.unsupported_phonemes(provider, "abc"))
+
+
+class ToneIntensityTest(unittest.TestCase):
+    """How hard a <tag> is acted. The presets are deliberately modest so a chain of them
+    stays listenable; this is the knob for someone who wants them played up."""
+
+    def tearDown(self):
+        textutil.set_tone_intensity(1.0)
+
+    def test_one_is_the_presets_unchanged(self):
+        textutil.set_tone_intensity(1.0)
+        self.assertAlmostEqual(textutil.tag_profile("whisper")["volume"], 0.55, places=2)
+
+    def test_two_is_the_tag_applied_twice(self):
+        """The scale is geometric because these are multipliers, and nested tags already
+        multiply -- so intensity 2 has a definition, not just a bigger number."""
+        textutil.set_tone_intensity(2.0)
+        self.assertAlmostEqual(textutil.tag_profile("whisper")["volume"], 0.55 ** 2, places=3)
+        self.assertAlmostEqual(textutil.tag_profile("excited")["speed"], 1.12 ** 2, places=3)
+
+    def test_neutral_stays_neutral_at_any_intensity(self):
+        """A tag with nothing to exaggerate must not acquire something."""
+        for intensity in (0.0, 1.0, 2.0, 4.0):
+            textutil.set_tone_intensity(intensity)
+            profile = textutil.tag_profile("question")     # 1.0 / 1.0 in TAG_PROFILES
+            self.assertEqual((profile["speed"], profile["volume"]), (1.0, 1.0), intensity)
+
+    def test_zero_flattens_every_tag(self):
+        textutil.set_tone_intensity(0.0)
+        for name in ("whisper", "excited", "sad"):
+            profile = textutil.tag_profile(name)
+            self.assertEqual((profile["speed"], profile["volume"]), (1.0, 1.0), name)
+
+    def test_it_is_clamped_where_the_synthesizer_would_refuse(self):
+        """Kokoro rejects a speed outside 0.5-2.0, and a volume of 0 is silence rather
+        than a quiet reading."""
+        textutil.set_tone_intensity(4.0)
+        combined = textutil._combine_profiles(["whisper", "tired", "sad"])
+        self.assertGreaterEqual(combined["speed"], 0.5)
+        self.assertGreater(combined["volume"], 0.0)
+
+    def test_a_bad_value_falls_back_rather_than_raising(self):
+        self.assertEqual(textutil.set_tone_intensity("mucho"), 1.0)
+        self.assertEqual(textutil.set_tone_intensity(None), 1.0)

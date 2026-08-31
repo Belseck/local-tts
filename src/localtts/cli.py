@@ -179,6 +179,8 @@ def _resolve_language(cfg, args):
 def speak(argv):
     args = _speak_parser().parse_args(argv)
     cfg = config.load()
+    # Once, from the config: tag_profile() reads it for every tag afterwards.
+    textutil.set_tone_intensity(cfg.get("tone_intensity", 1.0))
 
     text, is_markdown = _read_text(args)
     if args.markdown or (args.markdown is None and is_markdown):

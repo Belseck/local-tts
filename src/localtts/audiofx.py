@@ -16,6 +16,7 @@ WSOLA fallback so the feature never silently does nothing on a machine without f
 """
 
 import array
+import random
 import math
 import os
 import shutil
@@ -282,11 +283,169 @@ def append_silence(path, seconds):
     return True
 
 
-def apply_profile(path, speed=1.0, volume=1.0):
+#: Peak the whisper is allowed to reach, just under full scale.
+_CEILING = 32000.0
+
+#: How many poles model the vocal tract. Enough for the three or four formants that
+#: distinguish vowels; more would start fitting the pitch, which is the thing being
+#: thrown away.
+_BREATH_ORDER = 14
+
+#: Analysis frame, in seconds. Long enough to see a couple of pitch periods, short
+#: enough that the mouth has not moved much within one.
+_BREATH_FRAME = 0.023
+
+
+def _levinson(autocorr, order):
+    """Autocorrelation -> all-pole filter coefficients, by Levinson-Durbin recursion.
+
+    The resulting filter is guaranteed stable, which matters here: it is run over noise
+    for the whole utterance, and an unstable one would not merely sound wrong, it would
+    diverge into clipping.
+    """
+    coeffs = [0.0] * (order + 1)
+    coeffs[0] = 1.0
+    error = autocorr[0]
+    if error <= 0.0:
+        return coeffs
+    for i in range(1, order + 1):
+        acc = autocorr[i] + sum(coeffs[j] * autocorr[i - j] for j in range(1, i))
+        reflection = -acc / error
+        updated = coeffs[:]
+        for j in range(1, i):
+            updated[j] = coeffs[j] + reflection * coeffs[i - j]
+        updated[i] = reflection
+        coeffs = updated
+        error *= 1.0 - reflection * reflection
+        if error <= 0.0:
+            break
+    return coeffs
+
+
+def apply_breath(path, amount):
+    """Turn voiced speech into whispered speech, in place.
+
+    A whisper is not quiet speech: it is speech with no vocal fold vibration at all.
+    The vowels are turbulence shaped by the mouth rather than a pitched buzz filtered
+    by it. Kokoro has no phonation control, so this has to be done to the rendered wave.
+
+    Linear prediction separates the two. Each frame is fitted with an all-pole filter
+    that models the vocal tract -- the formants, which are what make a vowel an "a"
+    rather than an "e" -- and that same filter is then driven with noise instead of
+    with the original pitched excitation. The words survive; the pitch does not.
+
+    Two earlier attempts are worth recording, since both measured as successes:
+
+    - Multiplying the signal by white noise. Convolving with a flat spectrum does kill
+      periodicity, and also flattens the formants: on a sustained "a" the energy moved
+      from 200 Hz to 1800 Hz. It sounded like static, correctly.
+    - A ten-band vocoder, noise shaped by each band's envelope. Better, but the
+      resonator gain landed on both the noise and the envelope measured through it, so
+      per-band error compounded: the 2600 Hz formant of a synthetic vowel dropped 17 dB
+      and a spectral valley became the loudest thing in the signal.
+
+    Against that synthetic vowel this version holds all three formants within 0.5 dB
+    and drops periodicity from 0.98 to 0.17. It fills the spectral valleys between them
+    by a few dB -- noise excitation always will, and a real whisper does the same.
+
+    `amount` is how much of the voiced signal is replaced, 0 to 1, mixed rather than
+    switched: consonants are turbulent already and keep their bite with some of the
+    original left in.
+    """
+    amount = max(0.0, min(1.0, float(amount)))
+    if amount < EPSILON:
+        return False
+    params, raw = _read(path)
+    samples = array.array("h")
+    samples.frombytes(raw)
+    rate = params.framerate
+    channels = params.nchannels
+    frame = max(128, int(rate * _BREATH_FRAME))
+    if len(samples) < frame * 2 * channels:
+        return False
+
+    mono = [float(v) for v in (samples[0::channels] if channels > 1 else samples)]
+    count = len(mono)
+    hop = frame // 2
+    window = [0.5 - 0.5 * math.cos(2.0 * math.pi * i / frame) for i in range(frame)]
+
+    rand = random.Random(0)                       # same text, same whisper
+    whispered = [0.0] * count
+    weight = [0.0] * count
+    history = [0.0] * _BREATH_ORDER
+
+    for start in range(0, count - frame + 1, hop):
+        segment = [mono[start + i] * window[i] for i in range(frame)]
+        autocorr = [sum(segment[i] * segment[i + lag] for i in range(frame - lag))
+                    for lag in range(_BREATH_ORDER + 1)]
+        if autocorr[0] <= 0.0:
+            continue
+        autocorr[0] *= 1.0001                     # a ridge, so near-silence stays solvable
+        coeffs = _levinson(autocorr, _BREATH_ORDER)
+
+        excited = []
+        for _ in range(frame):
+            value = rand.random() * 2.0 - 1.0
+            for j in range(1, _BREATH_ORDER + 1):
+                value -= coeffs[j] * history[j - 1]
+            history = [value] + history[:-1]
+            excited.append(value)
+
+        loudness = math.sqrt(sum(v * v for v in segment) / frame)
+        synthetic = math.sqrt(sum(v * v for v in excited) / frame)
+        if synthetic <= 0.0:
+            continue
+        gain = loudness / synthetic
+        for i in range(frame):
+            whispered[start + i] += excited[i] * gain * window[i]
+            weight[start + i] += window[i] * window[i]
+
+    # Undo the analysis window. The floor is what keeps the first and last few samples
+    # sane: there only one window overlaps and its weight tapers to zero, so dividing by
+    # it raw turns a handful of edge samples into astronomical ones -- which then set the
+    # level for everything that follows. Clamping instead fades those edges, which is
+    # what they should do anyway.
+    floor = 0.25 * (max(weight) or 1.0)
+    for i in range(count):
+        whispered[i] = whispered[i] / max(weight[i], floor)
+
+    # Per-frame gain matched each frame's *windowed* loudness, and overlap-adding
+    # uncorrelated noise does not put that back the way overlap-adding the original
+    # would: the result lands about 30% quiet. Rather than derive the constant, match
+    # the level outright, which also stays right if the window or hop ever changes.
+    scale = 1.0
+    voiced_level = math.sqrt(sum(v * v for v in mono) / count)
+    breathed_level = math.sqrt(sum(v * v for v in whispered) / count)
+    if breathed_level > 0.0:
+        scale = voiced_level / breathed_level
+    # ...and then back off if that would clip. Noise peaks perhaps three times further
+    # above its own average than a voiced buzz does, so a line that was comfortably loud
+    # can whisper past full scale.
+    loudest = max((abs(v) for v in whispered), default=0.0) * scale
+    if loudest > _CEILING:
+        scale *= _CEILING / loudest
+
+    for i in range(count):
+        mixed = int((1.0 - amount) * mono[i] + amount * scale * whispered[i])
+        value = -32768 if mixed < -32768 else (32767 if mixed > 32767 else mixed)
+        for c in range(channels):
+            samples[i * channels + c] = value
+
+    if sys.byteorder == "big":
+        samples.byteswap()
+    _write(path, params, samples.tobytes())
+    return True
+
+
+def apply_profile(path, speed=1.0, volume=1.0, breath=0.0):
     """Apply whatever a provider could not realize itself. Never raises: a failed
     cosmetic transform must leave the original audio playable, not break synthesis."""
     changed = False
     try:
+        # Before the volume cut, so the turbulence is shaped by the full signal rather
+        # than by whatever is left after a whisper's own attenuation.
+        if breath and breath >= EPSILON:
+            changed = apply_breath(path, float(breath)) or changed
         if speed and abs(speed - 1.0) >= EPSILON:
             changed = apply_speed(path, float(speed)) or changed
         if volume and abs(volume - 1.0) >= EPSILON:

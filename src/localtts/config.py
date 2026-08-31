@@ -43,6 +43,10 @@ DEFAULTS = {
     # A bare key applies to every language; `<lang>:<word>` applies to that one only, so
     # a word said differently in two languages needs no nested structure. <tag> markup is
     # left untouched either way.
+    # How hard to act a <tag>. 1.0 is the built-in presets, deliberately modest so a
+    # chain of them stays listenable; 2.0 doubles how far each one departs from neutral,
+    # 0 flattens them to nothing. Scales the deviation, so neutral stays neutral.
+    "tone_intensity": 1.0,
     "pronunciations": {},
     "player_args": {},
     # Environment applied to the player process only, e.g.
@@ -264,6 +268,7 @@ DEFAULTS = {
 
 
 TOP_LEVEL_KEYS = ("provider", "play", "player", "terminal_title", "stream",
+                  "tone_intensity",
                   "player_args", "player_env", "pronunciations",
                   "phonetics_hooks", "phonetics_hook_timeout")
 #: Top-level settings that are maps, so `--set` takes one more level:

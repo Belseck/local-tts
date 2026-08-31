@@ -151,7 +151,8 @@ class KokoroProvider(Provider):
                 # so a tag's volume has to be applied right here or it is silently lost,
                 # which made <whisper> merely slow instead of quiet.
                 if profile and profile["volume"] != 1.0:
-                    audiofx.apply_profile(part, speed=1.0, volume=profile["volume"])
+                    audiofx.apply_profile(part, speed=1.0, volume=profile["volume"],
+                                          breath=profile.get("breath", 0.0))
                 self.emit_part(part)
             audiomod.concat_wavs(parts, out_path)
         finally:

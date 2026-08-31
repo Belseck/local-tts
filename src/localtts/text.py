@@ -194,6 +194,53 @@ TAG_PROFILES = {
 }
 
 
+#: How far a tag's prosody is pushed from neutral. 1.0 is the built-in presets, which
+#: are deliberately modest so a chain of them stays listenable; 2.0 doubles every
+#: deviation, so <whisper>'s 0.55 volume becomes 0.10 and <excited>'s 1.12 speed 1.24.
+#: Set through `tone_intensity` in the config rather than by editing TAG_PROFILES: the
+#: presets stay the reference, and how hard to act them is the user's call. The scale is
+#: geometric, so 2.0 means "as if the tag were applied twice".
+TONE_INTENSITY = 1.0
+
+#: How much of the voiced excitation each tag replaces with turbulence, 0 to 1. Only
+#: the tags that describe an unvoiced or near-unvoiced delivery: a whisper has no vocal
+#: fold vibration at all, and "gentle" is breathy without being whispered. Everything
+#: else stays voiced, because adding air to an ordinary sentence just sounds broken.
+#: Scaled by TONE_INTENSITY like speed and volume, and capped below 1.0 -- at 1.0 the
+#: consonants lose their edges and the words stop being recognizable.
+TAG_BREATH = {"whisper": 0.55, "gentle": 0.15, "tired": 0.12, "afraid": 0.18,
+              "fear": 0.18}
+
+
+def _exaggerate(value, intensity):
+    """Push a multiplier further from 1.0, geometrically.
+
+    Raising to a power rather than scaling the gap, because these *are* multipliers and
+    _combine_profiles already multiplies them for nested tags -- so intensity 2 means
+    exactly "as if the tag were applied twice", which is a definition a reader can hold.
+
+    It also behaves where linear scaling does not. <whisper> is 0.55 volume; linearly
+    doubled that is 0.10, which is not a loud whisper, it is silence. Squared it is
+    0.30: quieter, still audible. And 1.0 to any power is still 1.0, so neutral stays
+    neutral either way.
+    """
+    if value <= 0:
+        return value
+    return value ** intensity
+
+
+def set_tone_intensity(value):
+    """Set it once per run, from the config. Clamped: the synthesizer rejects a speed
+    outside 0.5-2.0, and past about 4 the presets stop being emphasis and start being
+    damage -- a whisper at zero volume is silence, not a whisper."""
+    global TONE_INTENSITY
+    try:
+        TONE_INTENSITY = max(0.0, min(4.0, float(value)))
+    except (TypeError, ValueError):
+        TONE_INTENSITY = 1.0
+    return TONE_INTENSITY
+
+
 def tag_profile(name):
     """One tag's {"instructions", "speed", "volume"} -- a built-in preset from
     TAG_PROFILES when the name matches one (case-insensitive), else a generic
@@ -204,24 +251,38 @@ def tag_profile(name):
     key = name.lower()
     if key in TAG_PROFILES:
         instructions, speed, volume = TAG_PROFILES[key]
-        return {"instructions": instructions, "speed": speed, "volume": volume}
-    return {"instructions": "Speak in a tone that conveys %s." % name, "speed": 1.0, "volume": 1.0}
+        breath = TAG_BREATH.get(key, 0.0)
+        if breath:
+            # More intensity means more air, but never all of it.
+            breath = min(0.9, breath * TONE_INTENSITY)
+        return {"instructions": instructions,
+                "speed": _exaggerate(speed, TONE_INTENSITY),
+                "volume": max(0.05, _exaggerate(volume, TONE_INTENSITY)),
+                "breath": breath}
+    return {"instructions": "Speak in a tone that conveys %s." % name,
+            "speed": 1.0, "volume": 1.0, "breath": 0.0}
 
 
 def _combine_profiles(names):
     """Nested tags (<a><b>...</b></a>) combine: instructions concatenate outer-first,
     speed/volume multiply (so two mild adjustments compound into a stronger one)."""
-    phrases, speed, volume = [], 1.0, 1.0
+    phrases, speed, volume, breath = [], 1.0, 1.0, 0.0
     for name in names:
         profile = tag_profile(name)
         if profile["instructions"]:
             phrases.append(profile["instructions"])
         speed *= profile["speed"]
         volume *= profile["volume"]
-    return {"instructions": " ".join(phrases) or None, "speed": speed, "volume": volume}
+        breath = max(breath, profile.get("breath", 0.0))   # the airiest tag wins
+    # Clamped after multiplying, not before: two tags that each stay in range can still
+    # compound past what the synthesizer accepts (0.5-2.0), and a speed of 0 is not a
+    # slower reading, it is a crash.
+    return {"instructions": " ".join(phrases) or None,
+            "speed": max(0.5, min(2.0, speed)), "volume": max(0.05, min(4.0, volume)),
+            "breath": min(0.9, breath)}
 
 
-_NEUTRAL_PROFILE = {"instructions": None, "speed": 1.0, "volume": 1.0}
+_NEUTRAL_PROFILE = {"instructions": None, "speed": 1.0, "volume": 1.0, "breath": 0.0}
 
 
 def resolve_tone_segments(text, auto_tone=False):
@@ -509,20 +570,24 @@ def _synthesize_with_audiofx(provider, text, out_path, voice, on_progress):
     does_volume = getattr(provider, "realizes_volume", False)
     pending = [
         (chunk, 1.0 if does_speed or not profile else profile["speed"],
-                1.0 if does_volume or not profile else profile["volume"])
+                1.0 if does_volume or not profile else profile["volume"],
+                0.0 if not profile else profile.get("breath", 0.0))
         for chunk, profile in segments
     ]
+    # Breath counts here too: no backend realizes a whisper on its own, so a tag that
+    # asks only for one must still bring us in, even where speed and volume are handled.
     if all(abs(sp - 1.0) < audiofx.EPSILON and abs(vol - 1.0) < audiofx.EPSILON
-           for _, sp, vol in pending):
+           and br < audiofx.EPSILON
+           for _, sp, vol, br in pending):
         return None                      # tags present, but nothing for us to realize
 
     work = tempfile.mkdtemp(prefix="local-tts-tone-")
     parts = [os.path.join(work, "%04d.wav" % index) for index in range(len(pending))]
     try:
         with _own_the_stream(provider) as emit:
-            for index, ((chunk, speed, volume), part) in enumerate(zip(pending, parts)):
+            for index, ((chunk, speed, volume, breath), part) in enumerate(zip(pending, parts)):
                 provider.synthesize(strip_tone_tags(chunk), part, voice=voice)
-                audiofx.apply_profile(part, speed=speed, volume=volume)
+                audiofx.apply_profile(part, speed=speed, volume=volume, breath=breath)
                 if emit:
                     emit(part)          # playable now; the rest are still being made
                 if on_progress:
