@@ -301,7 +301,10 @@ _BREATH_HIGHPASS_POLES = 3
 
 #: Corner of the low-pass on the excitation, in Hz, 0 to leave the top open. Whisper
 #: turbulence is broadband but not white: it has a broad peak and falls away above it.
-_BREATH_LOWPASS = 6000.0
+#: Fitted, like the rest: during the loudest moments the references carry -20.4 dB of
+#: their energy above 4 kHz and an unfiltered synthesis carried -16.5, which is heard as
+#: harshness on the sibilants rather than as a whisper. 3000 Hz lands on -20.1.
+_BREATH_LOWPASS = 3000.0
 
 #: Peak the whisper is allowed to reach, just under full scale.
 _CEILING = 32000.0
