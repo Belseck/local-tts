@@ -283,6 +283,26 @@ def append_silence(path, seconds):
     return True
 
 
+#: Pre-emphasis applied to the noise before it drives the vocal tract filter, as a
+#: number of first-order stages and their coefficient. This is what makes a whisper
+#: sound like one rather than like speech with the pitch removed: the fitted filter
+#: absorbs the glottal source's own -12 dB/octave slope, so exciting it with flat noise
+#: reproduces the balance of voiced speech. Whispering replaces that source with
+#: turbulence, which is far flatter, and the tilt has to be taken back out.
+_BREATH_TILT_STAGES = 1
+_BREATH_TILT = 0.70
+
+#: Corner of the high-pass on the excitation, in Hz, and how many one-pole sections it
+#: cascades into. A whisper has next to nothing down there -- no fundamental to put it
+#: there, and a raised first formant besides -- and a single pole rolls off too gently
+#: to move the peak of the spectrum where it belongs.
+_BREATH_HIGHPASS = 300.0
+_BREATH_HIGHPASS_POLES = 3
+
+#: Corner of the low-pass on the excitation, in Hz, 0 to leave the top open. Whisper
+#: turbulence is broadband but not white: it has a broad peak and falls away above it.
+_BREATH_LOWPASS = 4500.0
+
 #: Peak the whisper is allowed to reach, just under full scale.
 _CEILING = 32000.0
 
@@ -370,6 +390,30 @@ def apply_breath(path, amount):
     window = [0.5 - 0.5 * math.cos(2.0 * math.pi * i / frame) for i in range(frame)]
 
     rand = random.Random(0)                       # same text, same whisper
+    noise = [rand.random() * 2.0 - 1.0 for _ in range(count)]
+    for _ in range(_BREATH_TILT_STAGES):
+        previous = 0.0
+        for i in range(count):
+            current = noise[i]
+            noise[i] = current - _BREATH_TILT * previous
+            previous = current
+    if _BREATH_HIGHPASS > 0.0:
+        decay = math.exp(-2.0 * math.pi * _BREATH_HIGHPASS / rate)
+        for _ in range(_BREATH_HIGHPASS_POLES):
+            last_in = last_out = 0.0
+            for i in range(count):
+                current = noise[i]
+                last_out = decay * (last_out + current - last_in)
+                last_in = current
+                noise[i] = last_out
+
+    if _BREATH_LOWPASS > 0.0:
+        decay = math.exp(-2.0 * math.pi * _BREATH_LOWPASS / rate)
+        last = 0.0
+        for i in range(count):
+            last = decay * last + (1.0 - decay) * noise[i]
+            noise[i] = last
+
     whispered = [0.0] * count
     weight = [0.0] * count
     history = [0.0] * _BREATH_ORDER
@@ -384,8 +428,8 @@ def apply_breath(path, amount):
         coeffs = _levinson(autocorr, _BREATH_ORDER)
 
         excited = []
-        for _ in range(frame):
-            value = rand.random() * 2.0 - 1.0
+        for offset in range(frame):
+            value = noise[start + offset]
             for j in range(1, _BREATH_ORDER + 1):
                 value -= coeffs[j] * history[j - 1]
             history = [value] + history[:-1]

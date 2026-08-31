@@ -2200,18 +2200,22 @@ class AudioFxTest(unittest.TestCase):
         return max(abs(x) for x in data)
 
     def vowel(self, rate=22050, f0=110, formants=(700, 1200, 2600), seconds=1.0):
-        """A synthetic vowel: harmonics of `f0` shaped by formant resonances.
+        """A synthetic vowel: harmonics of `f0` shaped by formant resonances, over a
+        source that falls with frequency the way vocal folds make it.
 
         A plain sine will not do for testing a whisper. In a sine the pitch *is* the
         spectral envelope, so there is nothing to preserve once the pitch is gone; only
-        a harmonic-rich source shaped by formants can tell the two apart.
+        a harmonic-rich source shaped by formants can tell the two apart. The source
+        slope matters just as much: it is what a whisper replaces with flat turbulence,
+        so a vowel built on a flat source cannot show that happening.
         """
         import array, math
         samples = [0.0] * int(rate * seconds)
         for harmonic in range(1, int(rate / 2 / f0)):
             freq = f0 * harmonic
-            gain = sum(1.0 / (1.0 + ((freq - c) / 120.0) ** 2) for c in formants)
-            if gain < 0.01:
+            gain = sum(1.0 / (1.0 + ((freq - c) / 70.0) ** 2) for c in formants)
+            gain /= float(harmonic)                         # the glottal source's slope
+            if gain < 1e-5:
                 continue
             for i in range(len(samples)):
                 samples[i] += gain * math.sin(2 * math.pi * freq * i / rate)
@@ -2277,22 +2281,64 @@ class AudioFxTest(unittest.TestCase):
 
     def test_whispering_keeps_the_formants(self):
         """...but only the pitch goes. The formants are what make a vowel an "a" rather
-        than an "e", so they have to survive, or the words stop being words.
+        than an "e", so each has to survive as a peak against the valleys around it, or
+        the words stop being words.
 
-        This is the regression worth guarding: two earlier versions killed the pitch
-        and the formants together, measured as successes, and sounded like static.
+        Their *levels* are deliberately not pinned: apply_breath also re-tilts the
+        spectrum, which moves them relative to one another on purpose. Peak-against-
+        valley is the part that carries the vowel, and it is what this checks.
+
+        The formants are spaced widely here for a reason. A vowel whose first two sit
+        500 Hz apart has no resolvable valley between them even before processing, so a
+        reading taken there measures the test signal rather than the code.
         """
         import math
-        formants = (700, 1200, 2600)
+        formants = (400, 1800, 2800)
+        valleys = (1100, 2300, 3700)
         path = self.vowel(formants=formants)
-        before = [self.band_power(path, hz) for hz in formants]
         audiofx.apply_breath(path, 1.0)
-        after = [self.band_power(path, hz) for hz in formants]
-        loudest_before, loudest_after = max(before), max(after)
-        for hz, was, now in zip(formants, before, after):
-            drift = abs(10 * math.log10(was / loudest_before)
-                        - 10 * math.log10(now / loudest_after))
-            self.assertLess(drift, 3.0, "formant %d Hz moved %.1f dB" % (hz, drift))
+        peaks = [self.band_power(path, hz) for hz in formants]
+        floors = [self.band_power(path, hz) for hz in valleys]
+        for index, hz in enumerate(formants):
+            nearby = max(floors[index - 1] if index else floors[0], floors[index])
+            margin = 10 * math.log10(peaks[index] / nearby)
+            self.assertGreater(margin, 4.0,
+                               "formant %d Hz stands only %.1f dB above its valleys"
+                               % (hz, margin))
+
+    def test_whispering_brightens_the_spectrum(self):
+        """A whisper is not just an unpitched voice, it is a brighter one.
+
+        The filter fitted to voiced speech absorbs the glottal source's own steep slope,
+        so noise poured through it comes back sounding like speech with the pitch
+        removed rather than like a whisper. Real whispered speech, measured against two
+        recordings of it, sits around an octave higher in spectral centroid; the
+        excitation is pre-emphasized and band-limited to put it there.
+        """
+        import array, math
+        def centroid(path):
+            with wave.open(path, "rb") as w:
+                data = array.array("h"); data.frombytes(w.readframes(w.getnframes()))
+                rate = w.getframerate()
+            chunk = data[len(data) // 3:len(data) // 3 + 2048]
+            weighted = total = 0.0
+            for step in range(1, 60):
+                freq = step * 100.0
+                if freq >= rate / 2:
+                    break
+                real = sum(v * math.cos(2 * math.pi * freq * i / rate)
+                           for i, v in enumerate(chunk))
+                imag = sum(v * math.sin(2 * math.pi * freq * i / rate)
+                           for i, v in enumerate(chunk))
+                magnitude = math.sqrt(real * real + imag * imag)
+                weighted += magnitude * freq
+                total += magnitude
+            return weighted / total if total else 0.0
+
+        path = self.vowel(formants=(400, 1800, 2800))
+        before = centroid(path)
+        audiofx.apply_breath(path, 1.0)
+        self.assertGreater(centroid(path), before * 1.4)
 
     def test_whispering_nothing_is_a_no_op(self):
         self.assertFalse(audiofx.apply_breath(self.vowel(seconds=0.2), 0.0))
