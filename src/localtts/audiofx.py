@@ -290,18 +290,18 @@ def append_silence(path, seconds):
 #: reproduces the balance of voiced speech. Whispering replaces that source with
 #: turbulence, which is far flatter, and the tilt has to be taken back out.
 _BREATH_TILT_STAGES = 1
-_BREATH_TILT = 0.70
+_BREATH_TILT = 0.55
 
 #: Corner of the high-pass on the excitation, in Hz, and how many one-pole sections it
 #: cascades into. A whisper has next to nothing down there -- no fundamental to put it
 #: there, and a raised first formant besides -- and a single pole rolls off too gently
 #: to move the peak of the spectrum where it belongs.
-_BREATH_HIGHPASS = 300.0
+_BREATH_HIGHPASS = 450.0
 _BREATH_HIGHPASS_POLES = 3
 
 #: Corner of the low-pass on the excitation, in Hz, 0 to leave the top open. Whisper
 #: turbulence is broadband but not white: it has a broad peak and falls away above it.
-_BREATH_LOWPASS = 4500.0
+_BREATH_LOWPASS = 6000.0
 
 #: Peak the whisper is allowed to reach, just under full scale.
 _CEILING = 32000.0
@@ -309,7 +309,7 @@ _CEILING = 32000.0
 #: How many poles model the vocal tract. Enough for the three or four formants that
 #: distinguish vowels; more would start fitting the pitch, which is the thing being
 #: thrown away.
-_BREATH_ORDER = 14
+_BREATH_ORDER = 28
 
 #: Analysis frame, in seconds. Long enough to see a couple of pitch periods, short
 #: enough that the mouth has not moved much within one.

@@ -178,7 +178,7 @@ TAG_PROFILES = {
     "calm":        ("Speak calmly and evenly.", 0.95, 0.95),
     "excited":     ("Speak with excited, energetic emphasis.", 1.12, 1.10),
     "serious":     ("Speak in a serious, measured tone.", 0.95, 1.00),
-    "whisper":     ("Whisper, very quietly and softly.", 0.90, 0.55),
+    "whisper":     ("Whisper, very quietly and softly.", 0.90, 0.59),
     "sarcastic":   ("Speak with a dry, sarcastic edge.", 1.00, 1.00),
     "sarcasm":     ("Speak with a dry, sarcastic edge.", 1.00, 1.00),
     "urgent":      ("Speak urgently, with a sense of importance.", 1.15, 1.10),
@@ -194,9 +194,14 @@ TAG_PROFILES = {
 }
 
 
+#: <whisper>'s volume is not a taste: at the tone_intensity this was fitted at, it puts
+#: the rendered whisper at -40 dBFS, the average level of the recordings in
+#: tools/train_whisper.py's reference set. Their own takes span -52 to -31 dBFS, so the
+#: average is the only defensible point in that range.
+
 #: How far a tag's prosody is pushed from neutral. 1.0 is the built-in presets, which
 #: are deliberately modest so a chain of them stays listenable; 2.0 doubles every
-#: deviation, so <whisper>'s 0.55 volume becomes 0.10 and <excited>'s 1.12 speed 1.24.
+#: deviation, so <whisper>'s 0.59 volume becomes 0.18 and <excited>'s 1.12 speed 1.24.
 #: Set through `tone_intensity` in the config rather than by editing TAG_PROFILES: the
 #: presets stay the reference, and how hard to act them is the user's call. The scale is
 #: geometric, so 2.0 means "as if the tag were applied twice".
@@ -206,9 +211,12 @@ TONE_INTENSITY = 1.0
 #: the tags that describe an unvoiced or near-unvoiced delivery: a whisper has no vocal
 #: fold vibration at all, and "gentle" is breathy without being whispered. Everything
 #: else stays voiced, because adding air to an ordinary sentence just sounds broken.
-#: Scaled by TONE_INTENSITY like speed and volume, and capped below 1.0 -- at 1.0 the
-#: consonants lose their edges and the words stop being recognizable.
-TAG_BREATH = {"whisper": 0.55, "gentle": 0.15, "tired": 0.12, "afraid": 0.18,
+#: Scaled by TONE_INTENSITY like speed and volume. "whisper" replaces the excitation
+#: outright, because that is what the word means: fitted against recordings of real
+#: whispers, full replacement matched them better than any partial mix, and it costs
+#: the consonants nothing -- their attacks measured within 0.05 dB of the untouched
+#: rendering, since a whisper's consonants are turbulent to begin with.
+TAG_BREATH = {"whisper": 1.0, "gentle": 0.15, "tired": 0.12, "afraid": 0.18,
               "fear": 0.18}
 
 
@@ -219,10 +227,10 @@ def _exaggerate(value, intensity):
     _combine_profiles already multiplies them for nested tags -- so intensity 2 means
     exactly "as if the tag were applied twice", which is a definition a reader can hold.
 
-    It also behaves where linear scaling does not. <whisper> is 0.55 volume; linearly
-    doubled that is 0.10, which is not a loud whisper, it is silence. Squared it is
-    0.30: quieter, still audible. And 1.0 to any power is still 1.0, so neutral stays
-    neutral either way.
+    It also behaves where linear scaling does not. <whisper> is 0.59 volume; linearly
+    doubled that is 0.18, which is not a louder whisper, it is nearly silence. Squared
+    it is 0.35: quieter, still audible. And 1.0 to any power is still 1.0, so neutral
+    stays neutral either way.
     """
     if value <= 0:
         return value
@@ -254,7 +262,7 @@ def tag_profile(name):
         breath = TAG_BREATH.get(key, 0.0)
         if breath:
             # More intensity means more air, but never all of it.
-            breath = min(0.9, breath * TONE_INTENSITY)
+            breath = min(1.0, breath * TONE_INTENSITY)
         return {"instructions": instructions,
                 "speed": _exaggerate(speed, TONE_INTENSITY),
                 "volume": max(0.05, _exaggerate(volume, TONE_INTENSITY)),
@@ -279,7 +287,7 @@ def _combine_profiles(names):
     # slower reading, it is a crash.
     return {"instructions": " ".join(phrases) or None,
             "speed": max(0.5, min(2.0, speed)), "volume": max(0.05, min(4.0, volume)),
-            "breath": min(0.9, breath)}
+            "breath": min(1.0, breath)}
 
 
 _NEUTRAL_PROFILE = {"instructions": None, "speed": 1.0, "volume": 1.0, "breath": 0.0}

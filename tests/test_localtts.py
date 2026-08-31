@@ -2483,7 +2483,11 @@ class ToneRealizationTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 out = os.path.join(tmp, "out.wav")
                 textutil.synthesize_chunked(provider, "<whisper>quiet</whisper>", out)
-                quieter = self.peak(out) < 9000
+                # Measured as RMS: <whisper> swaps the voiced excitation for noise,
+                # which peaks much further above its own average, so a peak reading
+                # says more about the crest factor than about whether anything was
+                # applied. The loudness is what the tag's volume acts on.
+                quieter = self.rms(out) < self.rms(self.loud_wav_reference()) * 0.8
                 self.assertEqual(quieter, reshaped, "audio_fx=%s" % audio_fx)
 
     def test_command_audio_fx_defaults_to_off(self):
@@ -3497,14 +3501,23 @@ class ToneIntensityTest(unittest.TestCase):
 
     def test_one_is_the_presets_unchanged(self):
         textutil.set_tone_intensity(1.0)
-        self.assertAlmostEqual(textutil.tag_profile("whisper")["volume"], 0.55, places=2)
+        self.assertAlmostEqual(textutil.tag_profile("whisper")["volume"],
+                               textutil.TAG_PROFILES["whisper"][2], places=4)
 
     def test_two_is_the_tag_applied_twice(self):
         """The scale is geometric because these are multipliers, and nested tags already
-        multiply -- so intensity 2 has a definition, not just a bigger number."""
+        multiply -- so intensity 2 has a definition, not just a bigger number.
+
+        Read off TAG_PROFILES rather than written out: these presets are tuned against
+        recordings and do move, and a test that pins the number instead of the rule
+        fails for the wrong reason when they do."""
         textutil.set_tone_intensity(2.0)
-        self.assertAlmostEqual(textutil.tag_profile("whisper")["volume"], 0.55 ** 2, places=3)
-        self.assertAlmostEqual(textutil.tag_profile("excited")["speed"], 1.12 ** 2, places=3)
+        quiet = textutil.TAG_PROFILES["whisper"][2]
+        quick = textutil.TAG_PROFILES["excited"][1]
+        self.assertAlmostEqual(textutil.tag_profile("whisper")["volume"], quiet ** 2,
+                               places=4)
+        self.assertAlmostEqual(textutil.tag_profile("excited")["speed"], quick ** 2,
+                               places=4)
 
     def test_neutral_stays_neutral_at_any_intensity(self):
         """A tag with nothing to exaggerate must not acquire something."""

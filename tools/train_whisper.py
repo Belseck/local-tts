@@ -175,19 +175,51 @@ def spectrum(samples, rate, count=24):
     return [10 * math.log10(max(p / loudest, 1e-9)) for p in powers]
 
 
-def whispered_only(samples, rate, window=5.0):
-    """Drop the stretches where the speaker is not actually whispering."""
-    step = int(rate * window)
-    kept = []
-    for start in range(0, max(1, len(samples) - step), step):
-        piece = samples[start:start + step]
-        if periodicity(piece, rate) < VOICED:
-            kept.extend(piece)
-    return kept or samples
+def utterances(samples, rate, floor_db=-28.0, shortest_ms=180, pad_ms=40):
+    """Cut a recording into the stretches where somebody is speaking.
+
+    Compared one at a time rather than pooled, because pooling averages away exactly
+    what is being measured: a speaker whispers the same word louder and thinner and
+    faster from one take to the next, and the spread between those takes is the yardstick
+    for how close a synthetic one can reasonably get.
+    """
+    window = int(rate * 0.02)
+    hop = window // 2
+    count = (len(samples) - window) // hop
+    if count < 1:
+        return [samples]
+    levels = [math.sqrt(sum(v * v for v in samples[i * hop:i * hop + window]) / window)
+              for i in range(count)]
+    loudest = max(levels) or 1.0
+    speaking = [20 * math.log10(level / loudest + 1e-9) > floor_db for level in levels]
+    spans, start = [], None
+    for index, active in enumerate(speaking):
+        if active and start is None:
+            start = index
+        elif not active and start is not None:
+            spans.append((start, index))
+            start = None
+    if start is not None:
+        spans.append((start, len(speaking)))
+    pad = int(pad_ms / 1000.0 * rate)
+    out = []
+    for first, last in spans:
+        begin = max(0, first * hop - pad)
+        end = min(len(samples), last * hop + window + pad)
+        if (end - begin) * 1000.0 / rate >= shortest_ms:
+            out.append(samples[begin:end])
+    return out or [samples]
 
 
-def reference_spectrum(paths):
-    pooled, rate = [], None
+def whispered_only(samples, rate):
+    """The utterances that are actually whispered, one by one."""
+    return [piece for piece in utterances(samples, rate)
+            if periodicity(piece, rate) < VOICED]
+
+
+def reference_profiles(paths):
+    """One spectrum per whispered utterance, plus the pooled centroid."""
+    profiles, pooled, rate = [], [], None
     for path in paths:
         samples, this_rate = read_wav(path)
         if rate is None:
@@ -195,12 +227,29 @@ def reference_spectrum(paths):
         elif this_rate != rate:
             raise SystemExit("references must share a sample rate: %s is %d, not %d"
                              % (path, this_rate, rate))
-        usable = whispered_only(samples, rate)
-        print("  %-28s %5.1fs, %5.1fs whispered" % (os.path.basename(path),
-                                                   len(samples) / rate,
-                                                   len(usable) / rate))
-        pooled.extend(usable)
-    return spectrum(pooled, rate, count=64), centroid(pooled, rate, count=64), rate
+        kept = whispered_only(samples, rate)
+        print("  %-28s %5.1fs, %d whispered utterance%s"
+              % (os.path.basename(path), len(samples) / rate, len(kept),
+                 "" if len(kept) == 1 else "s"))
+        for piece in kept:
+            profiles.append(spectrum(piece, rate))
+            pooled.extend(piece)
+    if not profiles:
+        raise SystemExit("no whispered speech found; is VOICED calibrated for these?")
+    return profiles, centroid(pooled, rate, count=64), rate
+
+
+def agreement_floor(profiles):
+    """How far the references sit from each other -- where fitting has to stop.
+
+    Below this the numbers stop meaning anything: a synthetic whisper that matches the
+    references more closely than they match each other is fitting one speaker's takes,
+    not learning what a whisper is. This is the loop's stopping condition, and it is
+    measured rather than guessed.
+    """
+    gaps = [distance(a, b)
+            for index, a in enumerate(profiles) for b in profiles[index + 1:]]
+    return sum(gaps) / len(gaps) if gaps else 0.0
 
 
 def synthetic_vowel(path, rate, f0=110, formants=(400, 1800, 2800), seconds=1.5):
@@ -269,6 +318,10 @@ def distance(a, b):
     return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
 
 
+def distance_to_all(spec, targets):
+    return sum(distance(spec, target) for target in targets) / len(targets)
+
+
 def current_settings():
     return (audiofx._BREATH_TILT_STAGES, audiofx._BREATH_TILT, audiofx._BREATH_HIGHPASS,
             audiofx._BREATH_HIGHPASS_POLES, audiofx._BREATH_LOWPASS)
@@ -295,11 +348,11 @@ def main(argv=None):
 
     paths = [p for pattern in args.refs for p in sorted(glob.glob(pattern)) or [pattern]]
     print("references")
-    target, target_centroid, rate = reference_spectrum(paths)
-    print("\n  target spectrum, dB per band")
-    print("    " + " ".join("%6d" % b for b in BANDS[1:]))
-    print("    " + " ".join("%6.1f" % v for v in target))
-    print("  spectral centroid %.0f Hz" % target_centroid)
+    targets, target_centroid, rate = reference_profiles(paths)
+    floor = agreement_floor(targets)
+    print("\n  %d utterances, spectral centroid %.0f Hz" % (len(targets), target_centroid))
+    print("  they sit %.2f dB from each other -- fitting closer than that is fitting "
+          "noise" % floor)
 
     voiced, voiced_rate = read_wav(args.voiced)
     if voiced_rate != rate:
@@ -313,7 +366,7 @@ def main(argv=None):
     spec, bright, margin = render(args.voiced, probe, rate, base)
     print("\ncurrent: %s" % describe(base))
     print("  spectral error %.2f dB, centroid %.0f Hz, worst formant margin %.1f dB"
-          % (distance(spec, target), bright, margin))
+          % (distance_to_all(spec, targets), bright, margin))
 
     if not args.search:
         return 0
@@ -326,7 +379,7 @@ def main(argv=None):
     scored = []
     for settings in grid:
         spec, bright, margin = render(args.voiced, probe, rate, settings)
-        error = distance(spec, target)
+        error = distance_to_all(spec, targets)
         # A decibel of band error and 400 Hz of centroid drift are treated as equally
         # bad. The exact exchange rate is a judgement call; what it is there to prevent
         # is a setting buying a better band fit with an audibly wrong brightness.
